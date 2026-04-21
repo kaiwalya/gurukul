@@ -7,16 +7,33 @@ language: unknown
 # Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
 
 tasks:
+  # No Cargo crate here — disable the inherited Rust tasks.
+  build:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  test:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  lint:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  fmt:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
   regenerate:
     command: 'bash -c "cargo run -p cli -- emit-schema > schema/world.schema.json"'
-    outputs:
-      - 'world.schema.json'
     options:
       runFromWorkspaceRoot: true
 
   check:
     command: 'bash -c "cargo run -p cli -- emit-schema | diff - schema/world.schema.json"'
-    inputs:
-      - 'world.schema.json'
     options:
       runFromWorkspaceRoot: true

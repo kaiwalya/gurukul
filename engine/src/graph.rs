@@ -29,17 +29,22 @@ pub fn parse_port_path(path: &str) -> Result<(&str, &str), EngineError> {
 
 /// A running engine: instantiated nodes in topological order, ready to process.
 pub struct Engine {
-    // Node id -> index into `nodes`
     node_index: HashMap<String, usize>,
-    // Topologically ordered node ids
-    topo_order: Vec<String>,
+    topo_order_idx: Vec<usize>,
+    topo_order_ids: Vec<String>,
     nodes: Vec<(String, Box<dyn Node>)>,
-    // (src_node_idx, src_port_idx) -> Vec<(dst_node_idx, dst_port_idx)>
+    // (src_node_idx, src_port_idx, dst_node_idx, dst_port_idx)
     connections: Vec<(usize, usize, usize, usize)>,
     block_size: usize,
     sample_rate: u32,
-    // Per-node: Vec<Vec<f32>> for each output port buffer
+    // Per-node per-output-port buffers, allocated once.
     output_buffers: Vec<Vec<Vec<f32>>>,
+    // Per-node per-input-port buffers, allocated once and reused across run_blocks calls.
+    input_buffers: Vec<Vec<Vec<f32>>>,
+    // Cached port names per node (parallel to output_buffers / input_buffers).
+    output_port_names: Vec<Vec<String>>,
+    // Per (node_idx, out_port_idx): does anything downstream consume it?
+    output_has_downstream: Vec<Vec<bool>>,
 }
 
 impl Engine {
@@ -100,29 +105,53 @@ impl Engine {
             connections.push((src_idx, src_port_idx, dst_idx, dst_port_idx));
         }
 
-        // Allocate output buffers
-        let output_buffers: Vec<Vec<Vec<f32>>> = nodes
-            .iter()
-            .map(|(_, node)| {
-                let (_, outputs) = node.declare_ports();
+        // Cache port layouts and allocate buffers up front; declare_ports() is never called per-block.
+        let mut output_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
+        let mut input_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
+        let mut output_port_names: Vec<Vec<String>> = Vec::with_capacity(nodes.len());
+        for (_, node) in &nodes {
+            let (inputs, outputs) = node.declare_ports();
+            output_buffers.push(
                 outputs
                     .iter()
                     .map(|_| vec![0.0f32; world.block_size])
-                    .collect()
-            })
+                    .collect(),
+            );
+            input_buffers.push(
+                inputs
+                    .iter()
+                    .map(|_| vec![0.0f32; world.block_size])
+                    .collect(),
+            );
+            output_port_names.push(outputs.iter().map(|p| p.name.to_string()).collect());
+        }
+
+        // Per-output-port downstream flag, for skipping clones when no one listens.
+        let mut output_has_downstream: Vec<Vec<bool>> = output_port_names
+            .iter()
+            .map(|ports| vec![false; ports.len()])
             .collect();
+        for &(s_node, s_port, _, _) in &connections {
+            output_has_downstream[s_node][s_port] = true;
+        }
+
+        // Resolve topo order ids to indices once.
+        let topo_order_idx: Vec<usize> = topo_order.iter().map(|id| node_index[id]).collect();
 
         let mut engine = Engine {
             node_index,
-            topo_order,
+            topo_order_idx,
+            topo_order_ids: topo_order,
             nodes,
             connections,
             block_size: world.block_size,
             sample_rate: world.sample_rate,
             output_buffers,
+            input_buffers,
+            output_port_names,
+            output_has_downstream,
         };
 
-        // Prepare all nodes
         for (_, node) in &mut engine.nodes {
             node.prepare(engine.sample_rate, engine.block_size);
         }
@@ -132,40 +161,21 @@ impl Engine {
 
     /// Run for `n_blocks` blocks, calling the subscription hub for any subscribed ports.
     pub fn run_blocks(&mut self, n_blocks: u64, hub: &SubscriptionHub) {
-        // Per-node input accumulation buffers: node_idx -> port_idx -> buffer
-        let mut input_buffers: Vec<Vec<Vec<f32>>> = self
-            .nodes
-            .iter()
-            .map(|(_, node)| {
-                let (inputs, _) = node.declare_ports();
-                inputs
-                    .iter()
-                    .map(|_| vec![0.0f32; self.block_size])
-                    .collect()
-            })
-            .collect();
-
         for block_num in 0..n_blocks {
             let timestamp = block_num * self.block_size as u64;
 
-            // Clear input buffers
-            for node_inputs in &mut input_buffers {
+            for node_inputs in &mut self.input_buffers {
                 for buf in node_inputs {
                     buf.fill(0.0);
                 }
             }
 
-            // Process nodes in topo order
-            for node_id in &self.topo_order.clone() {
-                let node_idx = self.node_index[node_id];
-
-                // Gather inputs as slices
-                let input_slices: Vec<&[f32]> = input_buffers[node_idx]
+            for &node_idx in &self.topo_order_idx {
+                let input_slices: Vec<&[f32]> = self.input_buffers[node_idx]
                     .iter()
                     .map(|v| v.as_slice())
                     .collect();
 
-                // Process — need to temporarily move out output buffers
                 {
                     let output_bufs = &mut self.output_buffers[node_idx];
                     let mut output_slices: Vec<&mut [f32]> =
@@ -174,23 +184,29 @@ impl Engine {
                     node.process(&input_slices, &mut output_slices, self.block_size);
                 }
 
-                // Fan outputs to downstream input buffers
-                let (_, outputs) = self.nodes[node_idx].1.declare_ports();
-                for (port_idx, port_spec) in outputs.iter().enumerate() {
-                    let port_path = format!("{}.{}", node_id, port_spec.name);
-                    let data = self.output_buffers[node_idx][port_idx].clone();
+                let node_id = &self.nodes[node_idx].0;
+                for port_idx in 0..self.output_port_names[node_idx].len() {
+                    let port_name = &self.output_port_names[node_idx][port_idx];
+                    let has_downstream = self.output_has_downstream[node_idx][port_idx];
 
-                    // Send to subscription hub if anyone is listening
+                    // Only format the port path (and possibly clone the block) when needed.
+                    let port_path = format!("{}.{}", node_id, port_name);
                     if hub.has_subscribers(&port_path) {
-                        hub.send(&port_path, (timestamp, data.clone()));
+                        hub.send(
+                            &port_path,
+                            (timestamp, self.output_buffers[node_idx][port_idx].clone()),
+                        );
                     }
 
-                    // Copy to downstream nodes' input buffers
-                    for &(s_node, s_port, d_node, d_port) in &self.connections {
-                        if s_node == node_idx && s_port == port_idx {
-                            let dst_buf = &mut input_buffers[d_node][d_port];
-                            for (dst, src) in dst_buf.iter_mut().zip(data.iter()) {
-                                *dst += src;
+                    if has_downstream {
+                        // output_buffers and input_buffers are disjoint fields — borrow safely.
+                        let src: &[f32] = self.output_buffers[node_idx][port_idx].as_slice();
+                        for &(s_node, s_port, d_node, d_port) in &self.connections {
+                            if s_node == node_idx && s_port == port_idx {
+                                let dst = &mut self.input_buffers[d_node][d_port];
+                                for (d, s) in dst.iter_mut().zip(src.iter()) {
+                                    *d += *s;
+                                }
                             }
                         }
                     }
@@ -204,7 +220,7 @@ impl Engine {
     }
 
     pub fn topo_order(&self) -> &[String] {
-        &self.topo_order
+        &self.topo_order_ids
     }
 
     pub fn sample_rate(&self) -> u32 {

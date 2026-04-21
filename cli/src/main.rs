@@ -182,12 +182,17 @@ fn cmd_run(
 
     engine.run_blocks(n_blocks, &hub);
 
-    // Print events from all subscriptions
+    // Collect, sort chronologically (ties broken by port path), then print.
+    let mut events: Vec<(u64, String, f32)> = Vec::new();
     for (port_path, rx) in &subscriptions {
         for (timestamp, samples) in rx.try_iter() {
             let first = samples.first().copied().unwrap_or(0.0);
-            println!("{timestamp}\t{port_path}\t{first:.6}");
+            events.push((timestamp, port_path.clone(), first));
         }
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (timestamp, port_path, first) in events {
+        println!("{timestamp}\t{port_path}\t{first:.6}");
     }
 
     Ok(())

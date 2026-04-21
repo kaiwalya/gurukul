@@ -7,6 +7,27 @@ language: unknown
 # Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
 
 tasks:
+  # No Cargo crate here — disable the inherited Rust tasks.
+  build:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  test:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  lint:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
+  fmt:
+    command: 'noop'
+    options:
+      runFromWorkspaceRoot: true
+
   validate:
     command: 'cargo run -p cli -- validate worlds/hello.json'
     inputs:
