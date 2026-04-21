@@ -1,0 +1,20 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gurukul"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+node-sine-source = { path = "../node-sine-source" }
+node-passthrough = { path = "../node-passthrough" }
+node-null-sink = { path = "../node-null-sink" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

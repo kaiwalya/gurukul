@@ -1,0 +1,10 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+type: application
+language: rust
+
+dependsOn:
+  - engine
+  - node-sine-source
+  - node-passthrough
+  - node-null-sink

@@ -1,0 +1,26 @@
+$schema: 'https://moonrepo.dev/schemas/tasks.json'
+
+tasks:
+  build:
+    command: 'cargo build -p $project'
+    inputs:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+
+  test:
+    command: 'cargo test -p $project'
+    inputs:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+
+  lint:
+    command: 'cargo clippy -p $project -- -D warnings'
+    inputs:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+
+  fmt:
+    command: 'cargo fmt --check'
+    inputs:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'

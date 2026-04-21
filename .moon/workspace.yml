@@ -1,0 +1,12 @@
+$schema: 'https://moonrepo.dev/schemas/workspace.json'
+
+projects:
+  - engine
+  - cli
+  - node-sine-source
+  - node-passthrough
+  - node-null-sink
+  - schema
+  - worlds
+
+telemetry: false

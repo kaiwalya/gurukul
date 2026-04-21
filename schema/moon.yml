@@ -1,0 +1,22 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+type: configuration
+language: unknown
+
+# cli is an application layer; moon forbids configuration→application deps.
+# Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
+
+tasks:
+  regenerate:
+    command: 'bash -c "cargo run -p cli -- emit-schema > schema/world.schema.json"'
+    outputs:
+      - 'world.schema.json'
+    options:
+      runFromWorkspaceRoot: true
+
+  check:
+    command: 'bash -c "cargo run -p cli -- emit-schema | diff - schema/world.schema.json"'
+    inputs:
+      - 'world.schema.json'
+    options:
+      runFromWorkspaceRoot: true

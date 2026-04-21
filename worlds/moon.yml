@@ -1,0 +1,15 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+type: configuration
+language: unknown
+
+# cli is an application layer; moon forbids configuration→application deps.
+# Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
+
+tasks:
+  validate:
+    command: 'cargo run -p cli -- validate worlds/hello.json'
+    inputs:
+      - 'hello.json'
+    options:
+      runFromWorkspaceRoot: true
