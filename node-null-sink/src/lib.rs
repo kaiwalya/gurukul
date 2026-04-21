@@ -18,7 +18,7 @@ impl Node for NullSink {
         vec![]
     }
 
-    fn prepare(&mut self, _sample_rate: u32, _block_size: usize) {}
+    fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {}
 
     fn process(&mut self, _inputs: &[&[f32]], _outputs: &mut [&mut [f32]], _nframes: usize) {
         // Intentionally discards all input.
@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn null_sink_does_not_crash() {
         let mut node = NullSink;
-        node.prepare(48000, 512);
+        node.prepare("test", 48000, 512);
 
         // Varied inputs: zeros, ramp, large values
         let zeros = vec![0.0f32; 512];

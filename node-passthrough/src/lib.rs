@@ -21,7 +21,7 @@ impl Node for Passthrough {
         vec![]
     }
 
-    fn prepare(&mut self, _sample_rate: u32, _block_size: usize) {}
+    fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {}
 
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if inputs.is_empty() || outputs.is_empty() {
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn passthrough_output_equals_input() {
         let mut node = Passthrough;
-        node.prepare(48000, 512);
+        node.prepare("test", 48000, 512);
 
         let input: Vec<f32> = (0..512).map(|i| i as f32 * 0.001).collect();
         let mut output = vec![0.0f32; 512];

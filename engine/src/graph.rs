@@ -1,6 +1,5 @@
 use crate::node::Node;
 use crate::registry::NodeRegistry;
-use crate::subscription::SubscriptionHub;
 use crate::world::{Connection, World};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -41,15 +40,18 @@ pub struct Engine {
     output_buffers: Vec<Vec<Vec<f32>>>,
     // Per-node per-input-port buffers, allocated once and reused across run_blocks calls.
     input_buffers: Vec<Vec<Vec<f32>>>,
-    // Cached port names per node (parallel to output_buffers / input_buffers).
-    output_port_names: Vec<Vec<String>>,
     // Per (node_idx, out_port_idx): does anything downstream consume it?
     output_has_downstream: Vec<Vec<bool>>,
 }
 
 impl Engine {
     /// Build and prepare an Engine from a World definition.
-    pub fn build(world: &World, registry: &NodeRegistry) -> Result<Self, EngineError> {
+    pub fn build(
+        world: &World,
+        registry: &NodeRegistry,
+        sample_rate: u32,
+        block_size: usize,
+    ) -> Result<Self, EngineError> {
         // Instantiate nodes
         let mut nodes: Vec<(String, Box<dyn Node>)> = Vec::new();
         let mut node_index: HashMap<String, usize> = HashMap::new();
@@ -108,29 +110,19 @@ impl Engine {
         // Cache port layouts and allocate buffers up front; declare_ports() is never called per-block.
         let mut output_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
         let mut input_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
-        let mut output_port_names: Vec<Vec<String>> = Vec::with_capacity(nodes.len());
         for (_, node) in &nodes {
             let (inputs, outputs) = node.declare_ports();
-            output_buffers.push(
-                outputs
-                    .iter()
-                    .map(|_| vec![0.0f32; world.block_size])
-                    .collect(),
-            );
-            input_buffers.push(
-                inputs
-                    .iter()
-                    .map(|_| vec![0.0f32; world.block_size])
-                    .collect(),
-            );
-            output_port_names.push(outputs.iter().map(|p| p.name.to_string()).collect());
+            output_buffers.push(outputs.iter().map(|_| vec![0.0f32; block_size]).collect());
+            input_buffers.push(inputs.iter().map(|_| vec![0.0f32; block_size]).collect());
         }
 
-        // Per-output-port downstream flag, for skipping clones when no one listens.
-        let mut output_has_downstream: Vec<Vec<bool>> = output_port_names
+        // Per-output-port downstream flag, for skipping copies when no one listens.
+        let output_port_count: Vec<usize> = nodes
             .iter()
-            .map(|ports| vec![false; ports.len()])
+            .map(|(_, n)| n.declare_ports().1.len())
             .collect();
+        let mut output_has_downstream: Vec<Vec<bool>> =
+            output_port_count.iter().map(|&n| vec![false; n]).collect();
         for &(s_node, s_port, _, _) in &connections {
             output_has_downstream[s_node][s_port] = true;
         }
@@ -144,26 +136,27 @@ impl Engine {
             topo_order_ids: topo_order,
             nodes,
             connections,
-            block_size: world.block_size,
-            sample_rate: world.sample_rate,
+            block_size,
+            sample_rate,
             output_buffers,
             input_buffers,
-            output_port_names,
             output_has_downstream,
         };
 
-        for (_, node) in &mut engine.nodes {
-            node.prepare(engine.sample_rate, engine.block_size);
+        // Call prepare on every node, passing the node's own id.
+        for i in 0..engine.nodes.len() {
+            let id = engine.nodes[i].0.clone();
+            engine.nodes[i]
+                .1
+                .prepare(&id, engine.sample_rate, engine.block_size);
         }
 
         Ok(engine)
     }
 
-    /// Run for `n_blocks` blocks, calling the subscription hub for any subscribed ports.
-    pub fn run_blocks(&mut self, n_blocks: u64, hub: &SubscriptionHub) {
-        for block_num in 0..n_blocks {
-            let timestamp = block_num * self.block_size as u64;
-
+    /// Run for `n_blocks` blocks.
+    pub fn run_blocks(&mut self, n_blocks: u64) {
+        for _ in 0..n_blocks {
             for node_inputs in &mut self.input_buffers {
                 for buf in node_inputs {
                     buf.fill(0.0);
@@ -184,21 +177,8 @@ impl Engine {
                     node.process(&input_slices, &mut output_slices, self.block_size);
                 }
 
-                let node_id = &self.nodes[node_idx].0;
-                for port_idx in 0..self.output_port_names[node_idx].len() {
-                    let port_name = &self.output_port_names[node_idx][port_idx];
-                    let has_downstream = self.output_has_downstream[node_idx][port_idx];
-
-                    // Only format the port path (and possibly clone the block) when needed.
-                    let port_path = format!("{}.{}", node_id, port_name);
-                    if hub.has_subscribers(&port_path) {
-                        hub.send(
-                            &port_path,
-                            (timestamp, self.output_buffers[node_idx][port_idx].clone()),
-                        );
-                    }
-
-                    if has_downstream {
+                for port_idx in 0..self.output_has_downstream[node_idx].len() {
+                    if self.output_has_downstream[node_idx][port_idx] {
                         // output_buffers and input_buffers are disjoint fields — borrow safely.
                         let src: &[f32] = self.output_buffers[node_idx][port_idx].as_slice();
                         for &(s_node, s_port, d_node, d_port) in &self.connections {

@@ -48,7 +48,7 @@ impl Node for SineSource {
         ]
     }
 
-    fn prepare(&mut self, sample_rate: u32, _block_size: usize) {
+    fn prepare(&mut self, _id: &str, sample_rate: u32, _block_size: usize) {
         self.sample_rate = sample_rate as f32;
         self.phase = 0.0;
     }
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn sine_generates_correct_frequency_and_amplitude() {
         let mut node = SineSource::new(440.0, 0.5);
-        node.prepare(48000, 512);
+        node.prepare("test", 48000, 512);
 
         let mut out = vec![0.0f32; 512];
         {

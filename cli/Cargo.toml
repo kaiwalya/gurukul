@@ -12,6 +12,7 @@ engine = { path = "../engine" }
 node-sine-source = { path = "../node-sine-source" }
 node-passthrough = { path = "../node-passthrough" }
 node-null-sink = { path = "../node-null-sink" }
+node-tracer = { path = "../node-tracer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

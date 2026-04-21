@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use engine::subscription::SubscriptionHub;
-use engine::{Engine, NodeRegistry, World};
+use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
 use schemars::schema_for;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -38,16 +38,32 @@ enum Command {
         #[arg(long)]
         duration: String,
 
-        /// Port paths to subscribe to and dump events for (e.g. src.audio_out).
-        /// May be repeated or space-separated: --dump-events src.audio_out mid.audio_out
-        #[arg(long = "dump-events", value_name = "PORT_PATH", num_args = 1..)]
-        dump_events: Vec<String>,
+        /// Port paths to splice a Tracer node onto (e.g. src.audio_out).
+        /// May be repeated: --trace src.audio_out --trace mid.audio_out
+        #[arg(long = "trace", value_name = "PORT_PATH", num_args = 1..)]
+        trace: Vec<String>,
+
+        /// Sample rate in Hz.
+        #[arg(long, default_value_t = 48000)]
+        sample_rate: u32,
+
+        /// Block size in frames.
+        #[arg(long, default_value_t = 512)]
+        block_size: usize,
     },
 
     /// Render a world as Graphviz .dot output (pipe to `dot -Tsvg`).
     Render {
         /// Path to the world JSON file.
         world: PathBuf,
+
+        /// Sample rate in Hz.
+        #[arg(long, default_value_t = 48000)]
+        sample_rate: u32,
+
+        /// Block size in frames.
+        #[arg(long, default_value_t = 512)]
+        block_size: usize,
     },
 
     /// Emit the JSON Schema for world files to stdout.
@@ -59,6 +75,7 @@ fn build_registry() -> NodeRegistry {
     node_sine_source::register(&mut registry);
     node_passthrough::register(&mut registry);
     node_null_sink::register(&mut registry);
+    node_tracer::register(&mut registry);
     registry
 }
 
@@ -153,56 +170,122 @@ fn cmd_validate(world_path: &PathBuf, registry: &NodeRegistry) -> Result<()> {
     let world: World =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", world_path.display()))?;
 
-    // Graph build validates node types, port references, and topo sort (cycle detection)
-    Engine::build(&world, registry).context("building engine graph")?;
+    // Graph build validates node types, port references, and topo sort (cycle detection).
+    // sample_rate and block_size don't affect graph validity; use defaults.
+    Engine::build(&world, registry, 48000, 512).context("building engine graph")?;
 
     println!("OK");
     Ok(())
 }
 
+/// Splice tracer nodes into a cloned world for each requested port path.
+///
+/// Node id format: `__trace__{node_id}__{port_name}__{counter}` where `__` separates components.
+/// Assumption: user-chosen node ids and port names do not contain double underscores.
+fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry) -> Result<World> {
+    let mut world = world.clone();
+
+    for (counter, port_path) in trace_ports.iter().enumerate() {
+        let (node_id, port_name) = port_path.split_once('.').with_context(|| {
+            format!("invalid port path '{port_path}': expected '<node_id>.<port_name>'")
+        })?;
+
+        // Verify the node exists.
+        if !world.nodes.iter().any(|n| n.id == node_id) {
+            anyhow::bail!("node '{node_id}' not found");
+        }
+
+        // Determine if the port is an input or output of that node.
+        let node_def = world.nodes.iter().find(|n| n.id == node_id).unwrap();
+        let instance = registry
+            .create(&node_def.ty, &node_def.params)
+            .with_context(|| format!("unknown node type '{}'", node_def.ty))?;
+        let (inputs, outputs) = instance.declare_ports();
+
+        let is_output = outputs.iter().any(|p| p.name == port_name);
+        let is_input = inputs.iter().any(|p| p.name == port_name);
+
+        // If it's both (shouldn't happen by design), prefer output.
+        if !is_output && !is_input {
+            anyhow::bail!("port '{port_name}' not found on node '{node_id}'");
+        }
+
+        // Build the tracer node id. Replace `.` in node_id/port_name with `__` would be
+        // ambiguous if they already contain `__`, but we assume they don't (documented above).
+        let tracer_id = format!("__trace__{node_id}__{port_name}__{counter}");
+
+        world.nodes.push(NodeDef {
+            id: tracer_id.clone(),
+            ty: "Tracer".to_string(),
+            params: HashMap::new(),
+        });
+
+        if is_output {
+            // Redirect all existing connections FROM this output through the tracer.
+            for conn in &mut world.connections {
+                if conn.from == *port_path {
+                    conn.from = format!("{tracer_id}.audio_out");
+                }
+            }
+            // Feed the source output into the tracer.
+            world.connections.push(Connection {
+                from: port_path.clone(),
+                to: format!("{tracer_id}.audio_in"),
+            });
+        } else {
+            // is_input: redirect all existing connections TO this input through the tracer.
+            for conn in &mut world.connections {
+                if conn.to == *port_path {
+                    conn.to = format!("{tracer_id}.audio_in");
+                }
+            }
+            // Feed the tracer output into the destination input.
+            world.connections.push(Connection {
+                from: format!("{tracer_id}.audio_out"),
+                to: port_path.clone(),
+            });
+        }
+    }
+
+    Ok(world)
+}
+
 fn cmd_run(
     world_path: &PathBuf,
     duration_str: &str,
-    dump_ports: &[String],
+    trace_ports: &[String],
     registry: &NodeRegistry,
+    sample_rate: u32,
+    block_size: usize,
 ) -> Result<()> {
     let world = load_world(world_path)?;
-    let mut engine = Engine::build(&world, registry).context("building engine")?;
+    let world = if trace_ports.is_empty() {
+        world
+    } else {
+        splice_tracers(&world, trace_ports, registry)?
+    };
 
-    let total_samples = parse_duration_samples(duration_str, world.sample_rate)?;
-    let n_blocks = total_samples.div_ceil(world.block_size as u64);
+    let mut engine =
+        Engine::build(&world, registry, sample_rate, block_size).context("building engine")?;
 
-    let mut hub = SubscriptionHub::new();
-    let mut subscriptions: Vec<(String, engine::Subscription)> = Vec::new();
+    let total_samples = parse_duration_samples(duration_str, sample_rate)?;
+    let n_blocks = total_samples.div_ceil(block_size as u64);
 
-    for port_path in dump_ports {
-        let rx = hub.subscribe(port_path.clone());
-        subscriptions.push((port_path.clone(), rx));
-    }
-
-    engine.run_blocks(n_blocks, &hub);
-
-    // Collect, sort chronologically (ties broken by port path), then print.
-    let mut events: Vec<(u64, String, f32)> = Vec::new();
-    for (port_path, rx) in &subscriptions {
-        for (timestamp, samples) in rx.try_iter() {
-            let first = samples.first().copied().unwrap_or(0.0);
-            events.push((timestamp, port_path.clone(), first));
-        }
-    }
-    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (timestamp, port_path, first) in events {
-        println!("{timestamp}\t{port_path}\t{first:.6}");
-    }
+    engine.run_blocks(n_blocks);
 
     Ok(())
 }
 
-fn cmd_render(world_path: &PathBuf, registry: &NodeRegistry) -> Result<()> {
+fn cmd_render(
+    world_path: &PathBuf,
+    registry: &NodeRegistry,
+    sample_rate: u32,
+    block_size: usize,
+) -> Result<()> {
     let world = load_world(world_path)?;
 
     // Validate first
-    Engine::build(&world, registry).context("validating world")?;
+    Engine::build(&world, registry, sample_rate, block_size).context("validating world")?;
 
     println!("digraph gurukul {{");
     println!("  rankdir=LR;");
@@ -265,12 +348,18 @@ fn main() -> Result<()> {
         Command::Run {
             world,
             duration,
-            dump_events,
+            trace,
+            sample_rate,
+            block_size,
         } => {
-            cmd_run(world, duration, dump_events, &registry)?;
+            cmd_run(world, duration, trace, &registry, *sample_rate, *block_size)?;
         }
-        Command::Render { world } => {
-            cmd_render(world, &registry)?;
+        Command::Render {
+            world,
+            sample_rate,
+            block_size,
+        } => {
+            cmd_render(world, &registry, *sample_rate, *block_size)?;
         }
         Command::EmitSchema => {
             cmd_emit_schema()?;
@@ -312,5 +401,6 @@ mod tests {
         assert!(types.contains(&"SineSource"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));
+        assert!(types.contains(&"Tracer"));
     }
 }

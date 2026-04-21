@@ -24,6 +24,6 @@ pub trait Node: Send {
     /// Returns (inputs, outputs) port declarations.
     fn declare_ports(&self) -> (Vec<PortSpec>, Vec<PortSpec>);
     fn declare_parameters(&self) -> Vec<ParamSpec>;
-    fn prepare(&mut self, sample_rate: u32, block_size: usize);
+    fn prepare(&mut self, id: &str, sample_rate: u32, block_size: usize);
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize);
 }

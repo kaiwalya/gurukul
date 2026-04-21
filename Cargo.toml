@@ -5,6 +5,7 @@ members = [
     "node-sine-source",
     "node-passthrough",
     "node-null-sink",
+    "node-tracer",
 ]
 resolver = "2"
 
@@ -15,5 +16,4 @@ schemars = { version = "0.8", features = ["derive"] }
 jsonschema = "0.29"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
-crossbeam-channel = "0.5"
 anyhow = "1"
