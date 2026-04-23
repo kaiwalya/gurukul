@@ -49,7 +49,7 @@ pub struct PitchYin {
 const UNVOICED_DPRIME_THRESHOLD: f64 = 0.8;
 
 impl PitchYin {
-    fn new(window: usize, hop: usize, fmin_hz: f32, fmax_hz: f32, threshold: f32) -> Self {
+    pub fn new(window: usize, hop: usize, fmin_hz: f32, fmax_hz: f32, threshold: f32) -> Self {
         // Nominal sr=48000 for sizing; prepare() will recompute with the actual rate.
         let sr = 48000.0f32;
         let half = window / 2;
@@ -88,6 +88,10 @@ impl PitchYin {
         let tau_min = self.tau_min;
         let tau_search_min = self.tau_search_min;
         let tau_max = self.tau_max;
+
+        // Clear scratch buffers before each analysis (no reallocation).
+        self.d.fill(0.0);
+        self.dprime.fill(1.0);
 
         // --- Step 1: difference function ---
         // d[tau] = sum_{j=0..window-tau} (x[j] - x[j+tau])^2

@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 engine = { path = "../engine" }
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"
