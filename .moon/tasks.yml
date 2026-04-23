@@ -11,6 +11,7 @@ tasks:
     command: 'cargo test -p $project'
     inputs:
       - 'src/**/*.rs'
+      - 'tests/**/*.rs'
       - 'Cargo.toml'
 
   lint:

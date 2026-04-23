@@ -46,3 +46,13 @@ jobs:
 
       - name: Check committed schema is fresh
         run: moon run schema:check
+
+      - name: Upload pitch sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitch-sweep
+          path: |
+            target/tmp/pitch_sweep.csv
+            target/tmp/pitch_sweep_grid.txt
+          if-no-files-found: warn

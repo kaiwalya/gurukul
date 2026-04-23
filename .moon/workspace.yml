@@ -1,11 +1,20 @@
 $schema: 'https://moonrepo.dev/schemas/workspace.json'
 
 projects:
-  - engine
   - cli
-  - node-sine-source
-  - node-passthrough
+  - engine
+  - node-assert-near
+  - node-gain
+  - node-mix-sum
   - node-null-sink
+  - node-passthrough
+  - node-pitch-error
+  - node-pitch-yin
+  - node-rms-meter
+  - node-synth-pink-noise
+  - node-synth-sine
+  - node-synth-vibrato-sine
+  - node-tracer
   - schema
   - worlds
 
