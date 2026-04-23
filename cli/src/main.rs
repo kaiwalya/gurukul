@@ -98,6 +98,7 @@ fn build_registry() -> NodeRegistry {
     node_gain::register(&mut registry);
     node_passthrough::register(&mut registry);
     node_null_sink::register(&mut registry);
+    node_pitch_error::register(&mut registry);
     node_pitch_yin::register(&mut registry);
     node_tracer::register(&mut registry);
     registry
@@ -536,6 +537,7 @@ mod tests {
         assert!(types.contains(&"GainNode"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));
+        assert!(types.contains(&"PitchError"));
         assert!(types.contains(&"PitchYin"));
         assert!(types.contains(&"Tracer"));
     }

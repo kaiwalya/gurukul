@@ -11,6 +11,7 @@ members = [
     "node-gain",
     "node-passthrough",
     "node-null-sink",
+    "node-pitch-error",
     "node-pitch-yin",
     "node-tracer",
 ]

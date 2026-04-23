@@ -1,0 +1,15 @@
+[package]
+name = "node-pitch-error"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }
+
+[dev-dependencies]
+engine = { path = "../engine" }
+node-synth-sine = { path = "../node-synth-sine" }
+node-synth-pink-noise = { path = "../node-synth-pink-noise" }
+node-gain = { path = "../node-gain" }
+node-mix-sum = { path = "../node-mix-sum" }
+node-pitch-yin = { path = "../node-pitch-yin" }
