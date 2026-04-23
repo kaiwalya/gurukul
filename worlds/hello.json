@@ -1,7 +1,7 @@
 {
   "$schema": "../schema/world.schema.json",
   "nodes": [
-    { "id": "src", "type": "SineSource", "params": { "freq": 440.0, "amplitude": 0.5 } },
+    { "id": "src", "type": "SynthSine", "params": { "freq": 440.0, "amplitude": 0.5 } },
     { "id": "mid", "type": "Passthrough" },
     { "id": "out", "type": "NullSink" }
   ],

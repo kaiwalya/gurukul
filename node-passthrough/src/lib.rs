@@ -1,26 +1,9 @@
-use engine::{Node, NodeRegistry, ParamSpec, PortSpec, PortType};
+use engine::{Node, NodeRegistry, PortSpec, PortType};
 use std::collections::HashMap;
 
 pub struct Passthrough;
 
 impl Node for Passthrough {
-    fn declare_ports(&self) -> (Vec<PortSpec>, Vec<PortSpec>) {
-        (
-            vec![PortSpec {
-                name: "audio_in",
-                ty: PortType::Audio,
-            }],
-            vec![PortSpec {
-                name: "audio_out",
-                ty: PortType::Audio,
-            }],
-        )
-    }
-
-    fn declare_parameters(&self) -> Vec<ParamSpec> {
-        vec![]
-    }
-
     fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {}
 
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
@@ -32,8 +15,17 @@ impl Node for Passthrough {
 }
 
 pub fn register(registry: &mut NodeRegistry) {
-    registry.register(
+    registry.register_full(
         "Passthrough",
+        vec![PortSpec {
+            name: "audio_in",
+            ty: PortType::Audio,
+        }],
+        vec![PortSpec {
+            name: "audio_out",
+            ty: PortType::Audio,
+        }],
+        vec![],
         Box::new(|_params: &HashMap<String, f64>| Box::new(Passthrough) as Box<dyn Node>),
     );
 }

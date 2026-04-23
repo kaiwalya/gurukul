@@ -15,6 +15,8 @@ tasks:
 
   test:
     command: 'noop'
+    deps:
+      - '~:test-worlds'
     options:
       runFromWorkspaceRoot: true
 
@@ -32,5 +34,10 @@ tasks:
     command: 'cargo run -p cli -- validate worlds/hello.json'
     inputs:
       - 'hello.json'
+    options:
+      runFromWorkspaceRoot: true
+
+  test-worlds:
+    command: 'cargo run -p cli -- test worlds/test'
     options:
       runFromWorkspaceRoot: true

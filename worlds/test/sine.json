@@ -1,0 +1,10 @@
+{
+  "$schema": "../../schema/world.schema.json",
+  "nodes": [
+    {"id": "src", "type": "SynthSine", "params": {"freq": 440.0, "amplitude": 0.5, "phase": 0.0}},
+    {"id": "sink", "type": "AudioStatsSink", "params": {"expected_rms": 0.3536, "tolerance_db": 0.5}}
+  ],
+  "connections": [
+    {"from": "src.audio_out", "to": "sink.audio_in"}
+  ]
+}

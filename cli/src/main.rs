@@ -4,6 +4,7 @@ use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
 use schemars::schema_for;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(name = "gurukul", about = "Gurukul audio engine CLI")]
@@ -52,6 +53,22 @@ enum Command {
         block_size: usize,
     },
 
+    /// Run all world files in a directory (or a single file) and check AudioStatsSink assertions.
+    Test {
+        /// Path to a world file or directory of world files.
+        path: PathBuf,
+
+        /// Duration of simulated audio time (default 1s).
+        #[arg(long, default_value = "1s")]
+        duration: String,
+
+        #[arg(long, default_value_t = 48000)]
+        sample_rate: u32,
+
+        #[arg(long, default_value_t = 512)]
+        block_size: usize,
+    },
+
     /// Render a world as Graphviz .dot output (pipe to `dot -Tsvg`).
     Render {
         /// Path to the world JSON file.
@@ -72,7 +89,11 @@ enum Command {
 
 fn build_registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
-    node_sine_source::register(&mut registry);
+    node_synth_sine::register(&mut registry);
+    node_synth_vibrato_sine::register(&mut registry);
+    node_synth_pink_noise::register(&mut registry);
+    node_mix_sum::register(&mut registry);
+    node_audio_stats_sink::register(&mut registry);
     node_passthrough::register(&mut registry);
     node_null_sink::register(&mut registry);
     node_tracer::register(&mut registry);
@@ -107,13 +128,12 @@ fn cmd_list_nodes(registry: &NodeRegistry) {
 }
 
 fn cmd_describe_node(registry: &NodeRegistry, name: &str) -> Result<()> {
-    // Instantiate a default instance to call declare_* on it.
-    let node = registry
-        .create(name, &Default::default())
+    let (inputs, outputs) = registry
+        .ports(name)
         .with_context(|| format!("unknown node type '{name}'"))?;
-
-    let (inputs, outputs) = node.declare_ports();
-    let params = node.declare_parameters();
+    let params = registry
+        .parameters(name)
+        .with_context(|| format!("unknown node type '{name}'"))?;
 
     println!("Node: {name}");
     println!();
@@ -122,7 +142,7 @@ fn cmd_describe_node(registry: &NodeRegistry, name: &str) -> Result<()> {
     if inputs.is_empty() {
         println!("  (none)");
     }
-    for p in &inputs {
+    for p in inputs {
         println!("  {} [{:?}]", p.name, p.ty);
     }
 
@@ -130,7 +150,7 @@ fn cmd_describe_node(registry: &NodeRegistry, name: &str) -> Result<()> {
     if outputs.is_empty() {
         println!("  (none)");
     }
-    for p in &outputs {
+    for p in outputs {
         println!("  {} [{:?}]", p.name, p.ty);
     }
 
@@ -138,11 +158,18 @@ fn cmd_describe_node(registry: &NodeRegistry, name: &str) -> Result<()> {
     if params.is_empty() {
         println!("  (none)");
     }
-    for p in &params {
-        println!(
-            "  {} (default={}, min={}, max={})",
-            p.name, p.default, p.min, p.max
-        );
+    for p in params {
+        if p.unit.is_empty() {
+            println!(
+                "  {} (default={}, min={}, max={})",
+                p.name, p.default, p.min, p.max
+            );
+        } else {
+            println!(
+                "  {} [{}] (default={}, min={}, max={})",
+                p.name, p.unit, p.default, p.min, p.max
+            );
+        }
     }
 
     Ok(())
@@ -181,7 +208,8 @@ fn cmd_validate(world_path: &PathBuf, registry: &NodeRegistry) -> Result<()> {
 /// Splice tracer nodes into a cloned world for each requested port path.
 ///
 /// Node id format: `__trace__{node_id}__{port_name}__{counter}` where `__` separates components.
-/// Assumption: user-chosen node ids and port names do not contain double underscores.
+/// Assumption: user-chosen node ids and port names do not contain double underscores
+/// (enforced by Engine::build's id validation).
 fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry) -> Result<World> {
     let mut world = world.clone();
 
@@ -196,11 +224,13 @@ fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry
         }
 
         // Determine if the port is an input or output of that node.
+        // Use params-aware lookup so variadic nodes (e.g. MixSum with channels=3) resolve correctly.
         let node_def = world.nodes.iter().find(|n| n.id == node_id).unwrap();
-        let instance = registry
-            .create(&node_def.ty, &node_def.params)
-            .with_context(|| format!("unknown node type '{}'", node_def.ty))?;
-        let (inputs, outputs) = instance.declare_ports();
+        let node_ty = node_def.ty.clone();
+        let node_params = node_def.params.clone();
+        let (inputs, outputs) = registry
+            .ports_for_params(&node_ty, &node_params)
+            .with_context(|| format!("unknown node type '{node_ty}'"))?;
 
         let is_output = outputs.iter().any(|p| p.name == port_name);
         let is_input = inputs.iter().any(|p| p.name == port_name);
@@ -211,7 +241,7 @@ fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry
         }
 
         // Build the tracer node id. Replace `.` in node_id/port_name with `__` would be
-        // ambiguous if they already contain `__`, but we assume they don't (documented above).
+        // ambiguous if they already contain `__`, but we assume they don't (enforced above).
         let tracer_id = format!("__trace__{node_id}__{port_name}__{counter}");
 
         world.nodes.push(NodeDef {
@@ -250,6 +280,23 @@ fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry
     Ok(world)
 }
 
+/// Build an engine for a world file, optionally splicing tracers.
+fn build_engine_for_world(
+    world_path: &PathBuf,
+    trace_ports: &[String],
+    registry: &NodeRegistry,
+    sample_rate: u32,
+    block_size: usize,
+) -> Result<Engine> {
+    let world = load_world(world_path)?;
+    let world = if trace_ports.is_empty() {
+        world
+    } else {
+        splice_tracers(&world, trace_ports, registry)?
+    };
+    Engine::build(&world, registry, sample_rate, block_size).context("building engine")
+}
+
 fn cmd_run(
     world_path: &PathBuf,
     duration_str: &str,
@@ -258,22 +305,95 @@ fn cmd_run(
     sample_rate: u32,
     block_size: usize,
 ) -> Result<()> {
-    let world = load_world(world_path)?;
-    let world = if trace_ports.is_empty() {
-        world
+    let mut engine =
+        build_engine_for_world(world_path, trace_ports, registry, sample_rate, block_size)?;
+    let total_samples = parse_duration_samples(duration_str, sample_rate)?;
+    let n_blocks = total_samples.div_ceil(block_size as u64);
+    engine.run_blocks(n_blocks);
+    Ok(())
+}
+
+struct TestSummary {
+    #[allow(dead_code)]
+    passed: usize,
+    failed: usize,
+}
+
+fn cmd_test(
+    path: &PathBuf,
+    duration_str: &str,
+    sample_rate: u32,
+    block_size: usize,
+    registry: &NodeRegistry,
+) -> Result<TestSummary> {
+    // Collect world files: directory → sorted *.json; file → just that file.
+    let world_files: Vec<PathBuf> = if path.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+            .with_context(|| format!("reading directory {}", path.display()))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let p = entry.path();
+                if p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+                {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+        files
     } else {
-        splice_tracers(&world, trace_ports, registry)?
+        vec![path.clone()]
     };
 
-    let mut engine =
-        Engine::build(&world, registry, sample_rate, block_size).context("building engine")?;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    for world_path in &world_files {
+        let result = run_test_world(world_path, duration_str, sample_rate, block_size, registry);
+        match result {
+            Ok(()) => passed += 1,
+            Err(e) => {
+                eprintln!("FAILED {}: {e}", world_path.display());
+                failed += 1;
+            }
+        }
+    }
+
+    println!("test summary: {passed} passed, {failed} failed");
+
+    Ok(TestSummary { passed, failed })
+}
+
+fn run_test_world(
+    world_path: &PathBuf,
+    duration_str: &str,
+    sample_rate: u32,
+    block_size: usize,
+    registry: &NodeRegistry,
+) -> Result<()> {
+    let mut engine = build_engine_for_world(world_path, &[], registry, sample_rate, block_size)?;
 
     let total_samples = parse_duration_samples(duration_str, sample_rate)?;
     let n_blocks = total_samples.div_ceil(block_size as u64);
-
     engine.run_blocks(n_blocks);
 
-    Ok(())
+    // finish() prints the per-node summary lines; collect any failures.
+    let results = engine.finish();
+    let node_failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|(id, r)| r.err().map(|e| format!("{id}: {e}")))
+        .collect();
+
+    if node_failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", node_failures.join("; "))
+    }
 }
 
 fn cmd_render(
@@ -293,8 +413,7 @@ fn cmd_render(
     println!();
 
     for node_def in &world.nodes {
-        let instance = registry.create(&node_def.ty, &node_def.params).unwrap();
-        let (inputs, outputs) = instance.declare_ports();
+        let (inputs, outputs) = registry.ports(&node_def.ty).unwrap();
         let label = format!(
             "{}\\n[{}]\\nin: {}\\nout: {}",
             node_def.id,
@@ -331,42 +450,49 @@ fn cmd_emit_schema() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let registry = build_registry();
 
-    match &cli.command {
+    let result = match &cli.command {
         Command::ListNodes => {
             cmd_list_nodes(&registry);
+            Ok(())
         }
-        Command::DescribeNode { name } => {
-            cmd_describe_node(&registry, name)?;
-        }
-        Command::Validate { world } => {
-            cmd_validate(world, &registry)?;
-        }
+        Command::DescribeNode { name } => cmd_describe_node(&registry, name),
+        Command::Validate { world } => cmd_validate(world, &registry),
         Command::Run {
             world,
             duration,
             trace,
             sample_rate,
             block_size,
-        } => {
-            cmd_run(world, duration, trace, &registry, *sample_rate, *block_size)?;
-        }
+        } => cmd_run(world, duration, trace, &registry, *sample_rate, *block_size),
+        Command::Test {
+            path,
+            duration,
+            sample_rate,
+            block_size,
+        } => match cmd_test(path, duration, *sample_rate, *block_size, &registry) {
+            Ok(summary) if summary.failed > 0 => return ExitCode::FAILURE,
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        },
         Command::Render {
             world,
             sample_rate,
             block_size,
-        } => {
-            cmd_render(world, &registry, *sample_rate, *block_size)?;
-        }
-        Command::EmitSchema => {
-            cmd_emit_schema()?;
+        } => cmd_render(world, &registry, *sample_rate, *block_size),
+        Command::EmitSchema => cmd_emit_schema(),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -398,7 +524,11 @@ mod tests {
     fn registry_has_all_nodes() {
         let registry = build_registry();
         let types = registry.node_types();
-        assert!(types.contains(&"SineSource"));
+        assert!(types.contains(&"SynthSine"));
+        assert!(types.contains(&"SynthVibratoSine"));
+        assert!(types.contains(&"SynthPinkNoise"));
+        assert!(types.contains(&"MixSum"));
+        assert!(types.contains(&"AudioStatsSink"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));
         assert!(types.contains(&"Tracer"));

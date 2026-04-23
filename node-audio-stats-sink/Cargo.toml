@@ -1,0 +1,7 @@
+[package]
+name = "node-audio-stats-sink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }

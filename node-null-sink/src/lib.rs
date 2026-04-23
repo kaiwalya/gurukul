@@ -1,23 +1,9 @@
-use engine::{Node, NodeRegistry, ParamSpec, PortSpec, PortType};
+use engine::{Node, NodeRegistry, PortSpec, PortType};
 use std::collections::HashMap;
 
 pub struct NullSink;
 
 impl Node for NullSink {
-    fn declare_ports(&self) -> (Vec<PortSpec>, Vec<PortSpec>) {
-        (
-            vec![PortSpec {
-                name: "audio_in",
-                ty: PortType::Audio,
-            }],
-            vec![],
-        )
-    }
-
-    fn declare_parameters(&self) -> Vec<ParamSpec> {
-        vec![]
-    }
-
     fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {}
 
     fn process(&mut self, _inputs: &[&[f32]], _outputs: &mut [&mut [f32]], _nframes: usize) {
@@ -26,8 +12,14 @@ impl Node for NullSink {
 }
 
 pub fn register(registry: &mut NodeRegistry) {
-    registry.register(
+    registry.register_full(
         "NullSink",
+        vec![PortSpec {
+            name: "audio_in",
+            ty: PortType::Audio,
+        }],
+        vec![],
+        vec![],
         Box::new(|_params: &HashMap<String, f64>| Box::new(NullSink) as Box<dyn Node>),
     );
 }

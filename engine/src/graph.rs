@@ -1,4 +1,4 @@
-use crate::node::Node;
+use crate::node::{Node, NodeError};
 use crate::registry::NodeRegistry;
 use crate::world::{Connection, World};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,6 +16,8 @@ pub enum EngineError {
     NodeNotFound(String),
     #[error("port '{0}' not found on node '{1}'")]
     PortNotFound(String, String),
+    #[error("invalid node id '{0}': {1}")]
+    InvalidNodeId(String, String),
 }
 
 /// Parsed port address.
@@ -24,6 +26,25 @@ pub fn parse_port_path(path: &str) -> Result<(&str, &str), EngineError> {
         .split_once('.')
         .ok_or_else(|| EngineError::InvalidPortPath(path.to_string()))?;
     Ok((node_id, port_name))
+}
+
+/// Validate a user-chosen node id. Rejects empty ids, ids containing "__", and ids
+/// starting with "__trace__" (reserved for splice_tracers).
+fn validate_node_id(id: &str) -> Result<(), EngineError> {
+    if id.is_empty() {
+        return Err(EngineError::InvalidNodeId(
+            id.to_string(),
+            "id must not be empty".to_string(),
+        ));
+    }
+    if id.contains("__") {
+        return Err(EngineError::InvalidNodeId(
+            id.to_string(),
+            "id must not contain double underscores ('__') — reserved for internal tracer ids"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A running engine: instantiated nodes in topological order, ready to process.
@@ -52,6 +73,17 @@ impl Engine {
         sample_rate: u32,
         block_size: usize,
     ) -> Result<Self, EngineError> {
+        // Validate node ids before doing anything else.
+        for node_def in &world.nodes {
+            // Allow __trace__ ids since splice_tracers produces them. User-authored ids
+            // are rejected if they contain "__" at all.
+            // splice_tracers ids always start with "__trace__"; we only validate ids that
+            // don't start with "__trace__".
+            if !node_def.id.starts_with("__trace__") {
+                validate_node_id(&node_def.id)?;
+            }
+        }
+
         // Instantiate nodes
         let mut nodes: Vec<(String, Box<dyn Node>)> = Vec::new();
         let mut node_index: HashMap<String, usize> = HashMap::new();
@@ -72,7 +104,14 @@ impl Engine {
             &node_index,
         )?;
 
-        // Resolve connections to index pairs
+        // Pre-compute per-node port declarations using actual params (needed for variadic nodes).
+        let node_ports: Vec<(Vec<crate::node::PortSpec>, Vec<crate::node::PortSpec>)> = world
+            .nodes
+            .iter()
+            .map(|nd| registry.ports_for_params(&nd.ty, &nd.params).unwrap())
+            .collect();
+
+        // Resolve connections to index pairs — use per-node port declarations.
         let mut connections = Vec::new();
         for conn in &world.connections {
             let (src_id, src_port) = parse_port_path(&conn.from)?;
@@ -85,19 +124,16 @@ impl Engine {
                 .get(dst_id)
                 .ok_or_else(|| EngineError::NodeNotFound(dst_id.to_string()))?;
 
-            let (_, src_node) = &nodes[src_idx];
-            let (_, outputs) = src_node.declare_ports();
-            let src_port_idx =
-                outputs
-                    .iter()
-                    .position(|p| p.name == src_port)
-                    .ok_or_else(|| {
-                        EngineError::PortNotFound(src_port.to_string(), src_id.to_string())
-                    })?;
+            let (_, src_outputs) = &node_ports[src_idx];
+            let src_port_idx = src_outputs
+                .iter()
+                .position(|p| p.name == src_port)
+                .ok_or_else(|| {
+                    EngineError::PortNotFound(src_port.to_string(), src_id.to_string())
+                })?;
 
-            let (_, dst_node) = &nodes[dst_idx];
-            let (inputs, _) = dst_node.declare_ports();
-            let dst_port_idx = inputs
+            let (dst_inputs, _) = &node_ports[dst_idx];
+            let dst_port_idx = dst_inputs
                 .iter()
                 .position(|p| p.name == dst_port)
                 .ok_or_else(|| {
@@ -107,22 +143,19 @@ impl Engine {
             connections.push((src_idx, src_port_idx, dst_idx, dst_port_idx));
         }
 
-        // Cache port layouts and allocate buffers up front; declare_ports() is never called per-block.
+        // Allocate buffers using per-node port declarations.
         let mut output_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
         let mut input_buffers: Vec<Vec<Vec<f32>>> = Vec::with_capacity(nodes.len());
-        for (_, node) in &nodes {
-            let (inputs, outputs) = node.declare_ports();
+        for (inputs, outputs) in &node_ports {
             output_buffers.push(outputs.iter().map(|_| vec![0.0f32; block_size]).collect());
             input_buffers.push(inputs.iter().map(|_| vec![0.0f32; block_size]).collect());
         }
 
         // Per-output-port downstream flag, for skipping copies when no one listens.
-        let output_port_count: Vec<usize> = nodes
+        let mut output_has_downstream: Vec<Vec<bool>> = node_ports
             .iter()
-            .map(|(_, n)| n.declare_ports().1.len())
+            .map(|(_, outputs)| vec![false; outputs.len()])
             .collect();
-        let mut output_has_downstream: Vec<Vec<bool>> =
-            output_port_count.iter().map(|&n| vec![false; n]).collect();
         for &(s_node, s_port, _, _) in &connections {
             output_has_downstream[s_node][s_port] = true;
         }
@@ -195,6 +228,22 @@ impl Engine {
         }
     }
 
+    /// Call `finish()` on each node in topological order and return (node_id, result) pairs.
+    ///
+    /// Not called automatically by `run_blocks` — the caller invokes this explicitly after the
+    /// last block. This keeps `run_blocks` a pure hot-loop and allows worlds that stream forever
+    /// without ever finishing.
+    pub fn finish(&mut self) -> Vec<(String, Result<(), NodeError>)> {
+        self.topo_order_idx
+            .iter()
+            .map(|&idx| {
+                let id = self.nodes[idx].0.clone();
+                let result = self.nodes[idx].1.finish();
+                (id, result)
+            })
+            .collect()
+    }
+
     pub fn node_index(&self) -> &HashMap<String, usize> {
         &self.node_index
     }
@@ -245,9 +294,7 @@ fn topo_sort(
         .collect();
 
     // Sort for determinism
-    let mut sorted_queue: Vec<usize> = queue.drain(..).collect();
-    sorted_queue.sort();
-    queue.extend(sorted_queue);
+    queue.make_contiguous().sort();
 
     let mut order = Vec::with_capacity(n);
     let mut visited = HashSet::new();
@@ -324,5 +371,41 @@ mod tests {
         let index: HashMap<String, usize> = [("solo".to_string(), 0)].into();
         let order = topo_sort(&ids, &[], &index).unwrap();
         assert_eq!(order, vec!["solo"]);
+    }
+
+    #[test]
+    fn invalid_node_id_double_underscore() {
+        use crate::node::Node;
+        use crate::world::{NodeDef, World};
+        let mut registry = NodeRegistry::new();
+        // Register a minimal node type for the test.
+        struct Dummy;
+        impl Node for Dummy {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, _: &[&[f32]], _: &mut [&mut [f32]], _: usize) {}
+        }
+        registry.register_full(
+            "Dummy",
+            vec![],
+            vec![],
+            vec![],
+            Box::new(|_| Box::new(Dummy) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            nodes: vec![NodeDef {
+                id: "foo__bar".to_string(),
+                ty: "Dummy".to_string(),
+                params: Default::default(),
+            }],
+            connections: vec![],
+        };
+
+        let result = Engine::build(&world, &registry, 48000, 512);
+        assert!(
+            matches!(result, Err(EngineError::InvalidNodeId(ref id, _)) if id == "foo__bar"),
+            "expected InvalidNodeId error"
+        );
     }
 }

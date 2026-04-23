@@ -2,7 +2,11 @@
 members = [
     "engine",
     "cli",
-    "node-sine-source",
+    "node-synth-sine",
+    "node-synth-vibrato-sine",
+    "node-synth-pink-noise",
+    "node-mix-sum",
+    "node-audio-stats-sink",
     "node-passthrough",
     "node-null-sink",
     "node-tracer",

@@ -1,0 +1,14 @@
+{
+  "$schema": "../../schema/world.schema.json",
+  "nodes": [
+    {"id": "tone", "type": "SynthSine", "params": {"freq": 440.0, "amplitude": 0.7071, "phase": 0.0}},
+    {"id": "noise", "type": "SynthPinkNoise", "params": {"amplitude": 0.0707, "seed": 1.0}},
+    {"id": "mix", "type": "MixSum", "params": {"channels": 2.0}},
+    {"id": "sink", "type": "AudioStatsSink", "params": {"expected_rms": 0.50498, "tolerance_db": 0.5}}
+  ],
+  "connections": [
+    {"from": "tone.audio_out", "to": "mix.in_0"},
+    {"from": "noise.audio_out", "to": "mix.in_1"},
+    {"from": "mix.out", "to": "sink.audio_in"}
+  ]
+}

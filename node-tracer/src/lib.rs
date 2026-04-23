@@ -1,4 +1,4 @@
-use engine::{Node, NodeRegistry, ParamSpec, PortSpec, PortType};
+use engine::{Node, NodeRegistry, PortSpec, PortType};
 use std::collections::HashMap;
 
 pub struct Tracer {
@@ -49,23 +49,6 @@ impl Tracer {
 }
 
 impl Node for Tracer {
-    fn declare_ports(&self) -> (Vec<PortSpec>, Vec<PortSpec>) {
-        (
-            vec![PortSpec {
-                name: "audio_in",
-                ty: PortType::Audio,
-            }],
-            vec![PortSpec {
-                name: "audio_out",
-                ty: PortType::Audio,
-            }],
-        )
-    }
-
-    fn declare_parameters(&self) -> Vec<ParamSpec> {
-        vec![]
-    }
-
     fn prepare(&mut self, id: &str, _sample_rate: u32, block_size: usize) {
         self.label = Self::decode_id(id);
         self.block_size = block_size;
@@ -88,8 +71,17 @@ impl Node for Tracer {
 }
 
 pub fn register(registry: &mut NodeRegistry) {
-    registry.register(
+    registry.register_full(
         "Tracer",
+        vec![PortSpec {
+            name: "audio_in",
+            ty: PortType::Audio,
+        }],
+        vec![PortSpec {
+            name: "audio_out",
+            ty: PortType::Audio,
+        }],
+        vec![],
         Box::new(|_params: &HashMap<String, f64>| Box::new(Tracer::new()) as Box<dyn Node>),
     );
 }
