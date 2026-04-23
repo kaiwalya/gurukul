@@ -15,6 +15,7 @@ node-synth-pink-noise = { path = "../node-synth-pink-noise" }
 node-mix-sum = { path = "../node-mix-sum" }
 node-rms-meter = { path = "../node-rms-meter" }
 node-assert-near = { path = "../node-assert-near" }
+node-gain = { path = "../node-gain" }
 node-passthrough = { path = "../node-passthrough" }
 node-null-sink = { path = "../node-null-sink" }
 node-tracer = { path = "../node-tracer" }

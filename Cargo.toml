@@ -8,6 +8,7 @@ members = [
     "node-mix-sum",
     "node-rms-meter",
     "node-assert-near",
+    "node-gain",
     "node-passthrough",
     "node-null-sink",
     "node-tracer",

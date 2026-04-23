@@ -95,6 +95,7 @@ fn build_registry() -> NodeRegistry {
     node_mix_sum::register(&mut registry);
     node_rms_meter::register(&mut registry);
     node_assert_near::register(&mut registry);
+    node_gain::register(&mut registry);
     node_passthrough::register(&mut registry);
     node_null_sink::register(&mut registry);
     node_tracer::register(&mut registry);
@@ -531,6 +532,7 @@ mod tests {
         assert!(types.contains(&"MixSum"));
         assert!(types.contains(&"RmsMeter"));
         assert!(types.contains(&"AssertNear"));
+        assert!(types.contains(&"GainNode"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));
         assert!(types.contains(&"Tracer"));

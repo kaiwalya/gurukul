@@ -199,6 +199,7 @@ dependencies = [
  "engine",
  "jsonschema",
  "node-assert-near",
+ "node-gain",
  "node-mix-sum",
  "node-null-sink",
  "node-passthrough",
@@ -664,6 +665,13 @@ dependencies = [
 
 [[package]]
 name = "node-assert-near"
+version = "0.1.0"
+dependencies = [
+ "engine",
+]
+
+[[package]]
+name = "node-gain"
 version = "0.1.0"
 dependencies = [
  "engine",
