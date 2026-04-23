@@ -3,6 +3,16 @@ use std::collections::HashMap;
 
 const NUM_OCTAVES: usize = 7;
 
+/// SplitMix64 hash — mixes a seed value before use so nearby seeds produce uncorrelated streams.
+/// Returns the mixed value; the internal state increment does not need to persist (we call once).
+fn splitmix64(state: u64) -> u64 {
+    let state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 /// Xorshift64 PRNG — avoids any external dependency.
 fn xorshift64(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -43,8 +53,11 @@ impl SynthPinkNoise {
 
 impl Node for SynthPinkNoise {
     fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {
-        // Treat seed=0 as 1 to prevent xorshift from getting stuck in the all-zeros state.
-        self.state = if self.seed == 0 { 1 } else { self.seed };
+        // Run seed through SplitMix64 so nearby seeds (e.g. per-cell sweep indices) produce
+        // uncorrelated xorshift64 streams. Guard against the mixed value being zero, which
+        // would also get xorshift64 stuck.
+        let mixed = splitmix64(if self.seed == 0 { 1 } else { self.seed });
+        self.state = if mixed == 0 { 1 } else { mixed };
         // Allocate octave state here, not in process().
         self.octave_values = vec![0.0f32; NUM_OCTAVES];
         // Warm up octave values with one white sample each.
@@ -158,6 +171,44 @@ mod tests {
         let out = run_pink(7, 4096);
         for (i, &s) in out.iter().enumerate() {
             assert!(s.is_finite(), "sample {i} is not finite: {s}");
+        }
+    }
+
+    fn pearson(a: &[f32], b: &[f32]) -> f64 {
+        let n = a.len() as f64;
+        let mean_a = a.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let mean_b = b.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let mut num = 0.0f64;
+        let mut den_a = 0.0f64;
+        let mut den_b = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let da = x as f64 - mean_a;
+            let db = y as f64 - mean_b;
+            num += da * db;
+            den_a += da * da;
+            den_b += db * db;
+        }
+        num / (den_a.sqrt() * den_b.sqrt())
+    }
+
+    #[test]
+    fn nearby_seeds_are_uncorrelated() {
+        let n = 4096;
+        let s1 = run_pink(1, n);
+        let s2 = run_pink(2, n);
+        let s3 = run_pink(3, n);
+        let s4 = run_pink(4, n);
+
+        for (pair, (a, b)) in [
+            ("(1,2)", (&s1, &s2)),
+            ("(2,3)", (&s2, &s3)),
+            ("(3,4)", (&s3, &s4)),
+        ] {
+            let r = pearson(a, b).abs();
+            assert!(
+                r < 0.1,
+                "seeds {pair} have |r|={r:.4}, expected < 0.1 (SplitMix64 mixing insufficient)"
+            );
         }
     }
 }
