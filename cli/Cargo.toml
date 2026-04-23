@@ -18,6 +18,7 @@ node-assert-near = { path = "../node-assert-near" }
 node-gain = { path = "../node-gain" }
 node-passthrough = { path = "../node-passthrough" }
 node-null-sink = { path = "../node-null-sink" }
+node-pitch-yin = { path = "../node-pitch-yin" }
 node-tracer = { path = "../node-tracer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
