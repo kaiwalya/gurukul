@@ -198,10 +198,11 @@ dependencies = [
  "clap",
  "engine",
  "jsonschema",
- "node-audio-stats-sink",
+ "node-assert-near",
  "node-mix-sum",
  "node-null-sink",
  "node-passthrough",
+ "node-rms-meter",
  "node-synth-pink-noise",
  "node-synth-sine",
  "node-synth-vibrato-sine",
@@ -662,7 +663,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "node-audio-stats-sink"
+name = "node-assert-near"
 version = "0.1.0"
 dependencies = [
  "engine",
@@ -684,6 +685,13 @@ dependencies = [
 
 [[package]]
 name = "node-passthrough"
+version = "0.1.0"
+dependencies = [
+ "engine",
+]
+
+[[package]]
+name = "node-rms-meter"
 version = "0.1.0"
 dependencies = [
  "engine",

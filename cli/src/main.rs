@@ -53,7 +53,7 @@ enum Command {
         block_size: usize,
     },
 
-    /// Run all world files in a directory (or a single file) and check AudioStatsSink assertions.
+    /// Run all world files in a directory (or a single file) and check AssertNear assertions.
     Test {
         /// Path to a world file or directory of world files.
         path: PathBuf,
@@ -93,7 +93,8 @@ fn build_registry() -> NodeRegistry {
     node_synth_vibrato_sine::register(&mut registry);
     node_synth_pink_noise::register(&mut registry);
     node_mix_sum::register(&mut registry);
-    node_audio_stats_sink::register(&mut registry);
+    node_rms_meter::register(&mut registry);
+    node_assert_near::register(&mut registry);
     node_passthrough::register(&mut registry);
     node_null_sink::register(&mut registry);
     node_tracer::register(&mut registry);
@@ -528,7 +529,8 @@ mod tests {
         assert!(types.contains(&"SynthVibratoSine"));
         assert!(types.contains(&"SynthPinkNoise"));
         assert!(types.contains(&"MixSum"));
-        assert!(types.contains(&"AudioStatsSink"));
+        assert!(types.contains(&"RmsMeter"));
+        assert!(types.contains(&"AssertNear"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));
         assert!(types.contains(&"Tracer"));

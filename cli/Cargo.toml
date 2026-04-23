@@ -13,7 +13,8 @@ node-synth-sine = { path = "../node-synth-sine" }
 node-synth-vibrato-sine = { path = "../node-synth-vibrato-sine" }
 node-synth-pink-noise = { path = "../node-synth-pink-noise" }
 node-mix-sum = { path = "../node-mix-sum" }
-node-audio-stats-sink = { path = "../node-audio-stats-sink" }
+node-rms-meter = { path = "../node-rms-meter" }
+node-assert-near = { path = "../node-assert-near" }
 node-passthrough = { path = "../node-passthrough" }
 node-null-sink = { path = "../node-null-sink" }
 node-tracer = { path = "../node-tracer" }

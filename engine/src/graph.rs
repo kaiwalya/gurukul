@@ -63,6 +63,9 @@ pub struct Engine {
     input_buffers: Vec<Vec<Vec<f32>>>,
     // Per (node_idx, out_port_idx): does anything downstream consume it?
     output_has_downstream: Vec<Vec<bool>>,
+    // Per-node list of output port names, in declaration order. Populated during build().
+    // Used by last_block() to resolve a port name to a buffer index.
+    output_port_names: Vec<Vec<String>>,
 }
 
 impl Engine {
@@ -160,6 +163,12 @@ impl Engine {
             output_has_downstream[s_node][s_port] = true;
         }
 
+        // Persist output port names for last_block() lookups.
+        let output_port_names: Vec<Vec<String>> = node_ports
+            .iter()
+            .map(|(_, outputs)| outputs.iter().map(|p| p.name.to_string()).collect())
+            .collect();
+
         // Resolve topo order ids to indices once.
         let topo_order_idx: Vec<usize> = topo_order.iter().map(|id| node_index[id]).collect();
 
@@ -174,6 +183,7 @@ impl Engine {
             output_buffers,
             input_buffers,
             output_has_downstream,
+            output_port_names,
         };
 
         // Call prepare on every node, passing the node's own id.
@@ -258,6 +268,30 @@ impl Engine {
 
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// Read the last block written to an output port on a node.
+    ///
+    /// Valid only after `finish()` or the final `run_blocks()` call completes — this is a
+    /// test/debug affordance for inspecting terminal state, NOT the subscription API
+    /// (see `ARCHITECTURE.md` § "Port addressing and subscription"). The real read-side will be
+    /// stream-based and carry timestamps; do not build production tools on this accessor.
+    ///
+    /// The returned slice has length up to `block_size()`; future variable-tail-block runs may
+    /// return a shorter slice, so callers must check `.len()` rather than indexing unconditionally.
+    pub fn last_block(&self, node_id: &str, port_name: &str) -> Result<&[f32], EngineError> {
+        let node_idx = self
+            .node_index
+            .get(node_id)
+            .copied()
+            .ok_or_else(|| EngineError::NodeNotFound(node_id.to_string()))?;
+
+        let port_idx = self.output_port_names[node_idx]
+            .iter()
+            .position(|n| n == port_name)
+            .ok_or_else(|| EngineError::PortNotFound(port_name.to_string(), node_id.to_string()))?;
+
+        Ok(&self.output_buffers[node_idx][port_idx])
     }
 }
 
@@ -371,6 +405,98 @@ mod tests {
         let index: HashMap<String, usize> = [("solo".to_string(), 0)].into();
         let order = topo_sort(&ids, &[], &index).unwrap();
         assert_eq!(order, vec!["solo"]);
+    }
+
+    #[test]
+    fn last_block_returns_output_after_run() {
+        use crate::node::Node;
+        use crate::world::{NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+
+        // A node with one output that fills it with a known constant on every process() call.
+        struct ConstantSource;
+        impl Node for ConstantSource {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, _: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
+                if let Some(out) = outputs.first_mut() {
+                    out[..nframes].fill(0.25);
+                }
+            }
+        }
+
+        use crate::node::{PortSpec, PortType};
+        registry.register_full(
+            "ConstantSource",
+            vec![],
+            vec![PortSpec {
+                name: "audio_out",
+                ty: PortType::Audio,
+            }],
+            vec![],
+            Box::new(|_| Box::new(ConstantSource) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            nodes: vec![NodeDef {
+                id: "src".to_string(),
+                ty: "ConstantSource".to_string(),
+                params: Default::default(),
+            }],
+            connections: vec![],
+        };
+
+        let block_size = 256;
+        let mut engine = Engine::build(&world, &registry, 48000, block_size).unwrap();
+        engine.run_blocks(1);
+
+        let buf = engine.last_block("src", "audio_out").unwrap();
+        assert_eq!(buf.len(), block_size);
+        assert!(
+            buf.iter().all(|&s| (s - 0.25).abs() < 1e-9),
+            "expected all samples to be 0.25"
+        );
+    }
+
+    #[test]
+    fn last_block_errors_on_missing_node() {
+        use crate::node::Node;
+        use crate::world::{NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+        struct Dummy;
+        impl Node for Dummy {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, _: &[&[f32]], _: &mut [&mut [f32]], _: usize) {}
+        }
+        registry.register_full(
+            "Dummy",
+            vec![],
+            vec![],
+            vec![],
+            Box::new(|_| Box::new(Dummy) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            nodes: vec![NodeDef {
+                id: "n".to_string(),
+                ty: "Dummy".to_string(),
+                params: Default::default(),
+            }],
+            connections: vec![],
+        };
+
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        assert!(matches!(
+            engine.last_block("missing", "x"),
+            Err(EngineError::NodeNotFound(_))
+        ));
+        assert!(matches!(
+            engine.last_block("n", "no_such_port"),
+            Err(EngineError::PortNotFound(_, _))
+        ));
     }
 
     #[test]

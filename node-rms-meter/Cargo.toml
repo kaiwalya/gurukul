@@ -1,5 +1,5 @@
 [package]
-name = "node-audio-stats-sink"
+name = "node-rms-meter"
 version = "0.1.0"
 edition = "2024"
 
