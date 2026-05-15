@@ -9,3 +9,4 @@ engine = { path = "../engine" }
 [dev-dependencies]
 node-synth-vibrato-sine = { path = "../node-synth-vibrato-sine" }
 node-pitch-yin = { path = "../node-pitch-yin" }
+assert_no_alloc = "1.1.2"

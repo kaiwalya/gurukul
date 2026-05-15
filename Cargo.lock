@@ -767,6 +767,7 @@ dependencies = [
 name = "node-vibrato"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
  "engine",
  "node-pitch-yin",
  "node-synth-vibrato-sine",

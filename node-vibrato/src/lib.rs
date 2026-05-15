@@ -49,6 +49,12 @@ pub struct Vibrato {
     // Last held estimates (zero-order hold).
     held_rate: f32,
     held_depth: f32,
+
+    // Scratches sized in new(); reused each analysis via clear() + push() so
+    // no allocation occurs once the node is constructed. See the no_alloc
+    // integration test.
+    centred: Vec<f32>,
+    rns: Vec<f32>,
 }
 
 impl Vibrato {
@@ -59,10 +65,12 @@ impl Vibrato {
         rate_min_hz: f32,
         rate_max_hz: f32,
     ) -> Self {
+        let decimation = decimation.max(1);
+        let decim_cap = window_samples / decimation;
         Self {
             window_samples,
             analysis_hop,
-            decimation: decimation.max(1),
+            decimation,
             rate_min_hz,
             rate_max_hz,
             sample_rate: 48000.0,
@@ -72,115 +80,134 @@ impl Vibrato {
             total_samples: 0,
             held_rate: 0.0,
             held_depth: 0.0,
+            // Centred contour can be at most `decim_cap` entries (when every
+            // decimated sample is voiced). The autocorr scratch is sized to
+            // the worst-case lag range, which is bounded by `decim_cap / 2`.
+            centred: Vec::with_capacity(decim_cap),
+            rns: Vec::with_capacity(decim_cap / 2 + 1),
         }
     }
 
-    /// Decimate the ring by `self.decimation` and return values in temporal
-    /// order (oldest → newest). The ring is laid out in audio-sample order
-    /// with `ring_write` pointing at the next slot to overwrite (i.e. the
-    /// oldest sample).
-    fn decimated_window(&self) -> Vec<f32> {
-        let n_out = self.window_samples / self.decimation;
-        let mut out = Vec::with_capacity(n_out);
-        for k in 0..n_out {
+    /// Run one analysis on the current window contents, writing results into
+    /// `(self.held_rate, self.held_depth)`. Allocation-free: scratches are
+    /// pre-sized and reused.
+    fn analyse(&mut self) {
+        // Pull voiced f0 samples from the ring (decimated), convert to cents,
+        // accumulate sum for mean-centring in one pass.
+        self.centred.clear();
+        let n_decim = self.window_samples / self.decimation;
+        let mut sum = 0.0f32;
+        for k in 0..n_decim {
             let idx = (self.ring_write + k * self.decimation) % self.window_samples;
-            out.push(self.ring[idx]);
-        }
-        out
-    }
-
-    /// Run one analysis on the current window. Returns `(rate_hz, depth_cents)`;
-    /// either may be 0.0 if estimation fails (too few voiced samples, no clear
-    /// peak, etc.).
-    fn analyse(&self) -> (f32, f32) {
-        let window = self.decimated_window();
-
-        // Convert voiced samples to cents space, dropping unvoiced.
-        let cents: Vec<f32> = window
-            .iter()
-            .filter(|&&f| f > 0.0)
-            .map(|&f| 1200.0 * f.log2())
-            .collect();
-
-        let voiced_frac = cents.len() as f32 / window.len() as f32;
-        if voiced_frac < 0.5 || cents.len() < 32 {
-            return (0.0, 0.0);
+            let f = self.ring[idx];
+            if f > 0.0 {
+                let c = 1200.0 * f.log2();
+                self.centred.push(c);
+                sum += c;
+            }
         }
 
-        // Centre.
-        let mean: f32 = cents.iter().sum::<f32>() / cents.len() as f32;
-        let centred: Vec<f32> = cents.iter().map(|c| c - mean).collect();
+        let n = self.centred.len();
+        let voiced_frac = n as f32 / n_decim as f32;
+        if voiced_frac < 0.5 || n < 32 {
+            self.held_rate = 0.0;
+            self.held_depth = 0.0;
+            return;
+        }
+
+        // Centre in place.
+        let mean = sum / n as f32;
+        for c in self.centred.iter_mut() {
+            *c -= mean;
+        }
 
         // Depth = half the peak-to-peak range. Sin modulation of amplitude D
         // gives a centred range of 2D, so half-range = D.
-        let cmax = centred.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let cmin = centred.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mut cmax = f32::NEG_INFINITY;
+        let mut cmin = f32::INFINITY;
+        let mut sum_sq = 0.0f32;
+        for &c in self.centred.iter() {
+            if c > cmax {
+                cmax = c;
+            }
+            if c < cmin {
+                cmin = c;
+            }
+            sum_sq += c * c;
+        }
         let depth = (cmax - cmin) * 0.5;
+        self.held_depth = depth;
 
         // Contour sample rate is audio_sr / decimation.
         let contour_sr = self.sample_rate / self.decimation as f32;
         let lag_max = (contour_sr / self.rate_min_hz) as usize;
         let lag_min = (contour_sr / self.rate_max_hz).max(2.0) as usize;
-        let lag_max = lag_max.min(centred.len() / 2);
+        let lag_max = lag_max.min(n / 2);
         if lag_max <= lag_min + 2 {
-            return (0.0, depth);
+            self.held_rate = 0.0;
+            return;
         }
 
-        // RMS in cents — guards against treating numerical noise as signal.
-        // Real vibrato has RMS comparable to depth/√2; below 1 cent RMS we
-        // can't reliably distinguish modulation from f32 roundoff.
-        let mean_sq: f32 = centred.iter().map(|c| c * c).sum::<f32>() / centred.len() as f32;
+        // RMS guard — below 1 cent RMS, we're chasing f32 roundoff.
+        let mean_sq = sum_sq / n as f32;
         let rms = mean_sq.sqrt();
         if rms < 1.0 {
-            return (0.0, depth);
+            self.held_rate = 0.0;
+            return;
         }
 
-        // Unbiased normalised autocorrelation r̂(lag) = mean(c[i]*c[i+lag]) /
-        // variance. A pure sinusoid gives r̂(period) = +1. Subharmonics (lag =
-        // 2T, 3T, ...) also give ~+1, so we cannot just take the global max —
-        // we take the *first* local maximum that crosses a strong-peak
-        // threshold, which is the fundamental period.
-        let mut rns: Vec<f32> = Vec::with_capacity(lag_max - lag_min + 1);
+        // Unbiased normalised autocorrelation. Sub-harmonics also peak near
+        // +1, so we pick the *first* local maximum above 0.8 × global max —
+        // that's the fundamental period, not a multiple.
+        self.rns.clear();
         for lag in lag_min..=lag_max {
             let mut r = 0.0f32;
-            let n = centred.len() - lag;
-            for i in 0..n {
-                r += centred[i] * centred[i + lag];
+            let nover = n - lag;
+            for i in 0..nover {
+                r += self.centred[i] * self.centred[i + lag];
             }
-            rns.push((r / n as f32) / mean_sq);
+            self.rns.push((r / nover as f32) / mean_sq);
         }
 
-        // Need at least one strong-enough peak anywhere.
-        let global_max = rns.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut global_max = f32::NEG_INFINITY;
+        for &v in self.rns.iter() {
+            if v > global_max {
+                global_max = v;
+            }
+        }
         if global_max < 0.7 {
-            return (0.0, depth);
+            self.held_rate = 0.0;
+            return;
         }
 
-        // Walk from the shortest lag; find the first interior local maximum
-        // that is ≥ 0.8 of the global max. That's the vibrato period.
         let threshold = global_max * 0.8;
         let mut chosen_lag = lag_min;
         let mut found = false;
-        for k in 1..rns.len() - 1 {
-            if rns[k] >= threshold && rns[k] >= rns[k - 1] && rns[k] >= rns[k + 1] {
+        for k in 1..self.rns.len() - 1 {
+            if self.rns[k] >= threshold
+                && self.rns[k] >= self.rns[k - 1]
+                && self.rns[k] >= self.rns[k + 1]
+            {
                 chosen_lag = lag_min + k;
                 found = true;
                 break;
             }
         }
         if !found {
-            // Fall back to the global max position.
-            let idx = rns
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            chosen_lag = lag_min + idx;
+            // Fall back to the global max position. We have to find it again
+            // without allocating an iterator chain.
+            let mut best_idx = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &v) in self.rns.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_idx = i;
+                }
+            }
+            chosen_lag = lag_min + best_idx;
         }
 
-        let rate = contour_sr / chosen_lag as f32;
-        (rate, depth)
+        self.held_rate = contour_sr / chosen_lag as f32;
     }
 }
 
@@ -212,9 +239,7 @@ impl Node for Vibrato {
             if self.samples_since_analysis >= self.analysis_hop
                 && self.total_samples >= self.window_samples
             {
-                let (rate, depth) = self.analyse();
-                self.held_rate = rate;
-                self.held_depth = depth;
+                self.analyse();
                 self.samples_since_analysis = 0;
             }
         }
