@@ -11,3 +11,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+assert_no_alloc = "1.1.2"

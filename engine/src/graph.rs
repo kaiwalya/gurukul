@@ -66,7 +66,22 @@ pub struct Engine {
     // Per-node list of output port names, in declaration order. Populated during build().
     // Used by last_block() to resolve a port name to a buffer index.
     output_port_names: Vec<Vec<String>>,
+    // Pre-allocated scratches for materialising `&[&[f32]]` / `&mut [&mut [f32]]`
+    // views into the per-node input/output buffers without allocating each block.
+    // Each inner Vec is sized at build(); only the contents change per block.
+    // Stored as raw (ptr, len) pairs because Rust references would impose lifetime
+    // constraints we cannot satisfy across calls. Reborrowed to real slices inside
+    // run_blocks; see safety comment there.
+    input_ptr_scratch: Vec<Vec<(*const f32, usize)>>,
+    output_ptr_scratch: Vec<Vec<(*mut f32, usize)>>,
 }
+
+// SAFETY: the pointer scratches alias into `input_buffers` / `output_buffers`,
+// which the Engine owns and never reallocates after build(). They are only
+// dereferenced inside `run_blocks`, which takes `&mut self`, so no concurrent
+// access is possible. The Engine is otherwise Send (all Node trait objects are
+// Send); these raw-pointer fields do not change that.
+unsafe impl Send for Engine {}
 
 impl Engine {
     /// Build and prepare an Engine from a World definition.
@@ -169,6 +184,16 @@ impl Engine {
             .map(|(_, outputs)| outputs.iter().map(|p| p.name.to_string()).collect())
             .collect();
 
+        // Pre-size pointer scratches; populated per-block in run_blocks.
+        let input_ptr_scratch: Vec<Vec<(*const f32, usize)>> = input_buffers
+            .iter()
+            .map(|node_inputs| vec![(std::ptr::null(), 0usize); node_inputs.len()])
+            .collect();
+        let output_ptr_scratch: Vec<Vec<(*mut f32, usize)>> = output_buffers
+            .iter()
+            .map(|node_outputs| vec![(std::ptr::null_mut(), 0usize); node_outputs.len()])
+            .collect();
+
         // Resolve topo order ids to indices once.
         let topo_order_idx: Vec<usize> = topo_order.iter().map(|id| node_index[id]).collect();
 
@@ -184,6 +209,8 @@ impl Engine {
             input_buffers,
             output_has_downstream,
             output_port_names,
+            input_ptr_scratch,
+            output_ptr_scratch,
         };
 
         // Call prepare on every node, passing the node's own id.
@@ -198,7 +225,14 @@ impl Engine {
     }
 
     /// Run for `n_blocks` blocks.
+    ///
+    /// Hot path discipline: this function must not allocate. Per-node input/output
+    /// slice arrays are materialised into pre-sized `(ptr, len)` scratches owned by
+    /// the Engine, then reborrowed as `&[&[f32]]` / `&mut [&mut [f32]]` via the
+    /// stable layout of fat slice pointers. See `tests/no_alloc.rs` for the
+    /// regression check.
     pub fn run_blocks(&mut self, n_blocks: u64) {
+        let block_size = self.block_size;
         for _ in 0..n_blocks {
             for node_inputs in &mut self.input_buffers {
                 for buf in node_inputs {
@@ -206,18 +240,39 @@ impl Engine {
                 }
             }
 
-            for &node_idx in &self.topo_order_idx {
-                let input_slices: Vec<&[f32]> = self.input_buffers[node_idx]
-                    .iter()
-                    .map(|v| v.as_slice())
-                    .collect();
+            for topo_pos in 0..self.topo_order_idx.len() {
+                let node_idx = self.topo_order_idx[topo_pos];
 
-                {
-                    let output_bufs = &mut self.output_buffers[node_idx];
-                    let mut output_slices: Vec<&mut [f32]> =
-                        output_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
-                    let (_, node) = &mut self.nodes[node_idx];
-                    node.process(&input_slices, &mut output_slices, self.block_size);
+                // Populate (ptr, len) scratches from the buffer Vecs. No allocation:
+                // the scratch Vecs were sized in build(); we only overwrite contents.
+                for (port_idx, buf) in self.input_buffers[node_idx].iter().enumerate() {
+                    self.input_ptr_scratch[node_idx][port_idx] = (buf.as_ptr(), block_size);
+                }
+                for (port_idx, buf) in self.output_buffers[node_idx].iter_mut().enumerate() {
+                    self.output_ptr_scratch[node_idx][port_idx] = (buf.as_mut_ptr(), block_size);
+                }
+
+                let in_scratch = &self.input_ptr_scratch[node_idx];
+                let out_scratch = &mut self.output_ptr_scratch[node_idx];
+                let (_, node) = &mut self.nodes[node_idx];
+
+                // SAFETY: `&[f32]` and `&mut [f32]` have the documented layout
+                // `(ptr, len)` (Rust slice ABI). The scratches above hold valid
+                // `(ptr, len)` pairs into buffers owned by this Engine; those
+                // buffers are not realloc'd during run_blocks and inputs vs outputs
+                // are stored in disjoint fields so the views do not alias. The
+                // reborrowed slices outlive only `node.process()`, which returns
+                // before we touch the buffers again.
+                unsafe {
+                    let in_refs: &[&[f32]] = std::slice::from_raw_parts(
+                        in_scratch.as_ptr() as *const &[f32],
+                        in_scratch.len(),
+                    );
+                    let out_refs: &mut [&mut [f32]] = std::slice::from_raw_parts_mut(
+                        out_scratch.as_mut_ptr() as *mut &mut [f32],
+                        out_scratch.len(),
+                    );
+                    node.process(in_refs, out_refs, block_size);
                 }
 
                 for port_idx in 0..self.output_has_downstream[node_idx].len() {
