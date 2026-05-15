@@ -1,8 +1,8 @@
-/// Verifies that Vibrato::process() performs zero heap allocations on the
-/// hot path. Mirrors node-pitch-yin/tests/no_alloc.rs.
-///
-/// The global allocator is replaced with AllocDisabler for this test binary.
-/// Any allocation inside assert_no_alloc(|| { ... }) aborts the process.
+//! Verifies that Vibrato::process() performs zero heap allocations on the
+//! hot path. Mirrors node-pitch-yin/tests/no_alloc.rs.
+//!
+//! The global allocator is replaced with AllocDisabler for this test binary.
+//! Any allocation inside assert_no_alloc(|| { ... }) aborts the process.
 
 #[cfg(debug_assertions)]
 #[global_allocator]

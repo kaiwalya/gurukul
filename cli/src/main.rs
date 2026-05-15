@@ -102,6 +102,8 @@ fn build_registry() -> NodeRegistry {
     node_pitch_yin::register(&mut registry);
     node_tracer::register(&mut registry);
     node_vibrato::register(&mut registry);
+    node_synth_onsets::register(&mut registry);
+    node_onset::register(&mut registry);
     registry
 }
 
@@ -542,5 +544,7 @@ mod tests {
         assert!(types.contains(&"PitchYin"));
         assert!(types.contains(&"Tracer"));
         assert!(types.contains(&"Vibrato"));
+        assert!(types.contains(&"SynthOnsets"));
+        assert!(types.contains(&"Onset"));
     }
 }

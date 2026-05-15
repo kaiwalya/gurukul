@@ -66,3 +66,13 @@ jobs:
             target/tmp/vibrato_sweep.csv
             target/tmp/vibrato_sweep_grid.txt
           if-no-files-found: warn
+
+      - name: Upload onset sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onset-sweep
+          path: |
+            target/tmp/onset_sweep.csv
+            target/tmp/onset_sweep_grid.txt
+          if-no-files-found: warn

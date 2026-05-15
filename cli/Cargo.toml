@@ -22,6 +22,8 @@ node-pitch-error = { path = "../node-pitch-error" }
 node-pitch-yin = { path = "../node-pitch-yin" }
 node-tracer = { path = "../node-tracer" }
 node-vibrato = { path = "../node-vibrato" }
+node-synth-onsets = { path = "../node-synth-onsets" }
+node-onset = { path = "../node-onset" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

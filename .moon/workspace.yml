@@ -7,10 +7,12 @@ projects:
   - node-gain
   - node-mix-sum
   - node-null-sink
+  - node-onset
   - node-passthrough
   - node-pitch-error
   - node-pitch-yin
   - node-rms-meter
+  - node-synth-onsets
   - node-synth-pink-noise
   - node-synth-sine
   - node-synth-vibrato-sine

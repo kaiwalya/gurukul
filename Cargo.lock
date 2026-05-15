@@ -208,10 +208,12 @@ dependencies = [
  "node-gain",
  "node-mix-sum",
  "node-null-sink",
+ "node-onset",
  "node-passthrough",
  "node-pitch-error",
  "node-pitch-yin",
  "node-rms-meter",
+ "node-synth-onsets",
  "node-synth-pink-noise",
  "node-synth-sine",
  "node-synth-vibrato-sine",
@@ -702,6 +704,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "node-onset"
+version = "0.1.0"
+dependencies = [
+ "assert_no_alloc",
+ "engine",
+ "node-synth-onsets",
+]
+
+[[package]]
 name = "node-passthrough"
 version = "0.1.0"
 dependencies = [
@@ -730,6 +741,13 @@ dependencies = [
 
 [[package]]
 name = "node-rms-meter"
+version = "0.1.0"
+dependencies = [
+ "engine",
+]
+
+[[package]]
+name = "node-synth-onsets"
 version = "0.1.0"
 dependencies = [
  "engine",
