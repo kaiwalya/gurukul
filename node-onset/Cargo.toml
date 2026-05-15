@@ -8,4 +8,7 @@ engine = { path = "../engine" }
 
 [dev-dependencies]
 node-synth-onsets = { path = "../node-synth-onsets" }
+node-synth-pink-noise = { path = "../node-synth-pink-noise" }
+node-gain = { path = "../node-gain" }
+node-mix-sum = { path = "../node-mix-sum" }
 assert_no_alloc = "1.1.2"

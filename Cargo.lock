@@ -690,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "engine",
+ "node-mix-sum",
  "node-synth-breath",
  "node-synth-sine",
 ]
@@ -721,7 +722,10 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "engine",
+ "node-gain",
+ "node-mix-sum",
  "node-synth-onsets",
+ "node-synth-pink-noise",
 ]
 
 [[package]]
@@ -806,7 +810,10 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "engine",
+ "node-gain",
+ "node-mix-sum",
  "node-pitch-yin",
+ "node-synth-pink-noise",
  "node-synth-vibrato-sine",
 ]
 

@@ -8,5 +8,8 @@ engine = { path = "../engine" }
 
 [dev-dependencies]
 node-synth-vibrato-sine = { path = "../node-synth-vibrato-sine" }
+node-synth-pink-noise = { path = "../node-synth-pink-noise" }
 node-pitch-yin = { path = "../node-pitch-yin" }
+node-gain = { path = "../node-gain" }
+node-mix-sum = { path = "../node-mix-sum" }
 assert_no_alloc = "1.1.2"

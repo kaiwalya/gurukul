@@ -10,3 +10,4 @@ engine = { path = "../engine" }
 assert_no_alloc = "1.1.2"
 node-synth-breath = { path = "../node-synth-breath" }
 node-synth-sine = { path = "../node-synth-sine" }
+node-mix-sum = { path = "../node-mix-sum" }

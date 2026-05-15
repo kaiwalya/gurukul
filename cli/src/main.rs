@@ -643,10 +643,9 @@ mod tests {
         let registry = build_registry();
         let schema = build_world_schema(&registry).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        let bad: serde_json::Value = serde_json::from_str(
-            r#"{"nodes":[{"id":"x","type":"NoSuchNode"}],"connections":[]}"#,
-        )
-        .unwrap();
+        let bad: serde_json::Value =
+            serde_json::from_str(r#"{"nodes":[{"id":"x","type":"NoSuchNode"}],"connections":[]}"#)
+                .unwrap();
         assert!(validator.iter_errors(&bad).next().is_some());
     }
 

@@ -86,3 +86,33 @@ jobs:
             target/tmp/breath_sweep.csv
             target/tmp/breath_sweep_grid.txt
           if-no-files-found: warn
+
+      - name: Upload vibrato SNR sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibrato-snr-sweep
+          path: |
+            target/tmp/vibrato_snr_sweep.csv
+            target/tmp/vibrato_snr_sweep_grid.txt
+          if-no-files-found: warn
+
+      - name: Upload onset SNR sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onset-snr-sweep
+          path: |
+            target/tmp/onset_snr_sweep.csv
+            target/tmp/onset_snr_sweep_grid.txt
+          if-no-files-found: warn
+
+      - name: Upload breath distractor sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: breath-distractor-sweep
+          path: |
+            target/tmp/breath_distractor_sweep.csv
+            target/tmp/breath_distractor_sweep_grid.txt
+          if-no-files-found: warn
