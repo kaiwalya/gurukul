@@ -37,17 +37,22 @@ The engine is the **only** place that owns shared state and threading. Nothing e
 
 ## Plugins (nodes)
 
-Every node implements a small, stable contract:
+Every node implements a small, stable contract. As of phase 1.2 the Rust trait is:
 
+```rust
+trait Node: Send {
+    fn prepare(&mut self, id: &str, sample_rate: u32, block_size: usize);
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize);
+    fn finish(&mut self) -> Result<(), NodeError> { Ok(()) }  // default: no-op
+}
 ```
-class Node:
-    declare_ports() -> {inputs, outputs}              # audio/control/event/feature
-    declare_parameters() -> [ParamSpec]               # name, range, curve, default
-    declare_latency() -> samples
-    prepare(sample_rate, block_size) -> None          # called once
-    process(inputs, outputs, events, nframes)         # called every block
-    serialize_state() / restore_state()               # presets, sessions
-```
+
+Port and parameter declarations live in the `NodeRegistry` (one factory per node type), not on the trait — keeping the trait small and letting variadic nodes compute their port layout from params.
+
+Deferred to later phases (named here for the eventual VST3/CLAP/AU-shaped shape, but **not yet on the trait**):
+- `declare_latency()` — needed when Plugin Delay Compensation lands.
+- `serialize_state()` / `restore_state()` — needed when presets / sessions land.
+- Event ports — `process()` currently takes only audio/feature buffers; structured event streams arrive with the subscription API.
 
 This is VST3/CLAP/AU with the names changed. Do not invent a new protocol — scope the existing pattern to this domain.
 

@@ -16,13 +16,13 @@ Six stages, each shippable on its own. Each stage earns a product jump, not just
 
 Stage 1 is big enough to need its own phase plan. The ordering is deliberate: back-of-rack (engine, DSP, tests) before front-of-rack (pixels, live mic, phone). Each phase has a checkable artefact; the product ships at 1.5, and 1.6 ports it to phone.
 
-**Current phase: 1.2 — next up.** Phase 1.1 complete. This line is the single source of truth for project status; don't duplicate it elsewhere.
+**Current phase: 1.3 — next up.** Phases 1.0–1.2 complete. This line is the single source of truth for project status; don't duplicate it elsewhere.
 
 **Phase 1.0 — Engine skeleton + inspection. ✓ done.** Rust engine crate (`Node` trait, graph runner, world loader, port-subscription API per `ARCHITECTURE.md`). Three trivial nodes — `SineSource`, `Passthrough`, `NullSink` — each their own crate. A `gurukul` CLI (`list-nodes`, `describe-node`, `validate`, `run`, `render`). A JSON Schema for the world file format, treated as the authoritative interface contract (the file format the editor will eventually read and write, not a debug dump). Moonrepo + Cargo for build orchestration. Authoring surface at this phase is text editor + schema + CLI; the visual editor is deferred. The CLI and schema are part of 1.0, not later polish — "1.0 works" is unfalsifiable without them.
 
 **Phase 1.1 — Synth library + first test-mode world. ✓ done.** Synth node crates (`SynthSine`, `SynthVibratoSine`, `SynthPinkNoise`), a variadic `MixSum`, and an `AudioStatsSink` signal sanity check. Three test-mode worlds under `worlds/test/` (sine, vibrato, sine+pink) running end-to-end via `gurukul test`. Engine gained a `finish()` node hook and id validation; the `Node` trait shrank to `prepare`/`process`/`finish` with port and parameter declarations hoisted into the registry. `ParamSpec` carries a display unit. Tier-1 oracle loop is ready for the first real analyzer.
 
-**Phase 1.2 — First analyzer end-to-end.** Pitch detector (YIN). Ships with its paired synthesiser and a `pitch × SNR` sweep per `TESTING.md`. CI runs the sweep on every change. Back-of-rack only — results are CSV and a pass/fail grid, not pixels. From here an AI agent can author new analyzers against a working oracle loop.
+**Phase 1.2 — First analyzer end-to-end. ✓ done.** YIN pitch detector (`node-pitch-yin`), realtime-safe (zero alloc in `process()`, asserted by a `assert_no_alloc` test). Engine harness made realtime-safe too: `Engine::run_blocks` no longer allocates, with a companion no-alloc test at `engine/tests/no_alloc.rs`. Pitch error oracle (`node-pitch-error`) plus a `pitch × SNR` sweep test that asserts ≤10 cents median error for SNR ≥20 dB across a 5×6 grid; the sweep emits a CSV and a pass/fail grid as artifacts. CI runs the sweep on every push/PR and uploads both artifacts. Back-of-rack only — no pixels. From here an AI agent can author new analyzers against a working oracle loop.
 
 **Phase 1.3 — Remaining Stage-1 analyzers.** Vibrato, onset, breath. Each lands with its paired synth and sweep on the same day. Still headless. All four detection primitives exist and are individually validated against synthetic oracles and Tier-2 impairments.
 
@@ -32,13 +32,16 @@ Stage 1 is big enough to need its own phase plan. The ordering is deliberate: ba
 
 **Phase 1.6 — Phone port.** Rust core recompiled for `aarch64-apple-ios` and `aarch64-linux-android`. SwiftUI UI reused for iOS; Compose UI added for Android. Mic session plumbing per platform. The engine and analyzers do not change. This is where provisioning, device testing, and mobile audio-session quirks become live — deliberately deferred until there is something worth shipping.
 
-### Phase 1.1 follow-ups — do alongside 1.2
+### Phase 1.2 follow-ups — do alongside 1.3
 
-These three are coupled to 1.2's oracle work; doing them earlier is premature and doing them later means reshaping twice.
+These are coupled to 1.3's three-more-analyzers work; doing them earlier is premature and doing them later means reshaping multiple sweep tests instead of one.
 
-- `Node::finish() -> Result<(), NodeError>` returns too little. 1.2's feature-comparing oracle sink needs to emit a structured `Report` (pitch track, per-sample error, pass/fail grid cells per `TESTING.md`). Replace the `Result<(), _>` signature with something like `Result<Report, _>` where `Report` is a typed structured value, or change sinks to emit via a subscribable port instead of a return value.
-- Sinks currently `println!` from inside `finish()`. Move to a reporter pattern: nodes return structured results; the CLI/test harness formats and aggregates them. Unblocks parallel world execution and captured output.
-- `SynthPinkNoise` seeds feed straight into `xorshift64`; nearby seeds produce correlated output. When 1.2's `pitch × SNR` sweep indexes seeds by cell, pipe them through SplitMix64 (or equivalent) before first use.
+- **Typed `Report` from `Node::finish()`.** Carried over from the 1.1 follow-up list. `finish()` still returns `Result<(), NodeError>`; the sweep tests reconstruct their reports out-of-band by reading port outputs directly. Before 1.3 adds three more sweep tests (vibrato/onset/breath), promote `finish()` to return a typed `Report` (pitch track, per-sample error, pass/fail grid cells per `TESTING.md`), or expose results via a subscribable port. Reshape *with* the 1.3 work, not after.
+- **Tracer node-id encoding.** The `__trace__{id}__{port}__{counter}` string encoding (with engine-level reservation of the `__` substring) is a stringly-typed protocol that will calcify. Replace with either an explicit `Tracer { observed_path: String }` parameter or move splicing into the engine with a structured `TracePoint` table. This is also the right prototype for the eventual subscription API (`ARCHITECTURE.md` § "Port addressing and subscription") which 1.4 will need anyway.
+- **Float-sentinel `ParamSpec` cleanup.** `HashMap<String, f64>` for params has spawned sentinels in three places (`gain_linear = NaN` for "unset", `AssertNear::mode = 0.0|1.0` for enum, `Feature` port `0.0 = unvoiced`). The first sweep-test family is the natural moment to introduce a typed parameter representation before each new analyzer adds another sentinel.
+- **Registry-generated world schema.** `schema/world.schema.json` currently validates `{"type": "NoSuchNode", "params": {"chickens": 17}}`; the real contract lives in the registry. Generate per-node-type `oneOf` branches at `emit-schema` time so CLAUDE.md's "schema is the interface contract" claim becomes true. Roughly 100 lines.
+
+The `Phase 1.1 follow-up` originally on this list re: `SynthPinkNoise` seed mixing landed in 1.2 (`splitmix64` in `node-synth-pink-noise/src/lib.rs:6-9`).
 
 **Deferred past Stage 1:** visual graph editor. `ARCHITECTURE.md` is explicit that the editor is a client of the introspection API, and the API should be stressed by real node work before a canvas is built on top of it. The Phase 1.0 CLI + Graphviz renderer + JSON Schema serve the "see what nodes exist and how they connect" need until then.
 
