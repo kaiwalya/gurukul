@@ -56,3 +56,13 @@ jobs:
             target/tmp/pitch_sweep.csv
             target/tmp/pitch_sweep_grid.txt
           if-no-files-found: warn
+
+      - name: Upload vibrato sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibrato-sweep
+          path: |
+            target/tmp/vibrato_sweep.csv
+            target/tmp/vibrato_sweep_grid.txt
+          if-no-files-found: warn

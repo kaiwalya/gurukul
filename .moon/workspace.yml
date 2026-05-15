@@ -15,6 +15,7 @@ projects:
   - node-synth-sine
   - node-synth-vibrato-sine
   - node-tracer
+  - node-vibrato
   - schema
   - worlds
 

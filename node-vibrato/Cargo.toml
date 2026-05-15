@@ -1,0 +1,11 @@
+[package]
+name = "node-vibrato"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }
+
+[dev-dependencies]
+node-synth-vibrato-sine = { path = "../node-synth-vibrato-sine" }
+node-pitch-yin = { path = "../node-pitch-yin" }

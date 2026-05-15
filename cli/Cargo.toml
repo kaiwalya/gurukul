@@ -21,6 +21,7 @@ node-null-sink = { path = "../node-null-sink" }
 node-pitch-error = { path = "../node-pitch-error" }
 node-pitch-yin = { path = "../node-pitch-yin" }
 node-tracer = { path = "../node-tracer" }
+node-vibrato = { path = "../node-vibrato" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
