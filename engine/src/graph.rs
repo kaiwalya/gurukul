@@ -28,20 +28,14 @@ pub fn parse_port_path(path: &str) -> Result<(&str, &str), EngineError> {
     Ok((node_id, port_name))
 }
 
-/// Validate a user-chosen node id. Rejects empty ids, ids containing "__", and ids
-/// starting with "__trace__" (reserved for splice_tracers).
+/// Validate a node id. Rejects empty ids. Node ids are otherwise free-form;
+/// callers (including splice_tracers) are responsible for picking ids that do
+/// not collide with user-authored ids.
 fn validate_node_id(id: &str) -> Result<(), EngineError> {
     if id.is_empty() {
         return Err(EngineError::InvalidNodeId(
             id.to_string(),
             "id must not be empty".to_string(),
-        ));
-    }
-    if id.contains("__") {
-        return Err(EngineError::InvalidNodeId(
-            id.to_string(),
-            "id must not contain double underscores ('__') — reserved for internal tracer ids"
-                .to_string(),
         ));
     }
     Ok(())
@@ -93,13 +87,7 @@ impl Engine {
     ) -> Result<Self, EngineError> {
         // Validate node ids before doing anything else.
         for node_def in &world.nodes {
-            // Allow __trace__ ids since splice_tracers produces them. User-authored ids
-            // are rejected if they contain "__" at all.
-            // splice_tracers ids always start with "__trace__"; we only validate ids that
-            // don't start with "__trace__".
-            if !node_def.id.starts_with("__trace__") {
-                validate_node_id(&node_def.id)?;
-            }
+            validate_node_id(&node_def.id)?;
         }
 
         // Instantiate nodes
@@ -555,11 +543,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_node_id_double_underscore() {
+    fn empty_node_id_rejected() {
         use crate::node::Node;
         use crate::world::{NodeDef, World};
         let mut registry = NodeRegistry::new();
-        // Register a minimal node type for the test.
         struct Dummy;
         impl Node for Dummy {
             fn prepare(&mut self, _: &str, _: u32, _: usize) {}
@@ -576,7 +563,7 @@ mod tests {
         let world = World {
             schema: None,
             nodes: vec![NodeDef {
-                id: "foo__bar".to_string(),
+                id: String::new(),
                 ty: "Dummy".to_string(),
                 params: Default::default(),
             }],
@@ -585,8 +572,8 @@ mod tests {
 
         let result = Engine::build(&world, &registry, 48000, 512);
         assert!(
-            matches!(result, Err(EngineError::InvalidNodeId(ref id, _)) if id == "foo__bar"),
-            "expected InvalidNodeId error"
+            matches!(result, Err(EngineError::InvalidNodeId(ref id, _)) if id.is_empty()),
+            "expected InvalidNodeId error for empty id"
         );
     }
 }

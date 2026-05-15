@@ -216,11 +216,22 @@ fn cmd_validate(world_path: &PathBuf, registry: &NodeRegistry) -> Result<()> {
 
 /// Splice tracer nodes into a cloned world for each requested port path.
 ///
-/// Node id format: `__trace__{node_id}__{port_name}__{counter}` where `__` separates components.
-/// Assumption: user-chosen node ids and port names do not contain double underscores
-/// (enforced by Engine::build's id validation).
-fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry) -> Result<World> {
+/// Returns the rewritten world and a legend `Vec<(tracer_id, observed_port_path)>`
+/// so the caller can print a human-readable mapping. Tracer ids are simple
+/// `trace_N` strings — they carry no encoded information.
+fn splice_tracers(
+    world: &World,
+    trace_ports: &[String],
+    registry: &NodeRegistry,
+) -> Result<(World, Vec<(String, String)>)> {
     let mut world = world.clone();
+    let mut legend: Vec<(String, String)> = Vec::with_capacity(trace_ports.len());
+
+    // Pick a unique prefix that doesn't collide with any existing node id.
+    let mut prefix = "trace_".to_string();
+    while world.nodes.iter().any(|n| n.id.starts_with(&prefix)) {
+        prefix.insert(0, '_');
+    }
 
     for (counter, port_path) in trace_ports.iter().enumerate() {
         let (node_id, port_name) = port_path.split_once('.').with_context(|| {
@@ -249,9 +260,8 @@ fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry
             anyhow::bail!("port '{port_name}' not found on node '{node_id}'");
         }
 
-        // Build the tracer node id. Replace `.` in node_id/port_name with `__` would be
-        // ambiguous if they already contain `__`, but we assume they don't (enforced above).
-        let tracer_id = format!("__trace__{node_id}__{port_name}__{counter}");
+        let tracer_id = format!("{prefix}{counter}");
+        legend.push((tracer_id.clone(), port_path.clone()));
 
         world.nodes.push(NodeDef {
             id: tracer_id.clone(),
@@ -286,24 +296,27 @@ fn splice_tracers(world: &World, trace_ports: &[String], registry: &NodeRegistry
         }
     }
 
-    Ok(world)
+    Ok((world, legend))
 }
 
-/// Build an engine for a world file, optionally splicing tracers.
+/// Build an engine for a world file, optionally splicing tracers. Returns the
+/// engine and (if tracers were spliced) the tracer legend.
 fn build_engine_for_world(
     world_path: &PathBuf,
     trace_ports: &[String],
     registry: &NodeRegistry,
     sample_rate: u32,
     block_size: usize,
-) -> Result<Engine> {
+) -> Result<(Engine, Vec<(String, String)>)> {
     let world = load_world(world_path)?;
-    let world = if trace_ports.is_empty() {
-        world
+    let (world, legend) = if trace_ports.is_empty() {
+        (world, Vec::new())
     } else {
         splice_tracers(&world, trace_ports, registry)?
     };
-    Engine::build(&world, registry, sample_rate, block_size).context("building engine")
+    let engine =
+        Engine::build(&world, registry, sample_rate, block_size).context("building engine")?;
+    Ok((engine, legend))
 }
 
 fn cmd_run(
@@ -314,8 +327,11 @@ fn cmd_run(
     sample_rate: u32,
     block_size: usize,
 ) -> Result<()> {
-    let mut engine =
+    let (mut engine, legend) =
         build_engine_for_world(world_path, trace_ports, registry, sample_rate, block_size)?;
+    for (tracer_id, port_path) in &legend {
+        eprintln!("# {tracer_id} = {port_path}");
+    }
     let total_samples = parse_duration_samples(duration_str, sample_rate)?;
     let n_blocks = total_samples.div_ceil(block_size as u64);
     engine.run_blocks(n_blocks);
@@ -385,7 +401,8 @@ fn run_test_world(
     block_size: usize,
     registry: &NodeRegistry,
 ) -> Result<()> {
-    let mut engine = build_engine_for_world(world_path, &[], registry, sample_rate, block_size)?;
+    let (mut engine, _legend) =
+        build_engine_for_world(world_path, &[], registry, sample_rate, block_size)?;
 
     let total_samples = parse_duration_samples(duration_str, sample_rate)?;
     let n_blocks = total_samples.div_ceil(block_size as u64);
