@@ -1,0 +1,9 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+type: library
+language: rust
+
+dependsOn:
+  - engine
+  - node-synth-breath
+  - node-synth-sine

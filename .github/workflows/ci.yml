@@ -76,3 +76,13 @@ jobs:
             target/tmp/onset_sweep.csv
             target/tmp/onset_sweep_grid.txt
           if-no-files-found: warn
+
+      - name: Upload breath sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: breath-sweep
+          path: |
+            target/tmp/breath_sweep.csv
+            target/tmp/breath_sweep_grid.txt
+          if-no-files-found: warn

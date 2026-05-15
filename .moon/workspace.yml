@@ -12,6 +12,8 @@ projects:
   - node-pitch-error
   - node-pitch-yin
   - node-rms-meter
+  - node-breath
+  - node-synth-breath
   - node-synth-onsets
   - node-synth-pink-noise
   - node-synth-sine

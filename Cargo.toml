@@ -17,6 +17,8 @@ members = [
     "node-vibrato",
     "node-synth-onsets",
     "node-onset",
+    "node-synth-breath",
+    "node-breath",
 ]
 resolver = "2"
 

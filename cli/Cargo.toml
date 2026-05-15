@@ -24,6 +24,8 @@ node-tracer = { path = "../node-tracer" }
 node-vibrato = { path = "../node-vibrato" }
 node-synth-onsets = { path = "../node-synth-onsets" }
 node-onset = { path = "../node-onset" }
+node-synth-breath = { path = "../node-synth-breath" }
+node-breath = { path = "../node-breath" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

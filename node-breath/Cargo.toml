@@ -1,0 +1,12 @@
+[package]
+name = "node-breath"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"
+node-synth-breath = { path = "../node-synth-breath" }
+node-synth-sine = { path = "../node-synth-sine" }

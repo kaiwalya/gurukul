@@ -104,6 +104,8 @@ fn build_registry() -> NodeRegistry {
     node_vibrato::register(&mut registry);
     node_synth_onsets::register(&mut registry);
     node_onset::register(&mut registry);
+    node_synth_breath::register(&mut registry);
+    node_breath::register(&mut registry);
     registry
 }
 
@@ -546,5 +548,7 @@ mod tests {
         assert!(types.contains(&"Vibrato"));
         assert!(types.contains(&"SynthOnsets"));
         assert!(types.contains(&"Onset"));
+        assert!(types.contains(&"SynthBreath"));
+        assert!(types.contains(&"Breath"));
     }
 }
