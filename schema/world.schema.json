@@ -1,41 +1,7 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
-     Running `target/debug/gurukul emit-schema`
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "World",
-  "type": "object",
-  "required": [
-    "connections",
-    "nodes"
-  ],
-  "properties": {
-    "$schema": {
-      "description": "Path to the JSON Schema for this file (used by editors).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "connections": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/Connection"
-      }
-    },
-    "nodes": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/NodeDef"
-      }
-    }
-  },
   "definitions": {
     "Connection": {
-      "type": "object",
-      "required": [
-        "from",
-        "to"
-      ],
       "properties": {
         "from": {
           "description": "Source port path: `<node_id>.<port_name>`",
@@ -45,30 +11,707 @@
           "description": "Destination port path: `<node_id>.<port_name>`",
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
     },
     "NodeDef": {
-      "type": "object",
-      "required": [
-        "id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "expected": {
+                  "default": 0.0,
+                  "type": "number"
+                },
+                "mode": {
+                  "default": 0.0,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "tolerance_db": {
+                  "default": 0.5,
+                  "description": "unit: dB",
+                  "maximum": 120.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "AssertNear"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
         },
-        "params": {
-          "default": {},
-          "type": "object",
-          "additionalProperties": {
-            "type": "number",
-            "format": "double"
-          }
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "frame_samples": {
+                  "default": 1024.0,
+                  "description": "unit: samples",
+                  "maximum": 8192.0,
+                  "minimum": 64.0,
+                  "type": "number"
+                },
+                "hf_ratio_enter": {
+                  "default": 0.2,
+                  "maximum": 4.0,
+                  "minimum": 0.01,
+                  "type": "number"
+                },
+                "hf_ratio_exit": {
+                  "default": 0.1,
+                  "maximum": 4.0,
+                  "minimum": 0.005,
+                  "type": "number"
+                },
+                "min_energy": {
+                  "default": 0.00001,
+                  "maximum": 1.0,
+                  "minimum": 1e-9,
+                  "type": "number"
+                },
+                "min_release_samples": {
+                  "default": 2400.0,
+                  "description": "unit: samples",
+                  "maximum": 48000.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "Breath"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
         },
-        "type": {
-          "type": "string"
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "gain_db": {
+                  "default": 0.0,
+                  "description": "unit: dB",
+                  "maximum": 60.0,
+                  "minimum": -120.0,
+                  "type": "number"
+                },
+                "gain_linear": {
+                  "maximum": 1000000.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "GainNode"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "channels": {
+                  "default": 2.0,
+                  "description": "unit: count",
+                  "maximum": 16.0,
+                  "minimum": 2.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "MixSum"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "type": {
+              "const": "NullSink"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "baseline_alpha": {
+                  "default": 0.001,
+                  "maximum": 0.5,
+                  "minimum": 0.00001,
+                  "type": "number"
+                },
+                "frame_samples": {
+                  "default": 480.0,
+                  "description": "unit: samples",
+                  "maximum": 4800.0,
+                  "minimum": 32.0,
+                  "type": "number"
+                },
+                "min_separation_samples": {
+                  "default": 4800.0,
+                  "description": "unit: samples",
+                  "maximum": 48000.0,
+                  "minimum": 100.0,
+                  "type": "number"
+                },
+                "threshold_db": {
+                  "default": 12.0,
+                  "description": "unit: dB",
+                  "maximum": 60.0,
+                  "minimum": 1.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "Onset"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "type": {
+              "const": "Passthrough"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "type": {
+              "const": "PitchError"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "fmax_hz": {
+                  "default": 2000.0,
+                  "description": "unit: Hz",
+                  "maximum": 8000.0,
+                  "minimum": 500.0,
+                  "type": "number"
+                },
+                "fmin_hz": {
+                  "default": 50.0,
+                  "description": "unit: Hz",
+                  "maximum": 500.0,
+                  "minimum": 20.0,
+                  "type": "number"
+                },
+                "hop": {
+                  "default": 512.0,
+                  "description": "unit: samples",
+                  "maximum": 4096.0,
+                  "minimum": 32.0,
+                  "type": "number"
+                },
+                "threshold": {
+                  "default": 0.1,
+                  "maximum": 0.5,
+                  "minimum": 0.01,
+                  "type": "number"
+                },
+                "window": {
+                  "default": 2048.0,
+                  "description": "unit: samples",
+                  "maximum": 8192.0,
+                  "minimum": 256.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "PitchYin"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "type": {
+              "const": "RmsMeter"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "amplitude": {
+                  "default": 0.15,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "breath_duration_s": {
+                  "default": 0.6,
+                  "description": "unit: s",
+                  "maximum": 5.0,
+                  "minimum": 0.1,
+                  "type": "number"
+                },
+                "period_s": {
+                  "default": 2.0,
+                  "description": "unit: s",
+                  "maximum": 10.0,
+                  "minimum": 0.5,
+                  "type": "number"
+                },
+                "seed": {
+                  "default": 1.0,
+                  "description": "unit: seed",
+                  "maximum": 1e+18,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "SynthBreath"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "amplitude": {
+                  "default": 0.5,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "bpm": {
+                  "default": 120.0,
+                  "description": "unit: bpm",
+                  "maximum": 400.0,
+                  "minimum": 20.0,
+                  "type": "number"
+                },
+                "note_duration_s": {
+                  "default": 0.2,
+                  "description": "unit: s",
+                  "maximum": 5.0,
+                  "minimum": 0.01,
+                  "type": "number"
+                },
+                "note_freq": {
+                  "default": 440.0,
+                  "description": "unit: Hz",
+                  "maximum": 20000.0,
+                  "minimum": 20.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "SynthOnsets"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "amplitude": {
+                  "default": 0.1,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "seed": {
+                  "default": 1.0,
+                  "description": "unit: seed",
+                  "maximum": 1e+18,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "SynthPinkNoise"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "amplitude": {
+                  "default": 1.0,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "freq": {
+                  "default": 440.0,
+                  "description": "unit: Hz",
+                  "maximum": 20000.0,
+                  "minimum": 20.0,
+                  "type": "number"
+                },
+                "phase": {
+                  "default": 0.0,
+                  "description": "unit: radians",
+                  "maximum": 6.283185307179586,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "SynthSine"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "amplitude": {
+                  "default": 1.0,
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "carrier_freq": {
+                  "default": 440.0,
+                  "description": "unit: Hz",
+                  "maximum": 20000.0,
+                  "minimum": 20.0,
+                  "type": "number"
+                },
+                "vibrato_depth_cents": {
+                  "default": 50.0,
+                  "description": "unit: cents",
+                  "maximum": 1200.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                "vibrato_rate": {
+                  "default": 5.0,
+                  "description": "unit: Hz",
+                  "maximum": 30.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "SynthVibratoSine"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "type": {
+              "const": "Tracer"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": false,
+              "properties": {
+                "analysis_hop": {
+                  "default": 4800.0,
+                  "description": "unit: samples",
+                  "maximum": 48000.0,
+                  "minimum": 256.0,
+                  "type": "number"
+                },
+                "decimation": {
+                  "default": 256.0,
+                  "description": "unit: samples",
+                  "maximum": 4096.0,
+                  "minimum": 1.0,
+                  "type": "number"
+                },
+                "rate_max_hz": {
+                  "default": 10.0,
+                  "description": "unit: Hz",
+                  "maximum": 30.0,
+                  "minimum": 1.0,
+                  "type": "number"
+                },
+                "rate_min_hz": {
+                  "default": 2.0,
+                  "description": "unit: Hz",
+                  "maximum": 20.0,
+                  "minimum": 0.5,
+                  "type": "number"
+                },
+                "window_samples": {
+                  "default": 72000.0,
+                  "description": "unit: samples",
+                  "maximum": 192000.0,
+                  "minimum": 4096.0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "Vibrato"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
         }
-      }
+      ]
     }
-  }
+  },
+  "properties": {
+    "$schema": {
+      "description": "Path to the JSON Schema for this file (used by editors).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connections": {
+      "items": {
+        "$ref": "#/definitions/Connection"
+      },
+      "type": "array"
+    },
+    "nodes": {
+      "items": {
+        "$ref": "#/definitions/NodeDef"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "connections",
+    "nodes"
+  ],
+  "title": "World",
+  "type": "object"
 }

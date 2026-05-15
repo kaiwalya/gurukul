@@ -188,8 +188,9 @@ fn cmd_validate(world_path: &PathBuf, registry: &NodeRegistry) -> Result<()> {
     let raw = std::fs::read_to_string(world_path)
         .with_context(|| format!("reading {}", world_path.display()))?;
 
-    // Schema validation first
-    let schema_json = serde_json::to_value(schema_for!(World)).unwrap();
+    // Schema validation first — use the registry-augmented schema so unknown
+    // node types and unknown params are rejected here, not in Engine::build.
+    let schema_json = build_world_schema(registry)?;
     let instance: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing JSON in {}", world_path.display()))?;
 
@@ -469,9 +470,77 @@ fn cmd_render(
     Ok(())
 }
 
-fn cmd_emit_schema() -> Result<()> {
+/// Build the world JSON Schema with per-node-type `NodeDef` variants drawn
+/// from the registry. Each variant pins `type` to a `const` string and
+/// constrains `params` to that node's declared parameters (name + min/max).
+/// This is what makes the world schema the actual interface contract: an
+/// editor or agent authoring a world file gets per-type completion and
+/// validation out of the box.
+fn build_world_schema(registry: &NodeRegistry) -> Result<serde_json::Value> {
     let schema = schema_for!(World);
-    let json = serde_json::to_string_pretty(&schema).context("serializing schema")?;
+    let mut value = serde_json::to_value(&schema).context("serializing schema")?;
+
+    let definitions = value
+        .get_mut("definitions")
+        .and_then(|d| d.as_object_mut())
+        .context("schema missing 'definitions'")?;
+
+    let mut variants: Vec<serde_json::Value> = Vec::new();
+    for ty in registry.node_types() {
+        let params = registry.parameters(ty).unwrap_or(&[]);
+
+        let mut param_props = serde_json::Map::new();
+        for p in params {
+            let mut spec = serde_json::Map::new();
+            spec.insert("type".into(), serde_json::Value::String("number".into()));
+            if p.default.is_finite() {
+                spec.insert("default".into(), serde_json::Value::from(p.default));
+            }
+            if p.min.is_finite() {
+                spec.insert("minimum".into(), serde_json::Value::from(p.min));
+            }
+            if p.max.is_finite() {
+                spec.insert("maximum".into(), serde_json::Value::from(p.max));
+            }
+            if !p.unit.is_empty() {
+                spec.insert(
+                    "description".into(),
+                    serde_json::Value::String(format!("unit: {}", p.unit)),
+                );
+            }
+            param_props.insert(p.name.to_string(), serde_json::Value::Object(spec));
+        }
+
+        let params_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": serde_json::Value::Object(param_props),
+        });
+
+        let variant = serde_json::json!({
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "type": { "const": ty },
+                "params": params_schema,
+            },
+            "additionalProperties": false,
+        });
+        variants.push(variant);
+    }
+
+    definitions.insert(
+        "NodeDef".to_string(),
+        serde_json::json!({ "oneOf": variants }),
+    );
+
+    Ok(value)
+}
+
+fn cmd_emit_schema(registry: &NodeRegistry) -> Result<()> {
+    let value = build_world_schema(registry)?;
+    let json = serde_json::to_string_pretty(&value).context("serializing schema")?;
     println!("{json}");
     Ok(())
 }
@@ -509,7 +578,7 @@ fn main() -> ExitCode {
             sample_rate,
             block_size,
         } => cmd_render(world, &registry, *sample_rate, *block_size),
-        Command::EmitSchema => cmd_emit_schema(),
+        Command::EmitSchema => cmd_emit_schema(&registry),
     };
 
     match result {
@@ -567,5 +636,42 @@ mod tests {
         assert!(types.contains(&"Onset"));
         assert!(types.contains(&"SynthBreath"));
         assert!(types.contains(&"Breath"));
+    }
+
+    #[test]
+    fn schema_rejects_unknown_node_type() {
+        let registry = build_registry();
+        let schema = build_world_schema(&registry).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let bad: serde_json::Value = serde_json::from_str(
+            r#"{"nodes":[{"id":"x","type":"NoSuchNode"}],"connections":[]}"#,
+        )
+        .unwrap();
+        assert!(validator.iter_errors(&bad).next().is_some());
+    }
+
+    #[test]
+    fn schema_rejects_unknown_param() {
+        let registry = build_registry();
+        let schema = build_world_schema(&registry).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let bad: serde_json::Value = serde_json::from_str(
+            r#"{"nodes":[{"id":"x","type":"SynthSine","params":{"chickens":17}}],"connections":[]}"#,
+        )
+        .unwrap();
+        assert!(validator.iter_errors(&bad).next().is_some());
+    }
+
+    #[test]
+    fn schema_accepts_known_world() {
+        let registry = build_registry();
+        let schema = build_world_schema(&registry).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let good: serde_json::Value = serde_json::from_str(
+            r#"{"nodes":[{"id":"src","type":"SynthSine","params":{"freq":440.0,"amplitude":0.5}}],"connections":[]}"#,
+        )
+        .unwrap();
+        let errors: Vec<_> = validator.iter_errors(&good).collect();
+        assert!(errors.is_empty(), "unexpected schema errors: {errors:?}");
     }
 }
