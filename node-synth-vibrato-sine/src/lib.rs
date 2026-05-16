@@ -33,6 +33,11 @@ impl Node for SynthVibratoSine {
         self.vibrato_phase = 0.0;
     }
 
+    fn reset(&mut self) {
+        self.carrier_phase = 0.0;
+        self.vibrato_phase = 0.0;
+    }
+
     fn process(&mut self, _inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if outputs.is_empty() {
             return;

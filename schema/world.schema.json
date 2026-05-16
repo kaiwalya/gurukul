@@ -1,14 +1,41 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BoundaryPort": {
+      "description": "A boundary port on the engine's faceplate.\n\nThe port's signal type is not declared here — it is derived at engine-build time from the connected node port(s). `id` must match `^[a-z][a-z0-9_]*$`.",
+      "properties": {
+        "description": {
+          "description": "Free-form tooltip / API doc (optional).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable identifier. Used by edges and host APIs. Must match `^[a-z][a-z0-9_]*$`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Human-readable label (optional, cosmetic).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
     "Connection": {
       "properties": {
         "from": {
-          "description": "Source port path: `<node_id>.<port_name>`",
+          "description": "Source: either `<node_id>.<port_name>` (dotted) or a bare boundary port id.",
           "type": "string"
         },
         "to": {
-          "description": "Destination port path: `<node_id>.<port_name>`",
+          "description": "Destination: either `<node_id>.<port_name>` (dotted) or a bare boundary port id.",
           "type": "string"
         }
       },
@@ -23,8 +50,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -63,8 +98,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -118,8 +161,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -153,8 +204,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -183,8 +242,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -205,8 +272,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -255,8 +330,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -277,8 +360,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -299,8 +390,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -356,8 +455,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -378,8 +485,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -428,8 +543,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -478,8 +601,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -514,8 +645,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -557,8 +696,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -607,8 +754,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -629,8 +784,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "description": {
+              "description": "Free-form tooltip / API doc (optional).",
+              "type": "string"
+            },
             "id": {
               "minLength": 1,
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable label (optional, cosmetic).",
               "type": "string"
             },
             "params": {
@@ -701,11 +864,32 @@
       },
       "type": "array"
     },
+    "in_ports": {
+      "description": "Boundary input ports: the host writes samples into these before each block.",
+      "items": {
+        "$ref": "#/definitions/BoundaryPort"
+      },
+      "type": "array"
+    },
     "nodes": {
       "items": {
         "$ref": "#/definitions/NodeDef"
       },
       "type": "array"
+    },
+    "out_ports": {
+      "description": "Boundary output ports: the host reads samples from these after each block.",
+      "items": {
+        "$ref": "#/definitions/BoundaryPort"
+      },
+      "type": "array"
+    },
+    "world_version": {
+      "default": 1,
+      "description": "Schema version. Always 1 for worlds targeting this engine.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
     }
   },
   "required": [

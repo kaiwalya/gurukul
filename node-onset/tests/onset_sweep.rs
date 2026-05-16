@@ -4,8 +4,12 @@
 //!   - count the detected onsets in a fixed duration,
 //!   - verify the count matches the expected onset count (±1 boundary slack),
 //!   - verify the mean inter-onset interval matches 60/bpm s within 5%.
+//!
+//! The detector's output is read via the boundary out-port API (`engine.out_port`)
+//! rather than splicing a Tracer. This is the proof-of-life for the Phase 1.4
+//! boundary port API.
 
-use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
+use engine::{BoundaryPort, Connection, Engine, NodeDef, NodeRegistry, World};
 use std::collections::HashMap;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -37,34 +41,55 @@ fn run_cell(bpm: f32) -> CellResult {
     ]
     .into();
 
+    // Declare an out_port "trig" wired to the onset detector's output.
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![BoundaryPort {
+            id: "trig".to_string(),
+            name: None,
+            description: None,
+        }],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
                 ty: "SynthOnsets".to_string(),
                 params: synth_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "det".to_string(),
                 ty: "Onset".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
-        connections: vec![Connection {
-            from: "synth.audio_out".to_string(),
-            to: "det.audio_in".to_string(),
-        }],
+        connections: vec![
+            Connection {
+                from: "synth.audio_out".to_string(),
+                to: "det.audio_in".to_string(),
+            },
+            // Route onset output to the boundary out_port "trig".
+            Connection {
+                from: "det.onset".to_string(),
+                to: "trig".to_string(),
+            },
+        ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build");
 
-    // Collect onset positions by block-by-block scan of the det.onset port.
+    let h_trig = engine.resolve_out_port("trig").expect("resolve trig");
+
+    // Collect onset positions by block-by-block scan of the boundary out-port.
     let mut onset_sample_indices: Vec<u64> = Vec::new();
     for block_idx in 0..N_BLOCKS {
-        engine.run_blocks(1);
-        let buf = engine.last_block("det", "onset").unwrap();
+        engine.process_block(BLOCK_SIZE);
+        let buf = engine.out_port(h_trig);
         for (i, &v) in buf.iter().enumerate() {
             if v > 0.5 {
                 onset_sample_indices.push(block_idx * BLOCK_SIZE as u64 + i as u64);

@@ -43,16 +43,23 @@ fn run_cell(breath_duration_s: f32, amplitude: f32) -> CellResult {
 
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
                 ty: "SynthBreath".to_string(),
                 params: synth_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "det".to_string(),
                 ty: "Breath".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
         connections: vec![Connection {

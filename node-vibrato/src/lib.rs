@@ -224,6 +224,17 @@ impl Node for Vibrato {
         }
     }
 
+    fn reset(&mut self) {
+        self.ring_write = 0;
+        self.samples_since_analysis = 0;
+        self.total_samples = 0;
+        self.held_rate = 0.0;
+        self.held_depth = 0.0;
+        for v in self.ring.iter_mut() {
+            *v = 0.0;
+        }
+    }
+
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if inputs.is_empty() || outputs.len() < 2 {
             return;

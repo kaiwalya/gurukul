@@ -81,6 +81,12 @@ impl Node for SynthBreath {
         self.release_samples = (self.sample_rate * 0.10) as u64; // 100 ms
     }
 
+    fn reset(&mut self) {
+        let mixed = splitmix64(if self.seed == 0 { 1 } else { self.seed });
+        self.state = if mixed == 0 { 1 } else { mixed };
+        self.samples_into_period = 0;
+    }
+
     fn process(&mut self, _inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if outputs.is_empty() {
             return;

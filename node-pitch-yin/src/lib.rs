@@ -243,6 +243,18 @@ impl Node for PitchYin {
         self.dprime = vec![1.0f64; scratch_len];
     }
 
+    fn reset(&mut self) {
+        for v in self.ring.iter_mut() {
+            *v = 0.0;
+        }
+        self.ring_write = 0;
+        self.samples_since_analysis = 0;
+        self.total_samples = 0;
+        self.held_f0 = 0.0;
+        self.d.fill(0.0);
+        self.dprime.fill(1.0);
+    }
+
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         let out = match outputs.first_mut() {
             Some(o) => o,

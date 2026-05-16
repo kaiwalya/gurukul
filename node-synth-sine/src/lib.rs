@@ -29,6 +29,10 @@ impl Node for SynthSine {
         self.phase = self.initial_phase;
     }
 
+    fn reset(&mut self) {
+        self.phase = self.initial_phase;
+    }
+
     fn process(&mut self, _inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if outputs.is_empty() {
             return;

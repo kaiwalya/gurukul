@@ -114,26 +114,37 @@ fn run_one(breath_amp: f32, distractor_amp: f32, cell_seed: u64) -> Vec<f32> {
 
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![],
         nodes: vec![
             NodeDef {
                 id: "breath_src".to_string(),
                 ty: breath_ty.to_string(),
                 params: breath_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "sine".to_string(),
                 ty: "SynthSine".to_string(),
                 params: sine_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "mix".to_string(),
                 ty: "MixSum".to_string(),
                 params: mix_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "det".to_string(),
                 ty: "Breath".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
         connections: vec![

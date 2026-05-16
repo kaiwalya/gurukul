@@ -53,4 +53,11 @@ pub trait Node: Send {
     fn finish(&mut self) -> Result<(), NodeError> {
         Ok(())
     }
+
+    /// Drop all internal state (ring buffers, filter delays, phase counters, hysteresis).
+    ///
+    /// Called by `Engine::reset()` after an audio interruption so stale internal state does
+    /// not corrupt the next run. Stateless nodes can rely on the default no-op. Stateful nodes
+    /// should re-initialize to the same state as a freshly-constructed (and prepared) instance.
+    fn reset(&mut self) {}
 }

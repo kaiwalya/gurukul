@@ -268,6 +268,8 @@ fn splice_tracers(
             id: tracer_id.clone(),
             ty: "Tracer".to_string(),
             params: HashMap::new(),
+            name: None,
+            description: None,
         });
 
         if is_output {
@@ -524,6 +526,8 @@ fn build_world_schema(registry: &NodeRegistry) -> Result<serde_json::Value> {
                 "id": { "type": "string", "minLength": 1 },
                 "type": { "const": ty },
                 "params": params_schema,
+                "name": { "type": "string", "description": "Human-readable label (optional, cosmetic)." },
+                "description": { "type": "string", "description": "Free-form tooltip / API doc (optional)." },
             },
             "additionalProperties": false,
         });

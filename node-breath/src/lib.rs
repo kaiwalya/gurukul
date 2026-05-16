@@ -99,6 +99,23 @@ impl Node for Breath {
         self.samples_below_exit = 0;
     }
 
+    fn reset(&mut self) {
+        for v in self.total_ring.iter_mut() {
+            *v = 0.0;
+        }
+        for v in self.hf_ring.iter_mut() {
+            *v = 0.0;
+        }
+        self.total_write = 0;
+        self.hf_write = 0;
+        self.total_sum_sq = 0.0;
+        self.hf_sum_sq = 0.0;
+        self.filled = false;
+        self.prev_sample = 0.0;
+        self.latched = false;
+        self.samples_below_exit = 0;
+    }
+
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if inputs.is_empty() || outputs.is_empty() {
             return;

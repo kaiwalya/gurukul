@@ -78,6 +78,18 @@ impl Node for Onset {
         self.samples_since_onset = usize::MAX / 2;
     }
 
+    fn reset(&mut self) {
+        for v in self.energy_ring.iter_mut() {
+            *v = 0.0;
+        }
+        self.energy_ring_write = 0;
+        self.energy_sum_sq = 0.0;
+        self.energy_filled = false;
+        self.baseline_log10 = 0.0;
+        self.baseline_initialised = false;
+        self.samples_since_onset = usize::MAX / 2;
+    }
+
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if inputs.is_empty() || outputs.is_empty() {
             return;

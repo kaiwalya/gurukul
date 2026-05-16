@@ -68,6 +68,15 @@ impl Node for SynthPinkNoise {
         self.counter = 1;
     }
 
+    fn reset(&mut self) {
+        let mixed = splitmix64(if self.seed == 0 { 1 } else { self.seed });
+        self.state = if mixed == 0 { 1 } else { mixed };
+        for v in self.octave_values.iter_mut() {
+            *v = u64_to_f32(xorshift64(&mut self.state));
+        }
+        self.counter = 1;
+    }
+
     fn process(&mut self, _inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
         if outputs.is_empty() {
             return;

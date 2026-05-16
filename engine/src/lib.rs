@@ -3,7 +3,7 @@ pub mod node;
 pub mod registry;
 pub mod world;
 
-pub use graph::{Engine, EngineError};
+pub use graph::{BoundaryPortSpec, Engine, EngineError, InPortHandle, OutPortHandle};
 pub use node::{Node, NodeError, ParamSpec, PortSpec, PortType};
 pub use registry::NodeRegistry;
-pub use world::{Connection, NodeDef, World};
+pub use world::{BoundaryPort, Connection, NodeDef, World, boundary_port_id_valid};

@@ -263,6 +263,9 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "node-gain",
+ "node-passthrough",
+ "node-synth-sine",
  "schemars",
  "serde",
  "serde_json",

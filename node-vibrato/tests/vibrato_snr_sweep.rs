@@ -69,36 +69,51 @@ fn run_cell(rate_hz: f32, snr_db: f32, rate_idx: usize, snr_idx: usize) -> CellR
 
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
                 ty: "SynthVibratoSine".to_string(),
                 params: synth_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "noise".to_string(),
                 ty: "SynthPinkNoise".to_string(),
                 params: noise_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "gain".to_string(),
                 ty: "GainNode".to_string(),
                 params: gain_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "mix".to_string(),
                 ty: "MixSum".to_string(),
                 params: mix_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "yin".to_string(),
                 ty: "PitchYin".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "vib".to_string(),
                 ty: "Vibrato".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
         connections: vec![

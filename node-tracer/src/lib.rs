@@ -44,7 +44,11 @@ impl Node for Tracer {
             .copied()
             .unwrap_or(0.0);
         eprintln!("{}\t{}\t{:.6}", self.samples_seen, self.label, first);
-        self.samples_seen += self.block_size as u64;
+        self.samples_seen += nframes as u64;
+    }
+
+    fn reset(&mut self) {
+        self.samples_seen = 0;
     }
 }
 

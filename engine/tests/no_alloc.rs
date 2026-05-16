@@ -12,7 +12,10 @@
 static A: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 use assert_no_alloc::assert_no_alloc;
-use engine::{Connection, Engine, Node, NodeDef, NodeRegistry, PortSpec, PortType, World};
+use engine::{
+    BoundaryPort, Connection, Engine, InPortHandle, Node, NodeDef, NodeRegistry, OutPortHandle,
+    PortSpec, PortType, World,
+};
 use std::collections::HashMap;
 
 /// Trivial source: fills its single output with a constant. No allocations.
@@ -85,21 +88,30 @@ fn build_registry() -> NodeRegistry {
 fn run_blocks_does_not_allocate() {
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![],
         nodes: vec![
             NodeDef {
                 id: "src".to_string(),
                 ty: "ConstSource".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "mid".to_string(),
                 ty: "Copy".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "snk".to_string(),
                 ty: "Sink".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
         connections: vec![
@@ -124,5 +136,59 @@ fn run_blocks_does_not_allocate() {
 
     assert_no_alloc(|| {
         engine.run_blocks(25);
+    });
+}
+
+#[test]
+fn boundary_ports_do_not_allocate() {
+    // build_registry already has ConstSource, Copy, Sink — reuse it.
+    let reg = build_registry();
+
+    let world = World {
+        schema: None,
+        world_version: 1,
+        in_ports: vec![BoundaryPort {
+            id: "x".to_string(),
+            name: None,
+            description: None,
+        }],
+        out_ports: vec![BoundaryPort {
+            id: "y".to_string(),
+            name: None,
+            description: None,
+        }],
+        nodes: vec![NodeDef {
+            id: "mid".to_string(),
+            ty: "Copy".to_string(),
+            params: HashMap::new(),
+            name: None,
+            description: None,
+        }],
+        connections: vec![
+            Connection {
+                from: "x".to_string(),
+                to: "mid.in".to_string(),
+            },
+            Connection {
+                from: "mid.out".to_string(),
+                to: "y".to_string(),
+            },
+        ],
+    };
+
+    let mut engine = Engine::build(&world, &reg, 48000, 512).expect("build");
+    let h_in: InPortHandle = engine.resolve_in_port("x").unwrap();
+    let h_out: OutPortHandle = engine.resolve_out_port("y").unwrap();
+
+    // Warm up outside the no-alloc region.
+    engine.in_port(h_in).fill(0.5);
+    engine.process_block(512);
+
+    assert_no_alloc(|| {
+        for _ in 0..25 {
+            engine.in_port(h_in).fill(0.1);
+            engine.process_block(512);
+            std::hint::black_box(engine.out_port(h_out));
+        }
     });
 }

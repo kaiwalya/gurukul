@@ -48,21 +48,30 @@ fn run_cell(carrier_hz: f32, rate_hz: f32, depth_cents: f32) -> CellResult {
 
     let world = World {
         schema: None,
+        world_version: 1,
+        in_ports: vec![],
+        out_ports: vec![],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
                 ty: "SynthVibratoSine".to_string(),
                 params: synth_params,
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "yin".to_string(),
                 ty: "PitchYin".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
             NodeDef {
                 id: "vib".to_string(),
                 ty: "Vibrato".to_string(),
                 params: HashMap::new(),
+                name: None,
+                description: None,
             },
         ],
         connections: vec![
