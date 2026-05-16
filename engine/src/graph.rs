@@ -34,6 +34,17 @@ pub enum EngineError {
     BoundaryInPortUsedAsDestination(String),
     #[error("boundary out-port '{0}' appears as edge source (not allowed)")]
     BoundaryOutPortUsedAsSource(String),
+    #[error(
+        "boundary in-ports {in_port_ids:?} both target destination '{node_id}.{port}': \
+         only one in-port may feed a given node port"
+    )]
+    BoundaryInPortDestinationConflict {
+        node_id: String,
+        port: String,
+        in_port_ids: Vec<String>,
+    },
+    #[error("edge from boundary port '{0}' to boundary port '{1}' is not allowed")]
+    BoundaryToBoundary(String, String),
 }
 
 /// Parsed edge endpoint. A bare string (no dot) is a boundary port; a dotted
@@ -126,6 +137,10 @@ pub struct Engine {
     in_port_destinations: Vec<Vec<NodePortRef>>,
     // For each out-port: the single source (node_idx, port_idx).
     out_port_sources: Vec<NodePortRef>,
+    // Number of frames produced by the most recent process_block call.
+    // Slices returned by out_port() and peek() are trimmed to this length so
+    // callers never observe stale samples from a prior partial block.
+    last_n_frames: usize,
 }
 
 // SAFETY: the pointer scratches alias into `input_buffers` / `output_buffers`,
@@ -192,8 +207,19 @@ impl Engine {
         // --- Validate edge endpoint semantics ---
         // Boundary in-ports are write-only (host→engine); they must not appear as edge
         // destinations. Boundary out-ports are read-only (engine→host); they must not
-        // appear as edge sources.
+        // appear as edge sources. Boundary→boundary edges are never meaningful.
         for conn in &world.connections {
+            // Reject boundary→boundary edges before the directional checks so the
+            // error message is precise rather than surfacing as two unrelated errors.
+            if let (Endpoint::Boundary(from_id), Endpoint::Boundary(to_id)) =
+                (parse_endpoint(&conn.from), parse_endpoint(&conn.to))
+            {
+                return Err(EngineError::BoundaryToBoundary(
+                    from_id.to_string(),
+                    to_id.to_string(),
+                ));
+            }
+
             if let Endpoint::Boundary(id) = parse_endpoint(&conn.to)
                 && in_port_ids.contains(id)
             {
@@ -332,7 +358,7 @@ impl Engine {
                             types_seen.push(ty);
                         }
                         Endpoint::Boundary(_) => {
-                            // Boundary→boundary not allowed (caught by earlier checks).
+                            // Boundary→boundary edges are rejected before this loop.
                         }
                     }
                 }
@@ -343,6 +369,8 @@ impl Engine {
             }
 
             // All destinations must share one PortType.
+            // Also verify no two destinations point to the same (node_idx, port_idx)
+            // within this in-port's fan-out. Cross-in-port conflicts are checked below.
             let first_ty = types_seen[0].clone();
             if !types_seen.iter().all(|t| *t == first_ty) {
                 let type_names: Vec<String> = types_seen.iter().map(|t| format!("{t:?}")).collect();
@@ -362,6 +390,33 @@ impl Engine {
             });
             in_port_buffers.push(vec![0.0f32; block_size]);
             in_port_destinations.push(dests);
+        }
+
+        // --- Reject two boundary in-ports targeting the same destination ---
+        // Build a map from (dst_node_idx, dst_port_idx) → Vec of in-port ids.
+        // A silent last-writer-wins overwrite would be the worst possible semantic.
+        {
+            let mut dest_to_in_ports: HashMap<NodePortRef, Vec<String>> = HashMap::new();
+            for (spec, dests) in in_port_specs.iter().zip(in_port_destinations.iter()) {
+                for &dest in dests {
+                    dest_to_in_ports
+                        .entry(dest)
+                        .or_default()
+                        .push(spec.id.clone());
+                }
+            }
+            for ((dst_node_idx, dst_port_idx), in_port_ids) in &dest_to_in_ports {
+                if in_port_ids.len() > 1 {
+                    let node_id = nodes[*dst_node_idx].0.clone();
+                    let (dst_inputs, _) = &node_ports[*dst_node_idx];
+                    let port = dst_inputs[*dst_port_idx].name.to_string();
+                    return Err(EngineError::BoundaryInPortDestinationConflict {
+                        node_id,
+                        port,
+                        in_port_ids: in_port_ids.clone(),
+                    });
+                }
+            }
         }
 
         // --- Resolve boundary out-ports ---
@@ -441,6 +496,7 @@ impl Engine {
             out_port_buffers,
             in_port_destinations,
             out_port_sources,
+            last_n_frames: 0,
         };
 
         // Call prepare on every node.
@@ -502,7 +558,11 @@ impl Engine {
         &mut self.in_port_buffers[idx]
     }
 
-    /// Immutable slice of the boundary output buffer for `h`. Length == `block_size`.
+    /// Immutable slice of the boundary output buffer for `h`.
+    ///
+    /// Length equals the `n_frames` passed to the most recent `process_block` call
+    /// (0 before any call). Samples beyond that length are stale from a prior block
+    /// and are not visible here, so a naive `to_vec()` on a partial block is safe.
     ///
     /// Realtime-safe: no allocation, no lock, no string lookup.
     pub fn out_port(&self, h: OutPortHandle) -> &[f32] {
@@ -511,7 +571,7 @@ impl Engine {
             idx < self.out_port_buffers.len(),
             "OutPortHandle out of range"
         );
-        &self.out_port_buffers[idx]
+        &self.out_port_buffers[idx][..self.last_n_frames]
     }
 
     /// Process one block of up to `n_frames` samples.
@@ -528,6 +588,10 @@ impl Engine {
             n_frames,
             self.block_size
         );
+
+        // Record before doing any work so out_port() / peek() return the correct
+        // slice length even if called mid-panic during development.
+        self.last_n_frames = n_frames;
 
         // --- Zero input accumulator buffers ---
         for node_inputs in &mut self.input_buffers {
@@ -630,6 +694,8 @@ impl Engine {
         for buf in &mut self.out_port_buffers {
             buf.fill(0.0);
         }
+        // After reset there are no "last produced frames" to read.
+        self.last_n_frames = 0;
     }
 
     // -------------------------------------------------------------------------
@@ -665,7 +731,7 @@ impl Engine {
             .position(|n| n == port)
             .ok_or_else(|| EngineError::PortNotFound(port.to_string(), node_id.to_string()))?;
 
-        Ok(&self.output_buffers[node_idx][port_idx])
+        Ok(&self.output_buffers[node_idx][port_idx][..self.last_n_frames])
     }
 
     /// Backwards-compatible alias for `peek`.
@@ -1186,6 +1252,305 @@ mod tests {
 
         assert_eq!(engine.out_port(h_out1).to_vec(), signal);
         assert_eq!(engine.out_port(h_out2).to_vec(), signal);
+    }
+
+    #[test]
+    fn partial_block_out_port_len() {
+        // Regression: out_port() must return exactly n_frames samples after a
+        // partial process_block call, not the full block_size buffer.
+        use crate::node::{Node, PortSpec, PortType};
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        struct Passthrough;
+        impl Node for Passthrough {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
+                if !inputs.is_empty() && !outputs.is_empty() {
+                    outputs[0][..nframes].copy_from_slice(&inputs[0][..nframes]);
+                }
+            }
+        }
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Passthrough",
+            vec![PortSpec {
+                name: "in",
+                ty: PortType::Audio,
+            }],
+            vec![PortSpec {
+                name: "out",
+                ty: PortType::Audio,
+            }],
+            vec![],
+            Box::new(|_| Box::new(Passthrough) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![BoundaryPort {
+                id: "x".to_string(),
+                name: None,
+                description: None,
+            }],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "pt".to_string(),
+                ty: "Passthrough".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![
+                Connection {
+                    from: "x".to_string(),
+                    to: "pt.in".to_string(),
+                },
+                Connection {
+                    from: "pt.out".to_string(),
+                    to: "y".to_string(),
+                },
+            ],
+        };
+
+        let block_size = 512;
+        let mut engine = Engine::build(&world, &registry, 48000, block_size).unwrap();
+        let h_out = engine.resolve_out_port("y").unwrap();
+
+        engine.process_block(100);
+        assert_eq!(
+            engine.out_port(h_out).len(),
+            100,
+            "out_port must return exactly n_frames samples after a partial block"
+        );
+    }
+
+    #[test]
+    fn zero_frame_process_block_is_no_op() {
+        // Regression: process_block(0) must not panic and out_port must return
+        // an empty slice (Task 6 smoke test).
+        use crate::node::{Node, PortSpec, PortType};
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        struct Passthrough;
+        impl Node for Passthrough {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
+                if !inputs.is_empty() && !outputs.is_empty() {
+                    outputs[0][..nframes].copy_from_slice(&inputs[0][..nframes]);
+                }
+            }
+        }
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Passthrough",
+            vec![PortSpec {
+                name: "in",
+                ty: PortType::Audio,
+            }],
+            vec![PortSpec {
+                name: "out",
+                ty: PortType::Audio,
+            }],
+            vec![],
+            Box::new(|_| Box::new(Passthrough) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![BoundaryPort {
+                id: "x".to_string(),
+                name: None,
+                description: None,
+            }],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "pt".to_string(),
+                ty: "Passthrough".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![
+                Connection {
+                    from: "x".to_string(),
+                    to: "pt.in".to_string(),
+                },
+                Connection {
+                    from: "pt.out".to_string(),
+                    to: "y".to_string(),
+                },
+            ],
+        };
+
+        let block_size = 512;
+        let mut engine = Engine::build(&world, &registry, 48000, block_size).unwrap();
+        let h_out = engine.resolve_out_port("y").unwrap();
+
+        // Must not panic.
+        engine.process_block(0);
+        assert_eq!(
+            engine.out_port(h_out).len(),
+            0,
+            "out_port must return empty slice after process_block(0)"
+        );
+    }
+
+    #[test]
+    fn boundary_in_port_destination_conflict_rejected() {
+        // Two in-ports wired to the same destination node port must be rejected.
+        use crate::node::{Node, PortSpec, PortType};
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        struct Passthrough;
+        impl Node for Passthrough {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
+                if !inputs.is_empty() && !outputs.is_empty() {
+                    outputs[0][..nframes].copy_from_slice(&inputs[0][..nframes]);
+                }
+            }
+        }
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Passthrough",
+            vec![PortSpec {
+                name: "in",
+                ty: PortType::Audio,
+            }],
+            vec![PortSpec {
+                name: "out",
+                ty: PortType::Audio,
+            }],
+            vec![],
+            Box::new(|_| Box::new(Passthrough) as Box<dyn Node>),
+        );
+
+        // Two in-ports "a" and "b" both wired to "pt.in".
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![
+                BoundaryPort {
+                    id: "a".to_string(),
+                    name: None,
+                    description: None,
+                },
+                BoundaryPort {
+                    id: "b".to_string(),
+                    name: None,
+                    description: None,
+                },
+            ],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "pt".to_string(),
+                ty: "Passthrough".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![
+                Connection {
+                    from: "a".to_string(),
+                    to: "pt.in".to_string(),
+                },
+                Connection {
+                    from: "b".to_string(),
+                    to: "pt.in".to_string(),
+                },
+                Connection {
+                    from: "pt.out".to_string(),
+                    to: "y".to_string(),
+                },
+            ],
+        };
+
+        let result = Engine::build(&world, &registry, 48000, 512);
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::BoundaryInPortDestinationConflict { .. })
+            ),
+            "expected BoundaryInPortDestinationConflict"
+        );
+    }
+
+    #[test]
+    fn boundary_to_boundary_edge_rejected() {
+        // An edge from one boundary port to another must be rejected immediately.
+        use crate::node::{Node, PortSpec, PortType};
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        struct Dummy;
+        impl Node for Dummy {
+            fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+            fn process(&mut self, _: &[&[f32]], _: &mut [&mut [f32]], _: usize) {}
+        }
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Dummy",
+            vec![PortSpec {
+                name: "in",
+                ty: PortType::Audio,
+            }],
+            vec![PortSpec {
+                name: "out",
+                ty: PortType::Audio,
+            }],
+            vec![],
+            Box::new(|_| Box::new(Dummy) as Box<dyn Node>),
+        );
+
+        // Edge from in-port "x_in" to out-port "y_out": boundary→boundary.
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![BoundaryPort {
+                id: "x_in".to_string(),
+                name: None,
+                description: None,
+            }],
+            out_ports: vec![BoundaryPort {
+                id: "y_out".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "d".to_string(),
+                ty: "Dummy".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![Connection {
+                from: "x_in".to_string(),
+                to: "y_out".to_string(),
+            }],
+        };
+
+        let result = Engine::build(&world, &registry, 48000, 512);
+        assert!(
+            matches!(result, Err(EngineError::BoundaryToBoundary(_, _))),
+            "expected BoundaryToBoundary error"
+        );
     }
 
     #[test]

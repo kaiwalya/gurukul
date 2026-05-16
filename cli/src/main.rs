@@ -487,6 +487,22 @@ fn build_world_schema(registry: &NodeRegistry) -> Result<serde_json::Value> {
         .and_then(|d| d.as_object_mut())
         .context("schema missing 'definitions'")?;
 
+    // Inject `pattern` onto BoundaryPort.id. The regex is enforced by the
+    // engine but schemars 0.8 has no derive attribute for emitting `pattern`,
+    // so we add it in post-processing. This keeps editors and the visual editor
+    // in sync with the runtime validation rule.
+    if let Some(boundary_port) = definitions.get_mut("BoundaryPort")
+        && let Some(id_schema) = boundary_port
+            .get_mut("properties")
+            .and_then(|p| p.get_mut("id"))
+        && let Some(obj) = id_schema.as_object_mut()
+    {
+        obj.insert(
+            "pattern".into(),
+            serde_json::Value::String("^[a-z][a-z0-9_]*$".into()),
+        );
+    }
+
     let mut variants: Vec<serde_json::Value> = Vec::new();
     for ty in registry.node_types() {
         let params = registry.parameters(ty).unwrap_or(&[]);

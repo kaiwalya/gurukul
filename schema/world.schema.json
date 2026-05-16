@@ -13,6 +13,7 @@
         },
         "id": {
           "description": "Stable identifier. Used by edges and host APIs. Must match `^[a-z][a-z0-9_]*$`.",
+          "pattern": "^[a-z][a-z0-9_]*$",
           "type": "string"
         },
         "name": {

@@ -78,8 +78,24 @@ fn to_port_spec(s: &BoundaryPortSpec) -> PortSpec {
 }
 
 impl Node for SubEngineNode {
-    fn prepare(&mut self, _id: &str, _sample_rate: u32, _block_size: usize) {
-        // The inner engine was already prepared at build time.
+    fn prepare(&mut self, _id: &str, sample_rate: u32, block_size: usize) {
+        // The inner engine is built with parent SR/block_size at construction.
+        // If the outer engine later calls prepare() with different values that is
+        // a programmer error: the inner world was not built for those parameters.
+        debug_assert_eq!(
+            sample_rate,
+            self.inner.sample_rate(),
+            "SubEngineNode SR mismatch: inner engine was built with {}, outer engine prepared with {}",
+            self.inner.sample_rate(),
+            sample_rate,
+        );
+        debug_assert_eq!(
+            block_size,
+            self.inner.block_size(),
+            "SubEngineNode block_size mismatch: inner engine was built with {}, outer engine prepared with {}",
+            self.inner.block_size(),
+            block_size,
+        );
     }
 
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
