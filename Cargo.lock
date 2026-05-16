@@ -273,6 +273,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-ffi"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "node-assert-near",
+ "node-breath",
+ "node-gain",
+ "node-mix-sum",
+ "node-null-sink",
+ "node-onset",
+ "node-passthrough",
+ "node-pitch-error",
+ "node-pitch-yin",
+ "node-rms-meter",
+ "node-synth-breath",
+ "node-synth-onsets",
+ "node-synth-pink-noise",
+ "node-synth-sine",
+ "node-synth-vibrato-sine",
+ "node-tracer",
+ "node-vibrato",
+ "serde_json",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

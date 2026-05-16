@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "engine",
+    "engine-ffi",
     "cli",
     "node-synth-sine",
     "node-synth-vibrato-sine",

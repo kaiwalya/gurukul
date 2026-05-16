@@ -85,12 +85,40 @@ fn validate_node_id(id: &str) -> Result<(), EngineError> {
 }
 
 /// Opaque handle for a boundary input port. Resolved once at build time.
+#[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InPortHandle(pub(crate) u32);
 
+impl InPortHandle {
+    /// Construct from a raw `u32`. Caller is responsible for ensuring the value
+    /// originated from `resolve_in_port` on the same engine instance.
+    pub fn from_raw(v: u32) -> Self {
+        Self(v)
+    }
+
+    /// Extract the underlying `u32`.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
 /// Opaque handle for a boundary output port. Resolved once at build time.
+#[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct OutPortHandle(pub(crate) u32);
+
+impl OutPortHandle {
+    /// Construct from a raw `u32`. Caller is responsible for ensuring the value
+    /// originated from `resolve_out_port` on the same engine instance.
+    pub fn from_raw(v: u32) -> Self {
+        Self(v)
+    }
+
+    /// Extract the underlying `u32`.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
 
 /// Fully-resolved boundary port spec (id, name, description, derived type).
 #[derive(Debug, Clone)]

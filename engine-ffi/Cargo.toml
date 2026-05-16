@@ -1,0 +1,29 @@
+[package]
+name = "engine-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "engine_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+engine = { path = "../engine" }
+node-synth-sine = { path = "../node-synth-sine" }
+node-synth-vibrato-sine = { path = "../node-synth-vibrato-sine" }
+node-synth-pink-noise = { path = "../node-synth-pink-noise" }
+node-mix-sum = { path = "../node-mix-sum" }
+node-rms-meter = { path = "../node-rms-meter" }
+node-assert-near = { path = "../node-assert-near" }
+node-gain = { path = "../node-gain" }
+node-passthrough = { path = "../node-passthrough" }
+node-null-sink = { path = "../node-null-sink" }
+node-pitch-error = { path = "../node-pitch-error" }
+node-pitch-yin = { path = "../node-pitch-yin" }
+node-tracer = { path = "../node-tracer" }
+node-vibrato = { path = "../node-vibrato" }
+node-synth-onsets = { path = "../node-synth-onsets" }
+node-onset = { path = "../node-onset" }
+node-synth-breath = { path = "../node-synth-breath" }
+node-breath = { path = "../node-breath" }
+serde_json = { workspace = true }
