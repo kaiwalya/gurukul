@@ -44,6 +44,13 @@ enum Command {
         #[arg(long = "trace", value_name = "PORT_PATH", num_args = 1..)]
         trace: Vec<String>,
 
+        /// Internal node ports to read via the engine's peek API (e.g. yin.f0_hz).
+        /// May be repeated. Unlike --trace, --peek does not modify the graph; it
+        /// reads internal buffers after each block. CSV rows are written to stdout:
+        /// `block,frame,<peek_path_1>,<peek_path_2>,...`
+        #[arg(long = "peek", value_name = "NODE.PORT", num_args = 1..)]
+        peek: Vec<String>,
+
         /// Sample rate in Hz.
         #[arg(long, default_value_t = 48000)]
         sample_rate: u32,
@@ -326,6 +333,7 @@ fn cmd_run(
     world_path: &PathBuf,
     duration_str: &str,
     trace_ports: &[String],
+    peek_ports: &[String],
     registry: &NodeRegistry,
     sample_rate: u32,
     block_size: usize,
@@ -335,9 +343,75 @@ fn cmd_run(
     for (tracer_id, port_path) in &legend {
         eprintln!("# {tracer_id} = {port_path}");
     }
+
+    // Pre-validate peek paths: every NODE.PORT must resolve before we run.
+    // peek() returns Err if missing, but we want to fail upfront, not mid-stream.
+    let peek_targets: Vec<(String, String)> = peek_ports
+        .iter()
+        .map(|p| {
+            p.split_once('.')
+                .map(|(n, port)| (n.to_string(), port.to_string()))
+                .with_context(|| {
+                    format!("invalid --peek path '{p}': expected '<node_id>.<port_name>'")
+                })
+        })
+        .collect::<Result<_>>()?;
+    for (node_id, port) in &peek_targets {
+        engine
+            .peek(node_id, port)
+            .with_context(|| format!("--peek {node_id}.{port}"))?;
+    }
+
     let total_samples = parse_duration_samples(duration_str, sample_rate)?;
     let n_blocks = total_samples.div_ceil(block_size as u64);
-    engine.run_blocks(n_blocks);
+
+    if peek_targets.is_empty() {
+        engine.run_blocks(n_blocks);
+    } else {
+        // CSV header: block,frame,<path_1>,<path_2>,...
+        // Format is f32 only; revisit if peek ever returns non-numeric data.
+        let header_paths: Vec<String> = peek_ports.to_vec();
+        println!("block,frame,{}", header_paths.join(","));
+
+        let mut stdout = std::io::stdout().lock();
+        use std::io::Write;
+        // Debug-only path: per-block run_blocks(1) + per-block string lookup in
+        // engine.peek() is deliberate. Slower than a bulk run_blocks(n) by
+        // design, since we need to snapshot internal state between blocks. Not
+        // for realtime / hot-path use.
+        for block_idx in 0..n_blocks {
+            engine.run_blocks(1);
+            // Snapshot peek buffers. unwrap() is justified: paths were
+            // pre-validated above before the run loop.
+            let snapshots: Vec<&[f32]> = peek_targets
+                .iter()
+                .map(|(n, p)| engine.peek(n, p).unwrap())
+                .collect();
+            // All snapshots must share a length — same block, different ports.
+            // Today every node port returns block_size samples, but a future
+            // sparse Feature port could break this; assert loudly rather than
+            // index out of bounds.
+            let n_frames = snapshots[0].len();
+            for (i, snap) in snapshots.iter().enumerate().skip(1) {
+                if snap.len() != n_frames {
+                    anyhow::bail!(
+                        "--peek buffer length mismatch: '{}' = {}, '{}' = {}",
+                        peek_ports[0],
+                        n_frames,
+                        peek_ports[i],
+                        snap.len()
+                    );
+                }
+            }
+            for frame in 0..n_frames {
+                write!(stdout, "{block_idx},{frame}")?;
+                for snap in &snapshots {
+                    write!(stdout, ",{}", snap[frame])?;
+                }
+                writeln!(stdout)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -580,9 +654,18 @@ fn main() -> ExitCode {
             world,
             duration,
             trace,
+            peek,
             sample_rate,
             block_size,
-        } => cmd_run(world, duration, trace, &registry, *sample_rate, *block_size),
+        } => cmd_run(
+            world,
+            duration,
+            trace,
+            peek,
+            &registry,
+            *sample_rate,
+            *block_size,
+        ),
         Command::Test {
             path,
             duration,
@@ -679,6 +762,63 @@ mod tests {
         )
         .unwrap();
         assert!(validator.iter_errors(&bad).next().is_some());
+    }
+
+    #[test]
+    fn peek_returns_expected_samples() {
+        // Build a SynthSine world programmatically, run one block, peek the
+        // sine output, confirm the buffer is non-zero and finite.
+        let registry = build_registry();
+        let world: World = serde_json::from_str(
+            r#"{"nodes":[{"id":"src","type":"SynthSine","params":{"freq":440.0,"amplitude":0.5}}],"connections":[]}"#,
+        )
+        .unwrap();
+
+        let mut engine = Engine::build(&world, &registry, 48000, 64).unwrap();
+        engine.run_blocks(1);
+
+        let buf = engine.peek("src", "audio_out").unwrap();
+        assert_eq!(buf.len(), 64);
+        assert!(
+            buf.iter().any(|&s| s.abs() > 1e-6),
+            "expected non-zero sine"
+        );
+        assert!(buf.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn peek_two_ports_same_length() {
+        // Two SynthSine sources, peek both, confirm peek buffers stay aligned.
+        let registry = build_registry();
+        let world: World = serde_json::from_str(
+            r#"{
+                "nodes":[
+                    {"id":"a","type":"SynthSine","params":{"freq":440.0,"amplitude":0.3}},
+                    {"id":"b","type":"SynthSine","params":{"freq":880.0,"amplitude":0.3}}
+                ],
+                "connections":[]
+            }"#,
+        )
+        .unwrap();
+
+        let block_size = 32;
+        let mut engine = Engine::build(&world, &registry, 48000, block_size).unwrap();
+        engine.run_blocks(2);
+        let buf_a = engine.peek("a", "audio_out").unwrap();
+        let buf_b = engine.peek("b", "audio_out").unwrap();
+        assert_eq!(buf_a.len(), buf_b.len());
+        assert_eq!(buf_a.len(), block_size);
+    }
+
+    #[test]
+    fn peek_unknown_node_errors() {
+        let registry = build_registry();
+        let world: World =
+            serde_json::from_str(r#"{"nodes":[{"id":"src","type":"SynthSine"}],"connections":[]}"#)
+                .unwrap();
+        let engine = Engine::build(&world, &registry, 48000, 64).unwrap();
+        assert!(engine.peek("nope", "audio_out").is_err());
+        assert!(engine.peek("src", "no_such_port").is_err());
     }
 
     #[test]
