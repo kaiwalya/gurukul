@@ -8,7 +8,7 @@
 //! Assertion is gated on SNR ≥ 20 dB (matching the pitch_sweep contract);
 //! lower-SNR cells are recorded for the artifact but not asserted.
 
-use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
+use engine::{BoundaryPort, Connection, Engine, NodeDef, NodeRegistry, World};
 use std::collections::HashMap;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -72,7 +72,11 @@ fn run_cell(bpm: f32, snr_db: f32, bpm_idx: usize, snr_idx: usize) -> CellResult
         schema: None,
         world_version: 1,
         in_ports: vec![],
-        out_ports: vec![],
+        out_ports: vec![BoundaryPort {
+            id: "onset_out".to_string(),
+            name: None,
+            description: None,
+        }],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
@@ -127,16 +131,24 @@ fn run_cell(bpm: f32, snr_db: f32, bpm_idx: usize, snr_idx: usize) -> CellResult
                 from: "mix.out".to_string(),
                 to: "det.audio_in".to_string(),
             },
+            Connection {
+                from: "det.onset".to_string(),
+                to: "onset_out".to_string(),
+            },
         ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build");
 
+    let h_onset = engine
+        .resolve_out_port("onset_out")
+        .expect("resolve onset_out");
+
     let mut onset_sample_indices: Vec<u64> = Vec::new();
     for block_idx in 0..N_BLOCKS {
-        engine.run_blocks(1);
-        let buf = engine.last_block("det", "onset").unwrap();
+        engine.process_block(BLOCK_SIZE);
+        let buf = engine.out_port(h_onset);
         for (i, &v) in buf.iter().enumerate() {
             if v > 0.5 {
                 onset_sample_indices.push(block_idx * BLOCK_SIZE as u64 + i as u64);

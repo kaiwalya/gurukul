@@ -3,7 +3,9 @@
 /// Wires SynthSine + SynthPinkNoise(scaled) → MixSum → PitchYin → PitchError
 /// across a grid of frequencies and SNRs. Asserts ≤ 10 cents median error for
 /// all cells with SNR ≥ 20 dB.
-use engine::{Connection, Engine, Node, NodeDef, NodeRegistry, PortSpec, PortType, World};
+use engine::{
+    BoundaryPort, Connection, Engine, Node, NodeDef, NodeRegistry, PortSpec, PortType, World,
+};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -130,7 +132,18 @@ fn run_cell(freq_hz: f32, snr_db: f32, freq_idx: usize, snr_idx: usize) -> CellR
         schema: None,
         world_version: 1,
         in_ports: vec![],
-        out_ports: vec![],
+        out_ports: vec![
+            BoundaryPort {
+                id: "error_out".to_string(),
+                name: None,
+                description: None,
+            },
+            BoundaryPort {
+                id: "voiced_out".to_string(),
+                name: None,
+                description: None,
+            },
+        ],
         nodes: vec![
             NodeDef {
                 id: "sine".to_string(),
@@ -212,25 +225,38 @@ fn run_cell(freq_hz: f32, snr_db: f32, freq_idx: usize, snr_idx: usize) -> CellR
                 from: "refnode.feature_out".to_string(),
                 to: "perr.f0_reference".to_string(),
             },
+            // perr outputs → boundary out_ports
+            Connection {
+                from: "perr.error_cents".to_string(),
+                to: "error_out".to_string(),
+            },
+            Connection {
+                from: "perr.voiced".to_string(),
+                to: "voiced_out".to_string(),
+            },
         ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build failed");
 
+    let h_error = engine
+        .resolve_out_port("error_out")
+        .expect("resolve error_out");
+    let h_voiced = engine
+        .resolve_out_port("voiced_out")
+        .expect("resolve voiced_out");
+
     let mut error_samples: Vec<f32> = Vec::with_capacity(N_BLOCKS as usize);
     let mut voiced_count = 0u64;
     let total_blocks = N_BLOCKS;
 
     for _ in 0..total_blocks {
-        engine.run_blocks(1);
-
-        let error_buf = engine.last_block("perr", "error_cents").unwrap();
-        let voiced_buf = engine.last_block("perr", "voiced").unwrap();
+        engine.process_block(BLOCK_SIZE);
 
         // ZOH: last sample of the block holds the scalar for this block.
-        let err = *error_buf.last().unwrap();
-        let v = *voiced_buf.last().unwrap();
+        let err = *engine.out_port(h_error).last().unwrap();
+        let v = *engine.out_port(h_voiced).last().unwrap();
 
         if v == 1.0 {
             voiced_count += 1;

@@ -21,7 +21,9 @@
 //!     expected to miss it — recorded but not asserted, so the cliff is
 //!     visible in the artifact.
 
-use engine::{Connection, Engine, Node, NodeDef, NodeRegistry, PortSpec, PortType, World};
+use engine::{
+    BoundaryPort, Connection, Engine, Node, NodeDef, NodeRegistry, PortSpec, PortType, World,
+};
 use std::collections::HashMap;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -116,7 +118,11 @@ fn run_one(breath_amp: f32, distractor_amp: f32, cell_seed: u64) -> Vec<f32> {
         schema: None,
         world_version: 1,
         in_ports: vec![],
-        out_ports: vec![],
+        out_ports: vec![BoundaryPort {
+            id: "breath_out".to_string(),
+            name: None,
+            description: None,
+        }],
         nodes: vec![
             NodeDef {
                 id: "breath_src".to_string(),
@@ -160,16 +166,24 @@ fn run_one(breath_amp: f32, distractor_amp: f32, cell_seed: u64) -> Vec<f32> {
                 from: "mix.out".to_string(),
                 to: "det.audio_in".to_string(),
             },
+            Connection {
+                from: "det.breath".to_string(),
+                to: "breath_out".to_string(),
+            },
         ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build");
 
+    let h_breath = engine
+        .resolve_out_port("breath_out")
+        .expect("resolve breath_out");
+
     let mut samples: Vec<f32> = Vec::with_capacity((N_BLOCKS as usize) * BLOCK_SIZE);
     for _ in 0..N_BLOCKS {
-        engine.run_blocks(1);
-        let buf = engine.last_block("det", "breath").unwrap();
+        engine.process_block(BLOCK_SIZE);
+        let buf = engine.out_port(h_breath);
         samples.extend_from_slice(buf);
     }
     samples

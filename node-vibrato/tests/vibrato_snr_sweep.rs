@@ -10,7 +10,7 @@
 //! pitch_sweep contract): rate within ±0.7 Hz and depth within ±25 cents.
 //! Lower-SNR cells are recorded for the artifact but not asserted.
 
-use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
+use engine::{BoundaryPort, Connection, Engine, NodeDef, NodeRegistry, World};
 use std::collections::HashMap;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -71,7 +71,18 @@ fn run_cell(rate_hz: f32, snr_db: f32, rate_idx: usize, snr_idx: usize) -> CellR
         schema: None,
         world_version: 1,
         in_ports: vec![],
-        out_ports: vec![],
+        out_ports: vec![
+            BoundaryPort {
+                id: "rate_out".to_string(),
+                name: None,
+                description: None,
+            },
+            BoundaryPort {
+                id: "depth_out".to_string(),
+                name: None,
+                description: None,
+            },
+        ],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
@@ -137,15 +148,31 @@ fn run_cell(rate_hz: f32, snr_db: f32, rate_idx: usize, snr_idx: usize) -> CellR
                 from: "yin.f0".to_string(),
                 to: "vib.f0".to_string(),
             },
+            Connection {
+                from: "vib.rate".to_string(),
+                to: "rate_out".to_string(),
+            },
+            Connection {
+                from: "vib.depth".to_string(),
+                to: "depth_out".to_string(),
+            },
         ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build");
+
+    let h_rate = engine
+        .resolve_out_port("rate_out")
+        .expect("resolve rate_out");
+    let h_depth = engine
+        .resolve_out_port("depth_out")
+        .expect("resolve depth_out");
+
     engine.run_blocks(N_BLOCKS);
 
-    let est_rate_hz = *engine.last_block("vib", "rate").unwrap().last().unwrap();
-    let est_depth_cents = *engine.last_block("vib", "depth").unwrap().last().unwrap();
+    let est_rate_hz = *engine.out_port(h_rate).last().unwrap();
+    let est_depth_cents = *engine.out_port(h_depth).last().unwrap();
 
     let pass =
         (est_rate_hz - rate_hz).abs() <= 0.7 && (est_depth_cents - FIXED_DEPTH_CENTS).abs() <= 25.0;

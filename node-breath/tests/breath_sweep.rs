@@ -8,7 +8,7 @@
 //!   - active fraction outside the breath window is low (≤ 0.05),
 //!   - the detector unlatches (no permanent stickiness).
 
-use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
+use engine::{BoundaryPort, Connection, Engine, NodeDef, NodeRegistry, World};
 use std::collections::HashMap;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -45,7 +45,11 @@ fn run_cell(breath_duration_s: f32, amplitude: f32) -> CellResult {
         schema: None,
         world_version: 1,
         in_ports: vec![],
-        out_ports: vec![],
+        out_ports: vec![BoundaryPort {
+            id: "breath_out".to_string(),
+            name: None,
+            description: None,
+        }],
         nodes: vec![
             NodeDef {
                 id: "synth".to_string(),
@@ -62,14 +66,24 @@ fn run_cell(breath_duration_s: f32, amplitude: f32) -> CellResult {
                 description: None,
             },
         ],
-        connections: vec![Connection {
-            from: "synth.audio_out".to_string(),
-            to: "det.audio_in".to_string(),
-        }],
+        connections: vec![
+            Connection {
+                from: "synth.audio_out".to_string(),
+                to: "det.audio_in".to_string(),
+            },
+            Connection {
+                from: "det.breath".to_string(),
+                to: "breath_out".to_string(),
+            },
+        ],
     };
 
     let mut engine =
         Engine::build(&world, &registry, SAMPLE_RATE, BLOCK_SIZE).expect("engine build");
+
+    let h_breath = engine
+        .resolve_out_port("breath_out")
+        .expect("resolve breath_out");
 
     // Tally active samples inside and outside the breath window for each period.
     let breath_samples = (SAMPLE_RATE as f32 * breath_duration_s) as u64;
@@ -91,8 +105,8 @@ fn run_cell(breath_duration_s: f32, amplitude: f32) -> CellResult {
     let out_breath_skip: u64 = (SAMPLE_RATE as f32 * 0.15) as u64;
 
     for block_idx in 0..N_BLOCKS {
-        engine.run_blocks(1);
-        let buf = engine.last_block("det", "breath").unwrap();
+        engine.process_block(BLOCK_SIZE);
+        let buf = engine.out_port(h_breath);
         for (i, &v) in buf.iter().enumerate() {
             let abs_idx = block_idx * BLOCK_SIZE as u64 + i as u64;
             if abs_idx < warmup_samples {
