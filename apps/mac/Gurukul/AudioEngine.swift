@@ -1,5 +1,10 @@
 import AVFoundation
 import Foundation
+import OSLog
+
+/// Unified-logging channel for the audio pipeline. Read from the terminal with:
+///   log stream --predicate 'subsystem == "com.kaiwalya.Gurukul"' --info --debug
+private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "AudioPipeline")
 
 /// Drives the gurukul engine from a live AVAudioEngine microphone tap.
 ///
@@ -41,18 +46,19 @@ final class AudioPipeline {
       "nodes": [
         {
           "id": "yin",
-          "kind": "pitch-yin",
+          "type": "PitchYin",
           "params": {
-            "threshold": 0.15,
-            "min_hz": 70.0,
-            "max_hz": 1000.0,
-            "window_size": 2048
+            "window": 2048,
+            "hop": 512,
+            "fmin_hz": 70.0,
+            "fmax_hz": 1000.0,
+            "threshold": 0.15
           }
         }
       ],
       "connections": [
-        { "from": "mic", "to": "yin.audio" },
-        { "from": "yin.pitch_hz", "to": "pitch" }
+        { "from": "mic", "to": "yin.audio_in" },
+        { "from": "yin.f0", "to": "pitch" }
       ]
     }
     """
@@ -63,7 +69,7 @@ final class AudioPipeline {
         try buildEngineIfNeeded()
         try installTap()
         try avEngine.start()
-        print("[AudioPipeline] started — sample rate \(sampleRate) Hz, block size \(blockSize)")
+        log.info("started — sample rate \(self.sampleRate, privacy: .public) Hz, block size \(self.blockSize, privacy: .public)")
     }
 
     func stop() {
@@ -72,7 +78,7 @@ final class AudioPipeline {
         if let ptr = enginePtr {
             engine_reset(ptr)
         }
-        print("[AudioPipeline] stopped")
+        log.info("stopped")
     }
 
     deinit {
@@ -127,6 +133,7 @@ final class AudioPipeline {
             throw pipelineError("could not construct AVAudioConverter")
         }
 
+        log.info("hw input format: \(hwFormat, privacy: .public)")
         let tapBufferSize: AVAudioFrameCount = 4096
         inputNode.installTap(
             onBus: 0,
@@ -135,13 +142,32 @@ final class AudioPipeline {
         ) { [weak self] buffer, _ in
             self?.handleInputBuffer(buffer, converter: converter, engineFormat: engineFormat)
         }
+        log.info("tap installed on input bus 0 (buffer \(tapBufferSize, privacy: .public) frames)")
     }
+
+    /// Counter so we can periodically confirm buffers are flowing without
+    /// flooding the log on every callback.
+    private var bufferCount: Int = 0
 
     private func handleInputBuffer(
         _ buffer: AVAudioPCMBuffer,
         converter: AVAudioConverter,
         engineFormat: AVAudioFormat
     ) {
+        bufferCount += 1
+        if bufferCount % 25 == 1 {
+            // Compute peak amplitude over the raw (hw-format) buffer so we
+            // can tell whether any signal is arriving at all, independent
+            // of YIN's detection threshold.
+            var peak: Float = 0
+            if let ch = buffer.floatChannelData?[0] {
+                for i in 0..<Int(buffer.frameLength) {
+                    let v = abs(ch[i])
+                    if v > peak { peak = v }
+                }
+            }
+            log.info("tap #\(self.bufferCount, privacy: .public) frames=\(buffer.frameLength, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public)")
+        }
         // TODO(1.4.6): RT-safe — pre-allocate this buffer once at installTap
         // time and reuse it across callbacks; replace the per-pitch print()
         // with an atomic Float that the UI reads on a display-link timer.
@@ -166,7 +192,7 @@ final class AudioPipeline {
             return buffer
         }
         guard status != .error, error == nil else {
-            print("[AudioPipeline] converter error: \(error?.localizedDescription ?? "unknown")")
+            log.error("converter error: \(error?.localizedDescription ?? "unknown", privacy: .public)")
             return
         }
         guard let src = converted.floatChannelData?[0] else { return }
@@ -186,7 +212,7 @@ final class AudioPipeline {
             var inLen: Int = 0
             let rc1 = engine_in_port(ptr, micHandle, &inPtr, &inLen)
             guard rc1 == GURUKUL_OK, let writableMic = inPtr, inLen >= n else {
-                print("[AudioPipeline] engine_in_port failed rc=\(rc1)")
+                log.error("engine_in_port failed rc=\(rc1, privacy: .public)")
                 return
             }
             writableMic.update(from: src.advanced(by: offset), count: n)
@@ -194,7 +220,7 @@ final class AudioPipeline {
             // 2. Process the block.
             let rc2 = engine_process_block(ptr, n)
             guard rc2 == GURUKUL_OK else {
-                print("[AudioPipeline] engine_process_block failed rc=\(rc2)")
+                log.error("engine_process_block failed rc=\(rc2, privacy: .public)")
                 return
             }
 
@@ -203,12 +229,12 @@ final class AudioPipeline {
             var outLen: Int = 0
             let rc3 = engine_out_port(ptr, pitchHandle, &outPtr, &outLen)
             guard rc3 == GURUKUL_OK, let pitchBuf = outPtr, outLen > 0 else {
-                print("[AudioPipeline] engine_out_port failed rc=\(rc3)")
+                log.error("engine_out_port failed rc=\(rc3, privacy: .public)")
                 return
             }
             let lastPitch = pitchBuf[outLen - 1]
             if lastPitch > 0 {
-                print(String(format: "[pitch] %.1f Hz", lastPitch))
+                log.debug("pitch \(lastPitch, format: .fixed(precision: 1), privacy: .public) Hz")
             }
 
             offset += n

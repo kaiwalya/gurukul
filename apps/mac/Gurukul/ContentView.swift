@@ -1,5 +1,8 @@
 import AVFoundation
+import OSLog
 import SwiftUI
+
+private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "ContentView")
 
 /// Phase 1.4.5 skeleton view. There is no pitch display yet — pitch is
 /// printed to stdout via `AudioPipeline`. The view exists only to host the
@@ -31,13 +34,16 @@ struct ContentView: View {
     private func startPipeline() async {
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
         guard granted else {
+            log.error("microphone permission denied")
             status = "Microphone permission denied."
             return
         }
+        log.info("microphone permission granted")
         do {
             try pipeline.start()
             status = "Listening — sing or hum into the mic."
         } catch {
+            log.error("pipeline start failed: \(error.localizedDescription, privacy: .public)")
             status = "Failed to start: \(error.localizedDescription)"
         }
     }
