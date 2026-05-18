@@ -22,6 +22,15 @@ final class AudioPipeline {
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
     private var pitchHandle: UInt32 = GURUKUL_INVALID_PORT
 
+    /// Monotonic clock anchor set on first successful `start()`. Logged with
+    /// every pitch reading so wall-clock drift vs. sample-clock is visible.
+    private var startInstant: ContinuousClock.Instant?
+
+    /// Total frames the engine has processed since start. Bumped by every
+    /// `engine_process_block(n)` call. Logged alongside wall-clock-dt so any
+    /// underrun/overrun (sample-clock falling behind wall-clock) is obvious.
+    private var sampleClock: UInt64 = 0
+
     /// Sample rate the engine is built for. The mic tap is configured to
     /// deliver buffers at this rate via an AVAudioConverter setup below.
     private let sampleRate: UInt32 = 48000
@@ -69,6 +78,8 @@ final class AudioPipeline {
         try buildEngineIfNeeded()
         try installTap()
         try avEngine.start()
+        startInstant = ContinuousClock.now
+        sampleClock = 0
         log.info("started — sample rate \(self.sampleRate, privacy: .public) Hz, block size \(self.blockSize, privacy: .public)")
     }
 
@@ -223,6 +234,7 @@ final class AudioPipeline {
                 log.error("engine_process_block failed rc=\(rc2, privacy: .public)")
                 return
             }
+            sampleClock &+= UInt64(n)
 
             // 3. Read the pitch out-port.
             var outPtr: UnsafePointer<Float>?
@@ -234,7 +246,12 @@ final class AudioPipeline {
             }
             let lastPitch = pitchBuf[outLen - 1]
             if lastPitch > 0 {
-                log.debug("pitch \(lastPitch, format: .fixed(precision: 1), privacy: .public) Hz")
+                let dt = startInstant.map { ContinuousClock.now - $0 } ?? .zero
+                let dtSec = Double(dt.components.seconds) +
+                    Double(dt.components.attoseconds) * 1e-18
+                let sampSec = Double(sampleClock) / Double(sampleRate)
+                let lagMs = (dtSec - sampSec) * 1000
+                log.debug("pitch \(lastPitch, format: .fixed(precision: 1), privacy: .public) Hz t=\(dtSec, format: .fixed(precision: 3), privacy: .public)s lag=\(lagMs, format: .fixed(precision: 1), privacy: .public)ms")
             }
 
             offset += n
