@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0AF03E302FB93995002CD108 /* Atomics in Frameworks */ = {isa = PBXBuildFile; productRef = 0AF03E312FB93995002CD108 /* Atomics */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		0AF03E042FB93991002CD108 /* Gurukul.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Gurukul.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0AF03E302FB93995002CD108 /* Atomics in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -67,6 +72,7 @@
 			);
 			name = Gurukul;
 			packageProductDependencies = (
+				0AF03E312FB93995002CD108 /* Atomics */,
 			);
 			productName = Gurukul;
 			productReference = 0AF03E042FB93991002CD108 /* Gurukul.app */;
@@ -96,6 +102,9 @@
 			);
 			mainGroup = 0AF03DFB2FB93991002CD108;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				0AF03E322FB93995002CD108 /* XCRemoteSwiftPackageReference "swift-atomics" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 0AF03E052FB93991002CD108 /* Products */;
 			projectDirPath = "";
@@ -317,7 +326,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = Gurukul/Gurukul-Bridging-Header.h;
+				SWIFT_OBJC_BRIDGING_HEADER = "Gurukul/Gurukul-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -353,7 +362,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = Gurukul/Gurukul-Bridging-Header.h;
+				SWIFT_OBJC_BRIDGING_HEADER = "Gurukul/Gurukul-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -381,6 +390,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		0AF03E322FB93995002CD108 /* XCRemoteSwiftPackageReference "swift-atomics" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-atomics.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0AF03E312FB93995002CD108 /* Atomics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0AF03E322FB93995002CD108 /* XCRemoteSwiftPackageReference "swift-atomics" */;
+			productName = Atomics;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 0AF03DFC2FB93991002CD108 /* Project object */;
 }

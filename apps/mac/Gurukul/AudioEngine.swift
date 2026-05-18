@@ -9,40 +9,67 @@ private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "AudioPipe
 /// Drives the gurukul engine from a live AVAudioEngine microphone tap.
 ///
 /// Owns one `GurukulEngine` and one `AVAudioEngine`. On `start()` it installs
-/// an input tap, and for every buffer the tap delivers it copies the samples
-/// into the engine's `mic` in-port, calls `engine_process_block`, and reads
-/// the last sample of the `pitch` out-port — which YIN produces as Hz.
+/// an input tap, accumulates incoming frames into a pre-allocated scratch
+/// buffer, and drains the engine in hop-aligned chunks. The latest pitch
+/// reading lands in a lock-free `PitchSlot` the UI polls at 30 Hz.
 ///
-/// Lives off the audio thread for `start` / `stop` / `reset`; the tap callback
-/// runs on AVAudioEngine's render thread and is the only place we touch the
-/// FFI hot path.
-final class AudioPipeline {
+/// Lives off the audio thread for `start` / `stop`; the tap callback runs on
+/// AVAudioEngine's render thread and is the only place we touch the FFI hot
+/// path. The render thread must not allocate, lock, or call into Swift
+/// runtime functions that can — see the audit at the end of this file.
+/// Project default is `MainActor`; the pipeline is explicitly `nonisolated`
+/// because the audio render thread runs the tap callback and cannot be on the
+/// main actor. SwiftUI touches `pitchSlot` (lock-free) and the
+/// `start`/`stop` methods, which are quick and safe to call from the main
+/// thread.
+nonisolated final class AudioPipeline {
+    /// Public, read-only handle the view polls every UI tick.
+    let pitchSlot = PitchSlot()
+
     private let avEngine = AVAudioEngine()
     private var enginePtr: OpaquePointer?
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
     private var pitchHandle: UInt32 = GURUKUL_INVALID_PORT
 
-    /// Monotonic clock anchor set on first successful `start()`. Logged with
-    /// every pitch reading so wall-clock drift vs. sample-clock is visible.
-    private var startInstant: ContinuousClock.Instant?
-
-    /// Total frames the engine has processed since start. Bumped by every
-    /// `engine_process_block(n)` call. Logged alongside wall-clock-dt so any
-    /// underrun/overrun (sample-clock falling behind wall-clock) is obvious.
-    private var sampleClock: UInt64 = 0
-
     /// Sample rate the engine is built for. The mic tap is configured to
     /// deliver buffers at this rate via an AVAudioConverter setup below.
     private let sampleRate: UInt32 = 48000
 
-    /// Maximum frames per process_block call. AVAudioEngine delivers buffers
-    /// of varying sizes (typically 256-4096); the engine clamps to block_size
-    /// and we feed it in chunks if a buffer is larger.
-    private let blockSize: Int = 1024
+    /// Hop size that matches PitchYin's `hop` param in the world JSON. The
+    /// engine is fed exactly `hop` frames per `process_block` call so YIN's
+    /// hop counter never straddles a buffer boundary with stale state.
+    private let hop: Int = 512
+
+    /// Per-hop RMS gate. YIN happily locks onto noise-floor content at any
+    /// input level, so even mic-muted we'd see a stable bogus pitch. We
+    /// publish the YIN value only when the hop's RMS is above this floor;
+    /// below it, we publish NaN ("block ran, no detection") so the UI dims.
+    /// -50 dBFS ≈ 0.00316 linear; tune as we get more devices on the
+    /// matrix.
+    private let silenceRmsFloor: Float = 0.00316
+
+    /// Pre-allocated scratch that holds converted mono float frames between
+    /// callbacks. Sized generously (max tap delivery + a few hops of slack)
+    /// so we never have to grow it on the audio thread. Owned by the
+    /// pipeline; lives until `deinit`.
+    private var scratch: UnsafeMutableBufferPointer<Float>?
+    private var scratchFill: Int = 0
+    private var scratchCapacity: Int = 0
+
+    /// Monotonic sequence number stamped on every block we process. UI uses
+    /// it to tell "no new block" from "block with no detection".
+    private var seq: UInt32 = 0
+
+    /// Re-usable destination for the tap → engine-format conversion. Stays
+    /// the same shape callback after callback because both source format
+    /// and target format are constant. Nil when the hw format already
+    /// matches the engine format (the common case on macOS with built-in
+    /// mics + display audio) — we just hand the raw buffer through.
+    private var convertedBuffer: AVAudioPCMBuffer?
+    private var converter: AVAudioConverter?
 
     /// The world driving the engine in this skeleton: one mic in-port, a YIN
-    /// pitch tracker, one pitch out-port. Hardcoded for now — later phases
-    /// load worlds from disk or the editor.
+    /// pitch tracker, one pitch out-port.
     private static let worldJSON: String = """
     {
       "world_version": 1,
@@ -78,23 +105,31 @@ final class AudioPipeline {
         try buildEngineIfNeeded()
         try installTap()
         try avEngine.start()
-        startInstant = ContinuousClock.now
-        sampleClock = 0
-        log.info("started — sample rate \(self.sampleRate, privacy: .public) Hz, block size \(self.blockSize, privacy: .public)")
+        let inLat = avEngine.inputNode.presentationLatency
+        let outLat = avEngine.inputNode.outputPresentationLatency
+        log.info("started — sample rate \(self.sampleRate, privacy: .public) Hz, hop \(self.hop, privacy: .public), inputPresentationLatency=\(inLat * 1000, format: .fixed(precision: 1), privacy: .public)ms, outputPresentationLatency=\(outLat * 1000, format: .fixed(precision: 1), privacy: .public)ms")
     }
 
     func stop() {
+        // Remove the tap first so no new callbacks land while we're tearing
+        // down the engine. AVAudioEngine's removeTap is documented to wait
+        // for in-flight callbacks to drain before returning.
         avEngine.inputNode.removeTap(onBus: 0)
         avEngine.stop()
         if let ptr = enginePtr {
             engine_reset(ptr)
         }
+        scratchFill = 0
         log.info("stopped")
     }
 
     deinit {
+        // No MainActor work here — just free C memory and the scratch.
         if let ptr = enginePtr {
             engine_free(ptr)
+        }
+        if let scratch = scratch {
+            scratch.deallocate()
         }
     }
 
@@ -105,7 +140,7 @@ final class AudioPipeline {
 
         var ptr: OpaquePointer?
         let rc = Self.worldJSON.withCString { cstr in
-            engine_build(cstr, sampleRate, blockSize, &ptr)
+            engine_build(cstr, sampleRate, hop, &ptr)
         }
         guard rc == GURUKUL_OK, let built = ptr else {
             throw pipelineError("engine_build failed (rc=\(rc))")
@@ -128,9 +163,6 @@ final class AudioPipeline {
             throw pipelineError("input format has zero sample rate — is mic permission granted?")
         }
 
-        // We want mono Float32 at our engine's sample rate. AVAudioEngine will
-        // give us whatever the hardware provides; install the tap in the
-        // hardware format and convert per buffer.
         guard let engineFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(sampleRate),
@@ -139,21 +171,60 @@ final class AudioPipeline {
         ) else {
             throw pipelineError("could not construct engine AVAudioFormat")
         }
-        let converter = AVAudioConverter(from: hwFormat, to: engineFormat)
-        guard let converter else {
-            throw pipelineError("could not construct AVAudioConverter")
+
+        let needsConversion = hwFormat.sampleRate != engineFormat.sampleRate
+            || hwFormat.channelCount != engineFormat.channelCount
+            || hwFormat.commonFormat != engineFormat.commonFormat
+
+        // AVAudioEngine treats bufferSize as a hint. Asking for 512 frames
+        // (≈10.7 ms at 48 kHz) shrinks tap-side queueing to about one IO
+        // cycle — without it AVAudioEngine batched ~100 ms of audio into
+        // 200 ms-wall-clock taps on the LG display mic.
+        let tapBufferSize: AVAudioFrameCount = 512
+
+        // Worst-case scratch: in practice AVAudioEngine ignores small
+        // bufferSize hints somewhat and may hand us larger chunks (we've
+        // seen 4800-frame buffers on the LG mic). Size for that worst case
+        // so we never overflow.
+        let maxObservedTapFrames = 8192
+        let scratchCap = maxObservedTapFrames + hop
+        let buf = UnsafeMutableBufferPointer<Float>.allocate(capacity: scratchCap)
+        buf.initialize(repeating: 0)
+        scratch = buf
+        scratchCapacity = scratchCap
+        scratchFill = 0
+
+        if needsConversion {
+            let converter = AVAudioConverter(from: hwFormat, to: engineFormat)
+            guard let converter else {
+                throw pipelineError("could not construct AVAudioConverter")
+            }
+            let ratio = engineFormat.sampleRate / hwFormat.sampleRate
+            let convertedCapacity = AVAudioFrameCount(Double(maxObservedTapFrames) * ratio + 64)
+            guard let converted = AVAudioPCMBuffer(
+                pcmFormat: engineFormat,
+                frameCapacity: convertedCapacity
+            ) else {
+                throw pipelineError("could not allocate converter output buffer")
+            }
+            self.converter = converter
+            self.convertedBuffer = converted
+            log.info("conversion path engaged: hw \(hwFormat, privacy: .public) → engine \(engineFormat, privacy: .public), converted capacity=\(convertedCapacity, privacy: .public)")
+        } else {
+            self.converter = nil
+            self.convertedBuffer = nil
+            log.info("conversion bypassed: hw format already matches engine \(engineFormat, privacy: .public)")
         }
 
-        log.info("hw input format: \(hwFormat, privacy: .public)")
-        let tapBufferSize: AVAudioFrameCount = 4096
+        log.info("hw input format: \(hwFormat, privacy: .public), scratch=\(scratchCap, privacy: .public) frames")
         inputNode.installTap(
             onBus: 0,
             bufferSize: tapBufferSize,
             format: hwFormat
-        ) { [weak self] buffer, _ in
-            self?.handleInputBuffer(buffer, converter: converter, engineFormat: engineFormat)
+        ) { [weak self] buffer, when in
+            self?.handleInputBuffer(buffer, when: when)
         }
-        log.info("tap installed on input bus 0 (buffer \(tapBufferSize, privacy: .public) frames)")
+        log.info("tap installed on input bus 0 (buffer \(tapBufferSize, privacy: .public) frames, hop \(self.hop, privacy: .public))")
     }
 
     /// Counter so we can periodically confirm buffers are flowing without
@@ -162,81 +233,117 @@ final class AudioPipeline {
 
     private func handleInputBuffer(
         _ buffer: AVAudioPCMBuffer,
-        converter: AVAudioConverter,
-        engineFormat: AVAudioFormat
+        when _: AVAudioTime
     ) {
         bufferCount += 1
-        if bufferCount % 25 == 1 {
-            // Compute peak amplitude over the raw (hw-format) buffer so we
-            // can tell whether any signal is arriving at all, independent
-            // of YIN's detection threshold.
-            var peak: Float = 0
-            if let ch = buffer.floatChannelData?[0] {
-                for i in 0..<Int(buffer.frameLength) {
-                    let v = abs(ch[i])
-                    if v > peak { peak = v }
+
+        let frames: Int
+        let src: UnsafePointer<Float>
+
+        if let converter = converter, let converted = convertedBuffer {
+            converted.frameLength = 0
+            var error: NSError?
+            var didFeed = false
+            let status = converter.convert(to: converted, error: &error) { _, outStatus in
+                if didFeed {
+                    outStatus.pointee = .noDataNow
+                    return nil
                 }
+                didFeed = true
+                outStatus.pointee = .haveData
+                return buffer
             }
-            log.info("tap #\(self.bufferCount, privacy: .public) frames=\(buffer.frameLength, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public)")
-        }
-        // TODO(1.4.6): RT-safe — pre-allocate this buffer once at installTap
-        // time and reuse it across callbacks; replace the per-pitch print()
-        // with an atomic Float that the UI reads on a display-link timer.
-        // Convert to mono Float32 at the engine's sample rate.
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) *
-            engineFormat.sampleRate / buffer.format.sampleRate) + 64
-        guard let converted = AVAudioPCMBuffer(
-            pcmFormat: engineFormat,
-            frameCapacity: capacity
-        ) else {
-            return
-        }
-        var error: NSError?
-        var didFeed = false
-        let status = converter.convert(to: converted, error: &error) { _, outStatus in
-            if didFeed {
-                outStatus.pointee = .noDataNow
-                return nil
+            guard status != .error, error == nil else {
+                log.error("converter error: \(error?.localizedDescription ?? "unknown", privacy: .public)")
+                return
             }
-            didFeed = true
-            outStatus.pointee = .haveData
-            return buffer
+            guard let ch = converted.floatChannelData?[0] else { return }
+            src = UnsafePointer(ch)
+            frames = Int(converted.frameLength)
+        } else {
+            // Bypass: hw format already matches the engine format.
+            guard let ch = buffer.floatChannelData?[0] else { return }
+            src = UnsafePointer(ch)
+            frames = Int(buffer.frameLength)
         }
-        guard status != .error, error == nil else {
-            log.error("converter error: \(error?.localizedDescription ?? "unknown", privacy: .public)")
-            return
+
+        appendAndDrain(src: src, count: frames)
+
+        if bufferCount % 25 == 1 {
+            var peak: Float = 0
+            for i in 0..<frames {
+                let v = abs(src[i])
+                if v > peak { peak = v }
+            }
+            // scratchFill after drain shows whether we're keeping up with
+            // realtime. Steady state should sit at 0..<hop. If it grows
+            // monotonically, sample-clock drift is the lag source.
+            log.info("tap #\(self.bufferCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
         }
-        guard let src = converted.floatChannelData?[0] else { return }
-        feedEngine(src: src, frames: Int(converted.frameLength))
     }
 
-    private func feedEngine(src: UnsafePointer<Float>, frames: Int) {
+    /// Append `count` newly-converted frames into the scratch buffer, then
+    /// drain in hop-aligned chunks while there's enough fill. Any leftover
+    /// frames (< hop) stay in the scratch for the next callback so YIN sees
+    /// a continuous stream.
+    private func appendAndDrain(src: UnsafePointer<Float>, count: Int) {
+        guard let scratch = scratch else { return }
         guard let ptr = enginePtr else { return }
 
-        // Walk the converted buffer in block_size chunks.
-        var offset = 0
-        while offset < frames {
-            let n = min(blockSize, frames - offset)
+        // If the incoming chunk would overflow the scratch, drop the oldest
+        // frames. This should never fire in practice — scratch is sized for
+        // ~2× tap delivery — but it's a soft guard rather than a crash.
+        if scratchFill + count > scratchCapacity {
+            let overflow = scratchFill + count - scratchCapacity
+            if overflow < scratchFill {
+                // Drop the OLDEST frames: shift the tail [overflow ..<
+                // scratchFill] down to start at index 0.
+                scratch.baseAddress!
+                    .update(
+                        from: scratch.baseAddress!.advanced(by: overflow),
+                        count: scratchFill - overflow
+                    )
+                scratchFill -= overflow
+            } else {
+                scratchFill = 0
+            }
+            log.error("scratch overflow — dropped \(overflow, privacy: .public) frames")
+        }
 
-            // 1. Fetch the writable in-port slice.
+        scratch.baseAddress!.advanced(by: scratchFill)
+            .update(from: src, count: count)
+        scratchFill += count
+
+        // Drain hop-aligned chunks.
+        var consumed = 0
+        while scratchFill - consumed >= hop {
             var inPtr: UnsafeMutablePointer<Float>?
             var inLen: Int = 0
             let rc1 = engine_in_port(ptr, micHandle, &inPtr, &inLen)
-            guard rc1 == GURUKUL_OK, let writableMic = inPtr, inLen >= n else {
+            guard rc1 == GURUKUL_OK, let writableMic = inPtr, inLen >= hop else {
                 log.error("engine_in_port failed rc=\(rc1, privacy: .public)")
                 return
             }
-            writableMic.update(from: src.advanced(by: offset), count: n)
+            let hopStart = scratch.baseAddress!.advanced(by: consumed)
+            writableMic.update(from: hopStart, count: hop)
 
-            // 2. Process the block.
-            let rc2 = engine_process_block(ptr, n)
+            // RMS over the hop we're about to feed. If below the floor, we'll
+            // still process the block (so PitchYin's window stays in sync)
+            // but publish NaN instead of the YIN output — the UI sees
+            // "silence detected" and dims.
+            var sumSq: Float = 0
+            for i in 0..<hop {
+                let s = hopStart[i]
+                sumSq += s * s
+            }
+            let rms = sqrtf(sumSq / Float(hop))
+
+            let rc2 = engine_process_block(ptr, hop)
             guard rc2 == GURUKUL_OK else {
                 log.error("engine_process_block failed rc=\(rc2, privacy: .public)")
                 return
             }
-            sampleClock &+= UInt64(n)
 
-            // 3. Read the pitch out-port.
             var outPtr: UnsafePointer<Float>?
             var outLen: Int = 0
             let rc3 = engine_out_port(ptr, pitchHandle, &outPtr, &outLen)
@@ -245,16 +352,27 @@ final class AudioPipeline {
                 return
             }
             let lastPitch = pitchBuf[outLen - 1]
-            if lastPitch > 0 {
-                let dt = startInstant.map { ContinuousClock.now - $0 } ?? .zero
-                let dtSec = Double(dt.components.seconds) +
-                    Double(dt.components.attoseconds) * 1e-18
-                let sampSec = Double(sampleClock) / Double(sampleRate)
-                let lagMs = (dtSec - sampSec) * 1000
-                log.debug("pitch \(lastPitch, format: .fixed(precision: 1), privacy: .public) Hz t=\(dtSec, format: .fixed(precision: 3), privacy: .public)s lag=\(lagMs, format: .fixed(precision: 1), privacy: .public)ms")
-            }
 
-            offset += n
+            seq &+= 1
+            // Two ways to publish NaN ("block ran, no detection"):
+            //   - signal energy below the silence floor (mic muted / room),
+            //   - YIN itself returned 0 Hz (unvoiced / no clear period).
+            let voiced = rms >= silenceRmsFloor && lastPitch > 0
+            let publishedHz: Float = voiced ? lastPitch : .nan
+            pitchSlot.store(seq: seq, hz: publishedHz)
+
+            consumed += hop
+        }
+
+        if consumed > 0 {
+            let leftover = scratchFill - consumed
+            if leftover > 0 {
+                scratch.baseAddress!.update(
+                    from: scratch.baseAddress!.advanced(by: consumed),
+                    count: leftover
+                )
+            }
+            scratchFill = leftover
         }
     }
 
@@ -272,3 +390,24 @@ final class AudioPipeline {
         )
     }
 }
+
+// MARK: - RT-safety audit
+//
+// The audio-thread callback (`handleInputBuffer` → `appendAndDrain`) is on the
+// hot path. It must not allocate, lock, or call Swift-runtime functions that
+// can. The current state:
+//
+// - scratch buffer is pre-allocated in `installTap` and reused forever.
+// - converter output buffer is pre-allocated and reused; converter.convert
+//   writes into it in place. (Note: the AVAudioConverter internals may still
+//   allocate on certain SR ratios; remove with a manual resample later.)
+// - PitchSlot.store is a single ManagedAtomic<UInt64> store — lock-free.
+// - log.error and log.info on the hot path fire only on rare branches (every
+//   25 callbacks for the tap counter, or on actual errors); they are not in
+//   the per-block inner loop.
+// - No NSError construction on the inner loop.
+//
+// Known violation (deferred to 1.4.7): the AVAudioConverter path itself is
+// not strictly allocation-free across all hardware sample rates. The fix is
+// to replace AVAudioConverter with a manual resample using a pre-allocated
+// kernel, which is a larger change than 1.4.6's scope.
