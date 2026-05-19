@@ -23,8 +23,9 @@ private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "AudioPipe
 ///
 /// The downstream is identical for both paths: accumulate frames into a
 /// pre-allocated scratch buffer, drain in hop-aligned chunks, run a
-/// per-hop RMS energy gate, and publish the latest pitch into a lock-free
-/// `PitchSlot` the UI polls at 30 Hz.
+/// per-hop RMS energy gate, and publish a coherent `FeatureSnapshot`
+/// (pitch + onset + breath + vibrato rate/depth) into a lock-free,
+/// wait-free `FeatureSlot` (triple-buffered) the UI polls at 30 Hz.
 ///
 /// Project default is `MainActor`; the pipeline is explicitly
 /// `nonisolated` because the audio render thread (HAL IO proc or tap
@@ -33,11 +34,21 @@ private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "AudioPipe
 /// to call from the main thread.
 nonisolated final class AudioPipeline {
     /// Public, read-only handle the view polls every UI tick.
-    let pitchSlot = PitchSlot()
+    let featureSlot = FeatureSlot()
 
     private var enginePtr: OpaquePointer?
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
-    private var pitchHandle: UInt32 = GURUKUL_INVALID_PORT
+    private var pitchOut: UInt32 = GURUKUL_INVALID_PORT
+    private var onsetOut: UInt32 = GURUKUL_INVALID_PORT
+    private var breathOut: UInt32 = GURUKUL_INVALID_PORT
+    private var vibratoRateOut: UInt32 = GURUKUL_INVALID_PORT
+    private var vibratoDepthOut: UInt32 = GURUKUL_INVALID_PORT
+
+    /// Set true at start of a fresh stream (start, fallback, device
+    /// swap). Consumed by the next publish in `appendAndDrain`, which
+    /// stamps `discontinuity = true` on that snapshot so the UI ring
+    /// buffers know to clear.
+    private var pendingDiscontinuity: Bool = true
 
     /// Sample rate the engine is built for. Both capture paths deliver
     /// frames at this rate (HAL via the unit's internal conversion;
@@ -127,8 +138,11 @@ nonisolated final class AudioPipeline {
     private var converter: AVAudioConverter?
     private var fallbackActive: Bool = false
 
-    /// The world driving the engine: one mic in-port, a YIN pitch
-    /// tracker, one pitch out-port.
+    /// The world driving the engine: one mic in-port, four analyzers,
+    /// five boundary out-ports. Node ids and boundary port ids must
+    /// stay disjoint (PHASE_1_4.md §2 validation rule), hence
+    /// `pitch_yin` / `onset_det` / `breath_det` / `vibrato_det` on the
+    /// node side.
     private static let worldJSON: String = """
     {
       "world_version": 1,
@@ -136,11 +150,15 @@ nonisolated final class AudioPipeline {
         { "id": "mic" }
       ],
       "out_ports": [
-        { "id": "pitch" }
+        { "id": "pitch" },
+        { "id": "onset" },
+        { "id": "breath" },
+        { "id": "vibrato_rate" },
+        { "id": "vibrato_depth" }
       ],
       "nodes": [
         {
-          "id": "yin",
+          "id": "pitch_yin",
           "type": "PitchYin",
           "params": {
             "window": 2048,
@@ -149,11 +167,30 @@ nonisolated final class AudioPipeline {
             "fmax_hz": 1000.0,
             "threshold": 0.15
           }
+        },
+        {
+          "id": "onset_det",
+          "type": "Onset"
+        },
+        {
+          "id": "breath_det",
+          "type": "Breath"
+        },
+        {
+          "id": "vibrato_det",
+          "type": "Vibrato"
         }
       ],
       "connections": [
-        { "from": "mic", "to": "yin.audio_in" },
-        { "from": "yin.f0", "to": "pitch" }
+        { "from": "mic",                "to": "pitch_yin.audio_in" },
+        { "from": "mic",                "to": "onset_det.audio_in" },
+        { "from": "mic",                "to": "breath_det.audio_in" },
+        { "from": "pitch_yin.f0",       "to": "vibrato_det.f0" },
+        { "from": "pitch_yin.f0",       "to": "pitch" },
+        { "from": "onset_det.onset",    "to": "onset" },
+        { "from": "breath_det.breath",  "to": "breath" },
+        { "from": "vibrato_det.rate",   "to": "vibrato_rate" },
+        { "from": "vibrato_det.depth",  "to": "vibrato_depth" }
       ]
     }
     """
@@ -163,6 +200,7 @@ nonisolated final class AudioPipeline {
     func start() throws {
         try buildEngineIfNeeded()
         allocateScratch(capacity: maxFramesPerSlice + hop)
+        pendingDiscontinuity = true
 
         // Try HAL first. If anything along the chain fails, log and
         // fall back to the AVAudioEngine tap path. Failures are
@@ -198,6 +236,13 @@ nonisolated final class AudioPipeline {
             engine_reset(ptr)
         }
         scratchFill = 0
+        #if DEBUG
+        let counters = featureSlot.debugCounters()
+        let pct: Double = counters.reads > 0
+            ? Double(counters.retries) / Double(counters.reads) * 100.0
+            : 0.0
+        log.info("FeatureSlot reader: reads=\(counters.reads, privacy: .public) retries=\(counters.retries, privacy: .public) (\(pct, format: .fixed(precision: 2), privacy: .public)%)")
+        #endif
         log.info("stopped")
     }
 
@@ -231,8 +276,17 @@ nonisolated final class AudioPipeline {
         enginePtr = built
 
         micHandle = "mic".withCString { engine_resolve_in_port(built, $0) }
-        pitchHandle = "pitch".withCString { engine_resolve_out_port(built, $0) }
-        guard micHandle != GURUKUL_INVALID_PORT, pitchHandle != GURUKUL_INVALID_PORT else {
+        pitchOut = "pitch".withCString { engine_resolve_out_port(built, $0) }
+        onsetOut = "onset".withCString { engine_resolve_out_port(built, $0) }
+        breathOut = "breath".withCString { engine_resolve_out_port(built, $0) }
+        vibratoRateOut = "vibrato_rate".withCString { engine_resolve_out_port(built, $0) }
+        vibratoDepthOut = "vibrato_depth".withCString { engine_resolve_out_port(built, $0) }
+        guard micHandle != GURUKUL_INVALID_PORT,
+              pitchOut != GURUKUL_INVALID_PORT,
+              onsetOut != GURUKUL_INVALID_PORT,
+              breathOut != GURUKUL_INVALID_PORT,
+              vibratoRateOut != GURUKUL_INVALID_PORT,
+              vibratoDepthOut != GURUKUL_INVALID_PORT else {
             throw pipelineError("resolve_in_port/out_port failed")
         }
     }
@@ -543,6 +597,7 @@ nonisolated final class AudioPipeline {
             do {
                 try startFallback()
                 fallbackActive = true
+                pendingDiscontinuity = true
                 log.info("capture path: AVAudioEngine tap (post-swap fallback)")
             } catch {
                 log.error("fallback start also failed: \(error.localizedDescription, privacy: .public)")
@@ -579,8 +634,10 @@ nonisolated final class AudioPipeline {
         try check(startStatus, "AudioOutputUnitStart during swap")
 
         // Reset scratch — the device change is a discontinuity and we
-        // don't want to feed a stitched-together hop into YIN.
+        // don't want to feed a stitched-together hop into YIN. Flag
+        // the next publish so the UI ring buffers clear too.
         scratchFill = 0
+        pendingDiscontinuity = true
         log.info("HAL device swap complete")
     }
 
@@ -811,19 +868,30 @@ nonisolated final class AudioPipeline {
                 return
             }
 
-            var outPtr: UnsafePointer<Float>?
-            var outLen: Int = 0
-            let rc3 = engine_out_port(ptr, pitchHandle, &outPtr, &outLen)
-            guard rc3 == GURUKUL_OK, let pitchBuf = outPtr, outLen > 0 else {
-                log.error("engine_out_port failed rc=\(rc3, privacy: .public)")
-                return
-            }
-            let lastPitch = pitchBuf[outLen - 1]
+            // Read all five out-ports per the per-port shape table:
+            //   pitch, breath, vibrato_rate, vibrato_depth → last-sample
+            //   onset                                      → max-|x|
+            let lastPitch = readLastSample(ptr: ptr, handle: pitchOut)
+            let lastBreath = readLastSample(ptr: ptr, handle: breathOut)
+            let lastVibratoRate = readLastSample(ptr: ptr, handle: vibratoRateOut)
+            let lastVibratoDepth = readLastSample(ptr: ptr, handle: vibratoDepthOut)
+            let onsetMag = readMaxAbs(ptr: ptr, handle: onsetOut)
 
             seq &+= 1
             let voiced = rms >= silenceRmsFloor && lastPitch > 0
             let publishedHz: Float = voiced ? lastPitch : .nan
-            pitchSlot.store(seq: seq, hz: publishedHz)
+
+            let snapshot = FeatureSnapshot(
+                seq: seq,
+                hz: publishedHz,
+                onset: onsetMag,
+                breath: lastBreath,
+                vibratoRate: lastVibratoRate,
+                vibratoDepth: lastVibratoDepth,
+                discontinuity: pendingDiscontinuity
+            )
+            pendingDiscontinuity = false
+            featureSlot.store(snapshot)
 
             consumed += hop
         }
@@ -838,6 +906,40 @@ nonisolated final class AudioPipeline {
             }
             scratchFill = leftover
         }
+    }
+
+    /// Read the last sample of an out-port buffer. Use for
+    /// sample-and-hold features (pitch, breath, vibrato rate/depth).
+    /// Returns 0 on a failed FFI call rather than aborting the hop —
+    /// a stale "0" is better than a missed publish across all five
+    /// features.
+    private func readLastSample(ptr: OpaquePointer, handle: UInt32) -> Float {
+        var outPtr: UnsafePointer<Float>?
+        var outLen: Int = 0
+        let rc = engine_out_port(ptr, handle, &outPtr, &outLen)
+        guard rc == GURUKUL_OK, let buf = outPtr, outLen > 0 else {
+            return 0
+        }
+        return buf[outLen - 1]
+    }
+
+    /// Scan an out-port buffer for the maximum absolute value. Use for
+    /// event-shaped features (onset emits a one-sample pulse and would
+    /// be missed by a last-sample read; with hop=512 the pulse is at
+    /// the last index only ~0.2% of the time).
+    private func readMaxAbs(ptr: OpaquePointer, handle: UInt32) -> Float {
+        var outPtr: UnsafePointer<Float>?
+        var outLen: Int = 0
+        let rc = engine_out_port(ptr, handle, &outPtr, &outLen)
+        guard rc == GURUKUL_OK, let buf = outPtr, outLen > 0 else {
+            return 0
+        }
+        var maxAbs: Float = 0
+        for i in 0..<outLen {
+            let v = abs(buf[i])
+            if v > maxAbs { maxAbs = v }
+        }
+        return maxAbs
     }
 
     // MARK: - HAL helpers
@@ -960,7 +1062,12 @@ nonisolated final class AudioPipeline {
 //   reused across callbacks.
 // - AudioUnitRender is the intended RT-safe way to pull input from a HAL unit.
 // - converter output buffer is pre-allocated and reused on the fallback path.
-// - PitchSlot.store is a single ManagedAtomic<UInt64> store.
+// - Per-hop: 1 engine_in_port + 1 engine_process_block + 5 engine_out_port
+//   reads (4 last-sample + 1 max-scan-over-hop for onset). All pointer
+//   indirections, all infallible-by-construction once handles resolve.
+// - FeatureSlot.store is one .relaxed load + one .relaxed load + one plain
+//   struct store (28 bytes) + one .release store on a UInt8 atomic.
+//   Triple-buffered so writer is wait-free even under reader contention.
 // - stopping.load is a single ManagedAtomic<Bool> load (relaxed).
 // - log.error / log.info on the hot path fire only on rare branches (errors,
 //   or every 200th HAL callback / 25th tap callback).

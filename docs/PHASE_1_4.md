@@ -306,7 +306,7 @@ This list is the proof that the seam is sufficient: every concern above is the c
 
 ## 7. Open questions
 
-- **ECS in 1.4.7.** ROADMAP claims Phase 1.4 is where ECS enters (visualiser entities with `PortBinding(path)` components). This plan defers all ECS thinking to 1.4.7. Decide at the start of 1.4.7 whether ECS lands then or slips to 1.5 — small entity counts (one pitch line, one onset flash, one breath bar, one vibrato indicator) don't *need* an ECS yet. If ECS slips, update ROADMAP.
+- ~~**ECS in 1.4.7.**~~ **Decided 2026-05-18: ECS slips to Phase 1.5.** Rationale: four fixed signals + four hard-wired views (pitch trace, onset ticks, breath strip, vibrato readout) — the abstraction would be invented for itself. The cost of ECS now is greater than the cost of refactoring four views into entities later, if a non-toy entity count ever appears. ROADMAP updated in the same commit (PR 1.4.7).
 - **macOS deployment target.** Affects `AVAudioEngine` / SwiftUI APIs. Suggest macOS 13+; covers everything modern and we're not targeting old hardware.
 - **Xcode project in-tree (`apps/mac/`) vs separate repo.** Recommend in-tree until it stops working — better for the part-time cadence.
 - **Hardcoded World vs JSON-loaded in the cabinet.** 1.4.5 hardcodes; revisit when the editor work begins.

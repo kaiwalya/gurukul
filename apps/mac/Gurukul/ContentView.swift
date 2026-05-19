@@ -9,8 +9,10 @@ private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "ContentVi
 private let silenceDimAfter: TimeInterval = 0.2
 private let silenceClearAfter: TimeInterval = 0.5
 
-/// Phase 1.4.6 view: big note + cents readout driven by a 30 Hz timer that
-/// polls the audio pipeline's lock-free pitch slot.
+/// Phase 1.4.7 view: big note + cents readout (from 1.4.6) and a four-up
+/// visualiser panel (pitch trace + onset ticks + breath strip + vibrato
+/// readout) below, all driven by a 30 Hz timer polling the pipeline's
+/// lock-free `FeatureSlot`.
 struct ContentView: View {
     @State private var pipeline = AudioPipeline()
     @State private var status: String = "Idle"
@@ -23,15 +25,17 @@ struct ContentView: View {
     @State private var school: PitchSchool = .western
     @State private var westernCtx = WesternContext()
 
+    /// Latest coherent snapshot of all four features, refreshed every UI
+    /// tick. Passed by reference (via @State) to the visualiser subviews.
+    @State private var snapshot: FeatureSnapshot = .empty
+
     private let tick = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 16) {
             HStack {
                 Picker("School", selection: $school) {
                     Text(PitchSchool.western.displayName).tag(PitchSchool.western)
-                    // Indian schools are shaped in the type system but not
-                    // shipped in 1.4.6 — no disabled menu items either.
                 }
                 .pickerStyle(.menu)
                 .fixedSize()
@@ -44,13 +48,22 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
             }
 
-            Spacer()
-
-            VStack(spacing: 8) {
+            VStack(spacing: 4) {
                 noteText
                 centsText
                 hzText
             }
+
+            PitchTraceView(snapshot: snapshot)
+                .frame(maxWidth: .infinity, minHeight: 260)
+
+            BreathStripView(breath: snapshot.breath)
+                .frame(maxWidth: .infinity, minHeight: 18)
+
+            VibratoReadoutView(
+                rate: snapshot.vibratoRate,
+                depth: snapshot.vibratoDepth
+            )
 
             Spacer()
 
@@ -59,8 +72,8 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
-        .padding(32)
-        .frame(minWidth: 480, minHeight: 320)
+        .padding(24)
+        .frame(minWidth: 520, minHeight: 680)
         .task {
             await startIfPermitted()
         }
@@ -80,10 +93,10 @@ struct ContentView: View {
     @ViewBuilder private var noteText: some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(displayed.name)
-                .font(.system(size: 96, weight: .semibold, design: .rounded))
+                .font(.system(size: 80, weight: .semibold, design: .rounded))
                 .monospacedDigit()
             Text(registerSuffix(displayed.register))
-                .font(.system(size: 40, weight: .regular, design: .rounded))
+                .font(.system(size: 32, weight: .regular, design: .rounded))
                 .foregroundStyle(.secondary)
         }
         .opacity(dimAmount)
@@ -92,43 +105,42 @@ struct ContentView: View {
     @ViewBuilder private var centsText: some View {
         if displayed.hz > 0 {
             Text(formatCents(displayed.cents))
-                .font(.system(size: 28, weight: .medium, design: .rounded))
+                .font(.system(size: 24, weight: .medium, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(tintForCents(displayed.cents))
                 .opacity(dimAmount)
         } else {
             Text(" ")
-                .font(.system(size: 28))
+                .font(.system(size: 24))
         }
     }
 
     @ViewBuilder private var hzText: some View {
         if displayed.hz > 0 {
             Text(String(format: "%.1f Hz", displayed.hz))
-                .font(.system(size: 16, design: .rounded))
+                .font(.system(size: 14, design: .rounded))
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
                 .opacity(dimAmount)
         } else {
             Text(" ")
-                .font(.system(size: 16))
+                .font(.system(size: 14))
         }
     }
 
     private func refreshDisplay(now: Date) {
-        let (seq, hz) = pipeline.pitchSlot.load()
-        if seq == lastSeq { return }
-        lastSeq = seq
+        let next = pipeline.featureSlot.load()
+        if next.seq == lastSeq { return }
+        lastSeq = next.seq
+        snapshot = next
 
         let context = currentContext()
         let namer = PitchNamerFactory.namer(for: context)
-
+        let hz = next.hz
         if hz.isFinite && hz > 0 {
             displayed = namer.name(hz: hz)
             lastFreshAt = now
         } else {
-            // Block ran but no detection. Keep the last named pitch visible
-            // so the user sees a brief hold; the dim curve handles the fade.
             if Date().timeIntervalSince(lastFreshAt) > silenceClearAfter {
                 displayed = silentPitch
             }
@@ -138,7 +150,7 @@ struct ContentView: View {
     private func currentContext() -> PitchContext {
         switch school {
         case .western: return .western(westernCtx)
-        case .hindustani, .karnatik: return .western(westernCtx) // not shipped yet
+        case .hindustani, .karnatik: return .western(westernCtx)
         }
     }
 
