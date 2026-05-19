@@ -99,6 +99,27 @@ nonisolated final class AudioPipeline {
     /// path selection.
     private var halRunning: Bool = false
 
+    /// Device the HAL unit was wired to at the last `installHALInput()`.
+    /// Used by the default-input listener to decide whether a change
+    /// actually requires re-targeting.
+    private var halCurrentDeviceID: AudioDeviceID = kAudioObjectUnknown
+
+    /// True while a default-input property listener is registered on
+    /// the system object. Tracked so `stop()` can remove it
+    /// idempotently and we never double-register.
+    private var defaultInputListenerInstalled: Bool = false
+
+    /// Serial queue for device-swap work. The CoreAudio property
+    /// listener fires on a non-RT thread, but it's still not somewhere
+    /// we want to call Stop / SetProperty / Start in-line: those can
+    /// block and we don't know which queue the system used. Hopping to
+    /// our own serial queue lets us swap deliberately and serialises
+    /// concurrent listener fires.
+    private let deviceSwapQueue = DispatchQueue(
+        label: "com.kaiwalya.Gurukul.deviceSwap",
+        qos: .userInitiated
+    )
+
     // MARK: - AVAudioEngine fallback state
 
     private let avEngine = AVAudioEngine()
@@ -151,6 +172,7 @@ nonisolated final class AudioPipeline {
             try installHALInput()
             try startHALUnit()
             halRunning = true
+            installDefaultInputListener()
             log.info("capture path: HAL")
         } catch {
             log.error("HAL setup failed: \(error.localizedDescription, privacy: .public) — falling back to AVAudioEngine tap (HIGH LATENCY)")
@@ -162,6 +184,7 @@ nonisolated final class AudioPipeline {
     }
 
     func stop() {
+        removeDefaultInputListener()
         if halRunning {
             stopHALUnit()
             halRunning = false
@@ -282,6 +305,7 @@ nonisolated final class AudioPipeline {
 
         // CurrentDevice Global/0 = <default input device>
         var deviceID = try defaultInputDeviceID()
+        halCurrentDeviceID = deviceID
         status = AudioUnitSetProperty(
             unit,
             kAudioOutputUnitProperty_CurrentDevice,
@@ -340,17 +364,24 @@ nonisolated final class AudioPipeline {
         // Allocate the buffer list to maxFramesPerSlice. mDataByteSize
         // is reset per-callback inside the IO proc to match the actual
         // inNumberFrames; the underlying storage is fixed.
-        let backing = UnsafeMutableBufferPointer<Float>.allocate(capacity: maxFramesPerSlice)
-        backing.initialize(repeating: 0)
-        halBufferStorage = backing
-
-        let listPtr = AudioBufferList.allocate(maximumBuffers: 1)
-        listPtr[0] = AudioBuffer(
-            mNumberChannels: 1,
-            mDataByteSize: UInt32(maxFramesPerSlice * MemoryLayout<Float>.size),
-            mData: UnsafeMutableRawPointer(backing.baseAddress)
-        )
-        halBufferList = listPtr
+        //
+        // Re-use existing buffers if present (device-swap path
+        // re-enters installHALInput on the same pipeline, and we don't
+        // want to leak the previous allocation).
+        if halBufferStorage == nil {
+            let backing = UnsafeMutableBufferPointer<Float>.allocate(capacity: maxFramesPerSlice)
+            backing.initialize(repeating: 0)
+            halBufferStorage = backing
+        }
+        if halBufferList == nil, let backing = halBufferStorage {
+            let listPtr = AudioBufferList.allocate(maximumBuffers: 1)
+            listPtr[0] = AudioBuffer(
+                mNumberChannels: 1,
+                mDataByteSize: UInt32(maxFramesPerSlice * MemoryLayout<Float>.size),
+                mData: UnsafeMutableRawPointer(backing.baseAddress)
+            )
+            halBufferList = listPtr
+        }
 
         // SetInputCallback Global/0 = (ioCallback, self)
         var callbackStruct = AURenderCallbackStruct(
@@ -425,6 +456,132 @@ nonisolated final class AudioPipeline {
             listPtr.unsafeMutablePointer.deallocate()
             halBufferList = nil
         }
+    }
+
+    // MARK: - Default-input change handling
+
+    private static var defaultInputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    /// CoreAudio property-listener trampoline. Pulls the pipeline out
+    /// of the refcon and hops onto the swap queue — we don't know which
+    /// thread CoreAudio called us on, and the actual unit re-targeting
+    /// involves Stop/SetProperty/Start which we don't want to do
+    /// in-line on a system thread.
+    private static let defaultInputChanged: AudioObjectPropertyListenerProc = {
+        _, _, _, refcon in
+        guard let refcon else { return noErr }
+        let pipeline = Unmanaged<AudioPipeline>.fromOpaque(refcon).takeUnretainedValue()
+        pipeline.deviceSwapQueue.async {
+            pipeline.handleDefaultInputChanged()
+        }
+        return noErr
+    }
+
+    private func installDefaultInputListener() {
+        guard !defaultInputListenerInstalled else { return }
+        let status = AudioObjectAddPropertyListener(
+            AudioObjectID(kAudioObjectSystemObject),
+            &Self.defaultInputAddress,
+            Self.defaultInputChanged,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        if status == noErr {
+            defaultInputListenerInstalled = true
+            log.info("default-input listener installed")
+        } else {
+            log.error("AddPropertyListener(DefaultInputDevice) failed: \(status, privacy: .public)")
+        }
+    }
+
+    private func removeDefaultInputListener() {
+        guard defaultInputListenerInstalled else { return }
+        let status = AudioObjectRemovePropertyListener(
+            AudioObjectID(kAudioObjectSystemObject),
+            &Self.defaultInputAddress,
+            Self.defaultInputChanged,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        if status != noErr {
+            log.error("RemovePropertyListener(DefaultInputDevice) failed: \(status, privacy: .public)")
+        }
+        defaultInputListenerInstalled = false
+    }
+
+    /// Runs on `deviceSwapQueue`. Compares the new default input
+    /// against what the unit is wired to and, if different, stops the
+    /// unit, swaps `CurrentDevice`, restarts. If the swap fails at any
+    /// step, tears the HAL unit down and routes to the AVAudioEngine
+    /// fallback.
+    private func handleDefaultInputChanged() {
+        guard halRunning else { return }
+
+        let newID: AudioDeviceID
+        do {
+            newID = try defaultInputDeviceID()
+        } catch {
+            log.error("default-input changed but lookup failed: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        if newID == halCurrentDeviceID { return }
+
+        let oldName = deviceNameOrUnknown(for: halCurrentDeviceID)
+        let newName = deviceNameOrUnknown(for: newID)
+        log.info("default input changed: '\(oldName, privacy: .public)' (\(self.halCurrentDeviceID, privacy: .public)) → '\(newName, privacy: .public)' (\(newID, privacy: .public)) — swapping HAL device")
+
+        do {
+            try swapHALDevice(to: newID)
+        } catch {
+            log.error("HAL device swap failed: \(error.localizedDescription, privacy: .public) — falling back to AVAudioEngine tap")
+            // Tear the partial HAL state down and bring up the
+            // fallback path so the user still sees pitch readings.
+            tearDownHALUnit()
+            halRunning = false
+            do {
+                try startFallback()
+                fallbackActive = true
+                log.info("capture path: AVAudioEngine tap (post-swap fallback)")
+            } catch {
+                log.error("fallback start also failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Stop the unit, re-target it to `newID`, restart. Reuses the
+    /// same AudioUnit instance — cheaper and less race-prone than
+    /// re-creating from scratch.
+    private func swapHALDevice(to newID: AudioDeviceID) throws {
+        guard let unit = halUnit else {
+            throw pipelineError("swapHALDevice called without halUnit")
+        }
+        // M3 mirror: flag so any in-flight IO proc bails before we
+        // touch the unit. Cleared after restart succeeds.
+        stopping.store(true, ordering: .relaxed)
+        AudioOutputUnitStop(unit)
+
+        var deviceID = newID
+        let status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        try check(status, "SetProperty(CurrentDevice) during swap")
+        halCurrentDeviceID = newID
+
+        stopping.store(false, ordering: .relaxed)
+        let startStatus = AudioOutputUnitStart(unit)
+        try check(startStatus, "AudioOutputUnitStart during swap")
+
+        // Reset scratch — the device change is a discontinuity and we
+        // don't want to feed a stitched-together hop into YIN.
+        scratchFill = 0
+        log.info("HAL device swap complete")
     }
 
     // MARK: - HAL IO proc
