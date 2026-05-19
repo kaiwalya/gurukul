@@ -52,9 +52,17 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
             }
 
-            VStack(spacing: 4) {
-                noteText
-                centsText
+            VStack(spacing: 6) {
+                PitchClockView(
+                    pitchClass: pitchClass(from: displayed),
+                    noteName: displayed.hz > 0 ? displayed.name : "",
+                    registerLabel: registerSuffix(displayed.register),
+                    handTint: tintForCents(displayed.cents),
+                    isVoiced: displayed.hz > 0
+                )
+                .frame(width: 240, height: 240)
+                .opacity(dimAmount)
+                .frame(maxWidth: .infinity)
                 hzText
             }
 
@@ -95,31 +103,6 @@ struct ContentView: View {
         if dt > silenceClearAfter { return 0.35 }
         let t = (dt - silenceDimAfter) / (silenceClearAfter - silenceDimAfter)
         return 1.0 - t * 0.65
-    }
-
-    @ViewBuilder private var noteText: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Text(displayed.name)
-                .font(.system(size: 80, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-            Text(registerSuffix(displayed.register))
-                .font(.system(size: 32, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary)
-        }
-        .opacity(dimAmount)
-    }
-
-    @ViewBuilder private var centsText: some View {
-        if displayed.hz > 0 {
-            Text(formatCents(displayed.cents))
-                .font(.system(size: 24, weight: .medium, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(tintForCents(displayed.cents))
-                .opacity(dimAmount)
-        } else {
-            Text(" ")
-                .font(.system(size: 24))
-        }
     }
 
     @ViewBuilder private var hzText: some View {
@@ -202,10 +185,15 @@ struct ContentView: View {
         }
     }
 
-    private func formatCents(_ cents: Int) -> String {
-        if cents == 0 { return "in tune" }
-        let sign = cents > 0 ? "+" : ""
-        return "\(sign)\(cents)¢"
+    /// Convert a NamedPitch to a continuous pitch class in [0, 12).
+    /// 0 = C, 1 = C#, …, 11 = B; fractional part is the cents offset.
+    /// Returns 0 for unvoiced — the clock fades out so the value
+    /// doesn't matter visually.
+    private func pitchClass(from p: NamedPitch) -> Double {
+        guard p.hz > 0 else { return 0 }
+        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        let idx = names.firstIndex(of: p.name) ?? 0
+        return Double(idx) + Double(p.cents) / 100.0
     }
 
     private func tintForCents(_ cents: Int) -> Color {
