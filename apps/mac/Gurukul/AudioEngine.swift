@@ -1,4 +1,7 @@
+import Atomics
+import AudioToolbox
 import AVFoundation
+import CoreAudio
 import Foundation
 import OSLog
 
@@ -6,70 +9,105 @@ import OSLog
 ///   log stream --predicate 'subsystem == "com.kaiwalya.Gurukul"' --info --debug
 private let log = Logger(subsystem: "com.kaiwalya.Gurukul", category: "AudioPipeline")
 
-/// Drives the gurukul engine from a live AVAudioEngine microphone tap.
+/// Drives the gurukul engine from a live microphone capture.
 ///
-/// Owns one `GurukulEngine` and one `AVAudioEngine`. On `start()` it installs
-/// an input tap, accumulates incoming frames into a pre-allocated scratch
-/// buffer, and drains the engine in hop-aligned chunks. The latest pitch
-/// reading lands in a lock-free `PitchSlot` the UI polls at 30 Hz.
+/// Owns one `GurukulEngine` and one of two capture paths:
 ///
-/// Lives off the audio thread for `start` / `stop`; the tap callback runs on
-/// AVAudioEngine's render thread and is the only place we touch the FFI hot
-/// path. The render thread must not allocate, lock, or call into Swift
-/// runtime functions that can — see the audit at the end of this file.
-/// Project default is `MainActor`; the pipeline is explicitly `nonisolated`
-/// because the audio render thread runs the tap callback and cannot be on the
-/// main actor. SwiftUI touches `pitchSlot` (lock-free) and the
-/// `start`/`stop` methods, which are quick and safe to call from the main
-/// thread.
+///   1. **HAL path (preferred):** a CoreAudio
+///      `kAudioUnitSubType_HALOutput` AudioUnit, input-enabled, reading
+///      from the system default input device. IO procs fire at the
+///      device's hardware buffer size (~10 ms), much tighter than the
+///      tap path.
+///   2. **AVAudioEngine tap (fallback):** the 1.4.6 path, kept verbatim
+///      for devices / configurations where HAL setup fails.
+///
+/// The downstream is identical for both paths: accumulate frames into a
+/// pre-allocated scratch buffer, drain in hop-aligned chunks, run a
+/// per-hop RMS energy gate, and publish the latest pitch into a lock-free
+/// `PitchSlot` the UI polls at 30 Hz.
+///
+/// Project default is `MainActor`; the pipeline is explicitly
+/// `nonisolated` because the audio render thread (HAL IO proc or tap
+/// callback) cannot be on the main actor. SwiftUI touches `pitchSlot`
+/// (lock-free) and the `start`/`stop` methods, which are quick and safe
+/// to call from the main thread.
 nonisolated final class AudioPipeline {
     /// Public, read-only handle the view polls every UI tick.
     let pitchSlot = PitchSlot()
 
-    private let avEngine = AVAudioEngine()
     private var enginePtr: OpaquePointer?
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
     private var pitchHandle: UInt32 = GURUKUL_INVALID_PORT
 
-    /// Sample rate the engine is built for. The mic tap is configured to
-    /// deliver buffers at this rate via an AVAudioConverter setup below.
+    /// Sample rate the engine is built for. Both capture paths deliver
+    /// frames at this rate (HAL via the unit's internal conversion;
+    /// tap via AVAudioConverter or bypass).
     private let sampleRate: UInt32 = 48000
 
-    /// Hop size that matches PitchYin's `hop` param in the world JSON. The
-    /// engine is fed exactly `hop` frames per `process_block` call so YIN's
-    /// hop counter never straddles a buffer boundary with stale state.
+    /// Hop size that matches PitchYin's `hop` param in the world JSON.
     private let hop: Int = 512
 
-    /// Per-hop RMS gate. YIN happily locks onto noise-floor content at any
-    /// input level, so even mic-muted we'd see a stable bogus pitch. We
-    /// publish the YIN value only when the hop's RMS is above this floor;
-    /// below it, we publish NaN ("block ran, no detection") so the UI dims.
-    /// -50 dBFS ≈ 0.00316 linear; tune as we get more devices on the
-    /// matrix.
+    /// Per-hop RMS gate. YIN happily locks onto noise-floor content at
+    /// any input level, so even mic-muted we'd see a stable bogus pitch.
+    /// We publish the YIN value only when the hop's RMS is above this
+    /// floor; below it, we publish NaN so the UI dims. -50 dBFS ≈
+    /// 0.00316 linear.
     private let silenceRmsFloor: Float = 0.00316
 
-    /// Pre-allocated scratch that holds converted mono float frames between
-    /// callbacks. Sized generously (max tap delivery + a few hops of slack)
-    /// so we never have to grow it on the audio thread. Owned by the
-    /// pipeline; lives until `deinit`.
+    /// Pre-allocated scratch that holds mono float frames between
+    /// callbacks. Sized for `maxFramesPerSlice + hop` so the IO proc
+    /// never has to grow it.
     private var scratch: UnsafeMutableBufferPointer<Float>?
     private var scratchFill: Int = 0
     private var scratchCapacity: Int = 0
 
-    /// Monotonic sequence number stamped on every block we process. UI uses
-    /// it to tell "no new block" from "block with no detection".
+    /// Monotonic sequence number stamped on every block we process.
     private var seq: UInt32 = 0
 
-    /// Re-usable destination for the tap → engine-format conversion. Stays
-    /// the same shape callback after callback because both source format
-    /// and target format are constant. Nil when the hw format already
-    /// matches the engine format (the common case on macOS with built-in
-    /// mics + display audio) — we just hand the raw buffer through.
+    /// Upper bound on a single IO-proc / tap-callback delivery. HAL
+    /// path sets the unit's `MaximumFramesPerSlice` to this; tap path
+    /// uses it as scratch sizing for the same reason.
+    private let maxFramesPerSlice: Int = 4096
+
+    // MARK: - HAL state
+
+    /// HAL output AudioUnit. Nil when the fallback path is in use.
+    private var halUnit: AudioUnit?
+
+    /// Backing storage for the IO proc's `AudioBufferList`. Sized to
+    /// `maxFramesPerSlice` so an unexpected jump in `inNumberFrames`
+    /// (route change, SR change) cannot overflow it.
+    private var halBufferStorage: UnsafeMutableBufferPointer<Float>?
+
+    /// Pre-built `AudioBufferList` we hand to `AudioUnitRender`. Has
+    /// one buffer pointing at `halBufferStorage`. The `mDataByteSize`
+    /// field is reset per-callback to match `inNumberFrames`.
+    private var halBufferList: UnsafeMutableAudioBufferListPointer?
+
+    /// M3: set BEFORE `AudioOutputUnitStop`. The IO proc checks this
+    /// at entry and bails immediately if set, so a late callback that
+    /// lands after Stop returns cannot touch torn-down state.
+    private let stopping = ManagedAtomic<Bool>(false)
+
+    /// Counts IO-proc callbacks for throttled logging on the HAL path.
+    private var halCallbackCount: Int = 0
+
+    /// Counts tap callbacks for throttled logging on the fallback path.
+    private var tapCallbackCount: Int = 0
+
+    /// True while the HAL unit is started and running. Drives `stop()`
+    /// path selection.
+    private var halRunning: Bool = false
+
+    // MARK: - AVAudioEngine fallback state
+
+    private let avEngine = AVAudioEngine()
     private var convertedBuffer: AVAudioPCMBuffer?
     private var converter: AVAudioConverter?
+    private var fallbackActive: Bool = false
 
-    /// The world driving the engine in this skeleton: one mic in-port, a YIN
-    /// pitch tracker, one pitch out-port.
+    /// The world driving the engine: one mic in-port, a YIN pitch
+    /// tracker, one pitch out-port.
     private static let worldJSON: String = """
     {
       "world_version": 1,
@@ -103,19 +141,36 @@ nonisolated final class AudioPipeline {
 
     func start() throws {
         try buildEngineIfNeeded()
-        try installTap()
-        try avEngine.start()
-        let inLat = avEngine.inputNode.presentationLatency
-        let outLat = avEngine.inputNode.outputPresentationLatency
-        log.info("started — sample rate \(self.sampleRate, privacy: .public) Hz, hop \(self.hop, privacy: .public), inputPresentationLatency=\(inLat * 1000, format: .fixed(precision: 1), privacy: .public)ms, outputPresentationLatency=\(outLat * 1000, format: .fixed(precision: 1), privacy: .public)ms")
+        allocateScratch(capacity: maxFramesPerSlice + hop)
+
+        // Try HAL first. If anything along the chain fails, log and
+        // fall back to the AVAudioEngine tap path. Failures are
+        // expected on exotic devices (aggregate, non-Float32 native,
+        // …); the fallback keeps the app usable.
+        do {
+            try installHALInput()
+            try startHALUnit()
+            halRunning = true
+            log.info("capture path: HAL")
+        } catch {
+            log.error("HAL setup failed: \(error.localizedDescription, privacy: .public) — falling back to AVAudioEngine tap (HIGH LATENCY)")
+            tearDownHALUnit()
+            try startFallback()
+            fallbackActive = true
+            log.info("capture path: AVAudioEngine tap (fallback)")
+        }
     }
 
     func stop() {
-        // Remove the tap first so no new callbacks land while we're tearing
-        // down the engine. AVAudioEngine's removeTap is documented to wait
-        // for in-flight callbacks to drain before returning.
-        avEngine.inputNode.removeTap(onBus: 0)
-        avEngine.stop()
+        if halRunning {
+            stopHALUnit()
+            halRunning = false
+        }
+        if fallbackActive {
+            avEngine.inputNode.removeTap(onBus: 0)
+            avEngine.stop()
+            fallbackActive = false
+        }
         if let ptr = enginePtr {
             engine_reset(ptr)
         }
@@ -124,12 +179,17 @@ nonisolated final class AudioPipeline {
     }
 
     deinit {
-        // No MainActor work here — just free C memory and the scratch.
         if let ptr = enginePtr {
             engine_free(ptr)
         }
         if let scratch = scratch {
             scratch.deallocate()
+        }
+        if let halBufferStorage = halBufferStorage {
+            halBufferStorage.deallocate()
+        }
+        if let halBufferList = halBufferList {
+            halBufferList.unsafeMutablePointer.deallocate()
         }
     }
 
@@ -154,7 +214,288 @@ nonisolated final class AudioPipeline {
         }
     }
 
-    // MARK: - Audio tap
+    private func allocateScratch(capacity: Int) {
+        // Allocated once per lifetime of the pipeline; reused across
+        // start/stop cycles. Resized only if a future start asks for
+        // more — currently it doesn't.
+        if let existing = scratch, scratchCapacity >= capacity {
+            scratchFill = 0
+            existing.update(repeating: 0)
+            return
+        }
+        if let existing = scratch {
+            existing.deallocate()
+        }
+        let buf = UnsafeMutableBufferPointer<Float>.allocate(capacity: capacity)
+        buf.initialize(repeating: 0)
+        scratch = buf
+        scratchCapacity = capacity
+        scratchFill = 0
+    }
+
+    // MARK: - HAL setup
+
+    private func installHALInput() throws {
+        // Component description: HAL output unit (used for both input
+        // and output on macOS; the EnableIO flags below select input).
+        var desc = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &desc) else {
+            throw pipelineError("AudioComponentFindNext failed")
+        }
+
+        var unit: AudioUnit?
+        var status = AudioComponentInstanceNew(component, &unit)
+        try check(status, "AudioComponentInstanceNew")
+        guard let unit else {
+            throw pipelineError("AudioComponentInstanceNew returned nil")
+        }
+
+        // EnableIO Input/1 = 1
+        var enableInput: UInt32 = 1
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Input,
+            1,
+            &enableInput,
+            UInt32(MemoryLayout<UInt32>.size)
+        )
+        try check(status, "SetProperty(EnableIO, Input, 1)")
+
+        // EnableIO Output/0 = 0
+        var disableOutput: UInt32 = 0
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Output,
+            0,
+            &disableOutput,
+            UInt32(MemoryLayout<UInt32>.size)
+        )
+        try check(status, "SetProperty(EnableIO, Output, 0)")
+
+        // CurrentDevice Global/0 = <default input device>
+        var deviceID = try defaultInputDeviceID()
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        try check(status, "SetProperty(CurrentDevice)")
+
+        // Capture native ASBD for diagnostics. Bus 1, Input scope = the
+        // format coming FROM the device (before any internal conversion
+        // the unit performs).
+        var nativeASBD = AudioStreamBasicDescription()
+        var asbdSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        status = AudioUnitGetProperty(
+            unit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input,
+            1,
+            &nativeASBD,
+            &asbdSize
+        )
+        try check(status, "GetProperty(StreamFormat, Input, 1)")
+
+        // StreamFormat Output/1 = clientASBD. NB: bus 1 is input from
+        // device; element 1's *Output* scope is the format the unit
+        // produces to our callback — that's the side we set, not Input.
+        var clientASBD = makeClientASBD()
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output,
+            1,
+            &clientASBD,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        try check(status, "SetProperty(StreamFormat, Output, 1)")
+
+        // MaximumFramesPerSlice Global/0 = maxFramesPerSlice. M2:
+        // `inNumberFrames` on the IO proc is not pinned to the
+        // device's current buffer frame size — it can jump on route
+        // change. Set an explicit upper bound and size our buffer
+        // list to match.
+        var maxFrames: UInt32 = UInt32(maxFramesPerSlice)
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &maxFrames,
+            UInt32(MemoryLayout<UInt32>.size)
+        )
+        try check(status, "SetProperty(MaximumFramesPerSlice)")
+
+        // Allocate the buffer list to maxFramesPerSlice. mDataByteSize
+        // is reset per-callback inside the IO proc to match the actual
+        // inNumberFrames; the underlying storage is fixed.
+        let backing = UnsafeMutableBufferPointer<Float>.allocate(capacity: maxFramesPerSlice)
+        backing.initialize(repeating: 0)
+        halBufferStorage = backing
+
+        let listPtr = AudioBufferList.allocate(maximumBuffers: 1)
+        listPtr[0] = AudioBuffer(
+            mNumberChannels: 1,
+            mDataByteSize: UInt32(maxFramesPerSlice * MemoryLayout<Float>.size),
+            mData: UnsafeMutableRawPointer(backing.baseAddress)
+        )
+        halBufferList = listPtr
+
+        // SetInputCallback Global/0 = (ioCallback, self)
+        var callbackStruct = AURenderCallbackStruct(
+            inputProc: Self.ioCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_SetInputCallback,
+            kAudioUnitScope_Global,
+            0,
+            &callbackStruct,
+            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        )
+        try check(status, "SetProperty(SetInputCallback)")
+
+        status = AudioUnitInitialize(unit)
+        try check(status, "AudioUnitInitialize")
+
+        halUnit = unit
+
+        let deviceName = deviceNameOrUnknown(for: deviceID)
+        let nativeDesc = describe(nativeASBD)
+        let clientDesc = describe(clientASBD)
+        let conversion = asbdsDiffer(nativeASBD, clientASBD)
+        log.info("""
+        HAL engaged: device='\(deviceName, privacy: .public)' id=\(deviceID, privacy: .public)
+          native=\(nativeDesc, privacy: .public)
+          client=\(clientDesc, privacy: .public)
+          internalConversion=\(conversion, privacy: .public)
+          maxFramesPerSlice=\(self.maxFramesPerSlice, privacy: .public)
+        """)
+    }
+
+    private func startHALUnit() throws {
+        guard let unit = halUnit else {
+            throw pipelineError("startHALUnit called without halUnit")
+        }
+        stopping.store(false, ordering: .relaxed)
+        let status = AudioOutputUnitStart(unit)
+        try check(status, "AudioOutputUnitStart")
+    }
+
+    private func stopHALUnit() {
+        // M3: flip the flag before AudioOutputUnitStop so any late
+        // callback that fires after Stop returns bails at the
+        // entry-check rather than touching torn-down state.
+        stopping.store(true, ordering: .relaxed)
+        if let unit = halUnit {
+            AudioOutputUnitStop(unit)
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        halUnit = nil
+        halCallbackCount = 0
+    }
+
+    private func tearDownHALUnit() {
+        // Called when HAL setup throws partway through. Some properties
+        // may have been set; the unit may be allocated but not started.
+        stopping.store(true, ordering: .relaxed)
+        if let unit = halUnit {
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        halUnit = nil
+        if let backing = halBufferStorage {
+            backing.deallocate()
+            halBufferStorage = nil
+        }
+        if let listPtr = halBufferList {
+            listPtr.unsafeMutablePointer.deallocate()
+            halBufferList = nil
+        }
+    }
+
+    // MARK: - HAL IO proc
+
+    /// C trampoline. Pulls the pipeline out of the refcon and
+    /// dispatches to `handleHALInput`. Lives at file scope (via
+    /// `static let`) so the closure can be `@convention(c)`.
+    private static let ioCallback: AURenderCallback = { refcon, flags, ts, busNum, nFrames, _ in
+        let pipeline = Unmanaged<AudioPipeline>.fromOpaque(refcon).takeUnretainedValue()
+        return pipeline.handleHALInput(flags: flags, ts: ts, busNum: busNum, nFrames: nFrames)
+    }
+
+    private func handleHALInput(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        ts: UnsafePointer<AudioTimeStamp>,
+        busNum: UInt32,
+        nFrames: UInt32
+    ) -> OSStatus {
+        // M3 entry-check.
+        if stopping.load(ordering: .relaxed) {
+            return noErr
+        }
+
+        // M2 defense: the unit shouldn't deliver more than we set, but
+        // bail safely if it does instead of writing past our buffer.
+        let frames = Int(nFrames)
+        if frames > maxFramesPerSlice {
+            log.error("HAL inNumberFrames=\(frames, privacy: .public) > max=\(self.maxFramesPerSlice, privacy: .public); skipping callback")
+            return noErr
+        }
+
+        guard let unit = halUnit, let listPtr = halBufferList else {
+            return noErr
+        }
+
+        // Re-arm mDataByteSize to the requested write size; the storage
+        // capacity is fixed at maxFramesPerSlice.
+        listPtr[0].mDataByteSize = UInt32(frames * MemoryLayout<Float>.size)
+
+        let status = AudioUnitRender(unit, flags, ts, busNum, nFrames, listPtr.unsafeMutablePointer)
+        if status != noErr {
+            log.error("AudioUnitRender failed: \(status, privacy: .public)")
+            return noErr
+        }
+
+        guard let raw = listPtr[0].mData else { return noErr }
+        let src = raw.bindMemory(to: Float.self, capacity: frames)
+
+        appendAndDrain(src: src, count: frames)
+
+        halCallbackCount += 1
+        // ~10 ms callbacks → every 200 ≈ 2 s.
+        if halCallbackCount % 200 == 1 {
+            var peak: Float = 0
+            for i in 0..<frames {
+                let v = abs(src[i])
+                if v > peak { peak = v }
+            }
+            log.info("HAL #\(self.halCallbackCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
+        }
+        return noErr
+    }
+
+    // MARK: - Fallback: AVAudioEngine tap
+
+    private func startFallback() throws {
+        try installTap()
+        try avEngine.start()
+        let inLat = avEngine.inputNode.presentationLatency
+        log.info("fallback tap started — sample rate \(self.sampleRate, privacy: .public) Hz, hop \(self.hop, privacy: .public), inputPresentationLatency=\(inLat * 1000, format: .fixed(precision: 1), privacy: .public)ms")
+    }
 
     private func installTap() throws {
         let inputNode = avEngine.inputNode
@@ -176,23 +517,7 @@ nonisolated final class AudioPipeline {
             || hwFormat.channelCount != engineFormat.channelCount
             || hwFormat.commonFormat != engineFormat.commonFormat
 
-        // AVAudioEngine treats bufferSize as a hint. Asking for 512 frames
-        // (≈10.7 ms at 48 kHz) shrinks tap-side queueing to about one IO
-        // cycle — without it AVAudioEngine batched ~100 ms of audio into
-        // 200 ms-wall-clock taps on the LG display mic.
         let tapBufferSize: AVAudioFrameCount = 512
-
-        // Worst-case scratch: in practice AVAudioEngine ignores small
-        // bufferSize hints somewhat and may hand us larger chunks (we've
-        // seen 4800-frame buffers on the LG mic). Size for that worst case
-        // so we never overflow.
-        let maxObservedTapFrames = 8192
-        let scratchCap = maxObservedTapFrames + hop
-        let buf = UnsafeMutableBufferPointer<Float>.allocate(capacity: scratchCap)
-        buf.initialize(repeating: 0)
-        scratch = buf
-        scratchCapacity = scratchCap
-        scratchFill = 0
 
         if needsConversion {
             let converter = AVAudioConverter(from: hwFormat, to: engineFormat)
@@ -200,7 +525,7 @@ nonisolated final class AudioPipeline {
                 throw pipelineError("could not construct AVAudioConverter")
             }
             let ratio = engineFormat.sampleRate / hwFormat.sampleRate
-            let convertedCapacity = AVAudioFrameCount(Double(maxObservedTapFrames) * ratio + 64)
+            let convertedCapacity = AVAudioFrameCount(Double(maxFramesPerSlice) * ratio + 64)
             guard let converted = AVAudioPCMBuffer(
                 pcmFormat: engineFormat,
                 frameCapacity: convertedCapacity
@@ -216,7 +541,7 @@ nonisolated final class AudioPipeline {
             log.info("conversion bypassed: hw format already matches engine \(engineFormat, privacy: .public)")
         }
 
-        log.info("hw input format: \(hwFormat, privacy: .public), scratch=\(scratchCap, privacy: .public) frames")
+        log.info("hw input format: \(hwFormat, privacy: .public), scratch=\(self.scratchCapacity, privacy: .public) frames")
         inputNode.installTap(
             onBus: 0,
             bufferSize: tapBufferSize,
@@ -227,15 +552,11 @@ nonisolated final class AudioPipeline {
         log.info("tap installed on input bus 0 (buffer \(tapBufferSize, privacy: .public) frames, hop \(self.hop, privacy: .public))")
     }
 
-    /// Counter so we can periodically confirm buffers are flowing without
-    /// flooding the log on every callback.
-    private var bufferCount: Int = 0
-
     private func handleInputBuffer(
         _ buffer: AVAudioPCMBuffer,
         when _: AVAudioTime
     ) {
-        bufferCount += 1
+        tapCallbackCount += 1
 
         let frames: Int
         let src: UnsafePointer<Float>
@@ -261,7 +582,6 @@ nonisolated final class AudioPipeline {
             src = UnsafePointer(ch)
             frames = Int(converted.frameLength)
         } else {
-            // Bypass: hw format already matches the engine format.
             guard let ch = buffer.floatChannelData?[0] else { return }
             src = UnsafePointer(ch)
             frames = Int(buffer.frameLength)
@@ -269,35 +589,30 @@ nonisolated final class AudioPipeline {
 
         appendAndDrain(src: src, count: frames)
 
-        if bufferCount % 25 == 1 {
+        if tapCallbackCount % 25 == 1 {
             var peak: Float = 0
             for i in 0..<frames {
                 let v = abs(src[i])
                 if v > peak { peak = v }
             }
-            // scratchFill after drain shows whether we're keeping up with
-            // realtime. Steady state should sit at 0..<hop. If it grows
-            // monotonically, sample-clock drift is the lag source.
-            log.info("tap #\(self.bufferCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
+            log.info("tap #\(self.tapCallbackCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
         }
     }
 
-    /// Append `count` newly-converted frames into the scratch buffer, then
-    /// drain in hop-aligned chunks while there's enough fill. Any leftover
-    /// frames (< hop) stay in the scratch for the next callback so YIN sees
-    /// a continuous stream.
+    // MARK: - Shared hot path (HAL + fallback both call this)
+
+    /// Append `count` frames into the scratch buffer, then drain in
+    /// hop-aligned chunks while there's enough fill. Any leftover
+    /// frames (< hop) stay in the scratch for the next callback so YIN
+    /// sees a continuous stream.
     private func appendAndDrain(src: UnsafePointer<Float>, count: Int) {
         guard let scratch = scratch else { return }
         guard let ptr = enginePtr else { return }
 
-        // If the incoming chunk would overflow the scratch, drop the oldest
-        // frames. This should never fire in practice — scratch is sized for
-        // ~2× tap delivery — but it's a soft guard rather than a crash.
+        // If the incoming chunk would overflow, drop the OLDEST frames.
         if scratchFill + count > scratchCapacity {
             let overflow = scratchFill + count - scratchCapacity
             if overflow < scratchFill {
-                // Drop the OLDEST frames: shift the tail [overflow ..<
-                // scratchFill] down to start at index 0.
                 scratch.baseAddress!
                     .update(
                         from: scratch.baseAddress!.advanced(by: overflow),
@@ -314,7 +629,6 @@ nonisolated final class AudioPipeline {
             .update(from: src, count: count)
         scratchFill += count
 
-        // Drain hop-aligned chunks.
         var consumed = 0
         while scratchFill - consumed >= hop {
             var inPtr: UnsafeMutablePointer<Float>?
@@ -327,10 +641,6 @@ nonisolated final class AudioPipeline {
             let hopStart = scratch.baseAddress!.advanced(by: consumed)
             writableMic.update(from: hopStart, count: hop)
 
-            // RMS over the hop we're about to feed. If below the floor, we'll
-            // still process the block (so PitchYin's window stays in sync)
-            // but publish NaN instead of the YIN output — the UI sees
-            // "silence detected" and dims.
             var sumSq: Float = 0
             for i in 0..<hop {
                 let s = hopStart[i]
@@ -354,9 +664,6 @@ nonisolated final class AudioPipeline {
             let lastPitch = pitchBuf[outLen - 1]
 
             seq &+= 1
-            // Two ways to publish NaN ("block ran, no detection"):
-            //   - signal energy below the silence floor (mic muted / room),
-            //   - YIN itself returned 0 Hz (unvoiced / no clear period).
             let voiced = rms >= silenceRmsFloor && lastPitch > 0
             let publishedHz: Float = voiced ? lastPitch : .nan
             pitchSlot.store(seq: seq, hz: publishedHz)
@@ -373,6 +680,99 @@ nonisolated final class AudioPipeline {
                 )
             }
             scratchFill = leftover
+        }
+    }
+
+    // MARK: - HAL helpers
+
+    private func makeClientASBD() -> AudioStreamBasicDescription {
+        // Mono Float32 non-interleaved at the engine's sample rate.
+        // mBytesPerFrame = mBytesPerPacket = sizeof(Float) — for
+        // non-interleaved formats CoreAudio expects per-channel byte
+        // counts here.
+        let bytesPerSample = UInt32(MemoryLayout<Float>.size)
+        return AudioStreamBasicDescription(
+            mSampleRate: Float64(sampleRate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat
+                | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: bytesPerSample,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytesPerSample,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+    }
+
+    private func defaultInputDeviceID() throws -> AudioDeviceID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        try check(status, "AudioObjectGetPropertyData(DefaultInputDevice)")
+        guard deviceID != kAudioObjectUnknown else {
+            throw pipelineError("default input device is kAudioObjectUnknown")
+        }
+        return deviceID
+    }
+
+    private func deviceNameOrUnknown(for deviceID: AudioDeviceID) -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &name
+        )
+        guard status == noErr, let n = name?.takeRetainedValue() else {
+            return "<unknown>"
+        }
+        return n as String
+    }
+
+    private func describe(_ asbd: AudioStreamBasicDescription) -> String {
+        let flags = asbd.mFormatFlags
+        let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
+        let isNonInterleaved = (flags & kAudioFormatFlagIsNonInterleaved) != 0
+        let kind = isFloat ? "Float\(asbd.mBitsPerChannel)" : "Int\(asbd.mBitsPerChannel)"
+        let layout = isNonInterleaved ? "non-interleaved" : "interleaved"
+        return "\(Int(asbd.mSampleRate)) Hz, \(asbd.mChannelsPerFrame) ch, \(kind), \(layout)"
+    }
+
+    private func asbdsDiffer(
+        _ a: AudioStreamBasicDescription,
+        _ b: AudioStreamBasicDescription
+    ) -> Bool {
+        return a.mSampleRate != b.mSampleRate
+            || a.mChannelsPerFrame != b.mChannelsPerFrame
+            || a.mFormatFlags != b.mFormatFlags
+            || a.mBitsPerChannel != b.mBitsPerChannel
+    }
+
+    private func check(_ status: OSStatus, _ what: String) throws {
+        if status != noErr {
+            throw pipelineError("\(what) failed: OSStatus \(status)")
         }
     }
 
@@ -393,21 +793,21 @@ nonisolated final class AudioPipeline {
 
 // MARK: - RT-safety audit
 //
-// The audio-thread callback (`handleInputBuffer` → `appendAndDrain`) is on the
-// hot path. It must not allocate, lock, or call Swift-runtime functions that
-// can. The current state:
+// The audio-thread callback (HAL IO proc → handleHALInput → appendAndDrain,
+// or AVAudioEngine tap → handleInputBuffer → appendAndDrain) is on the hot
+// path. It must not allocate, lock, or call Swift-runtime functions that can.
+// Current state:
 //
-// - scratch buffer is pre-allocated in `installTap` and reused forever.
-// - converter output buffer is pre-allocated and reused; converter.convert
-//   writes into it in place. (Note: the AVAudioConverter internals may still
-//   allocate on certain SR ratios; remove with a manual resample later.)
-// - PitchSlot.store is a single ManagedAtomic<UInt64> store — lock-free.
-// - log.error and log.info on the hot path fire only on rare branches (every
-//   25 callbacks for the tap counter, or on actual errors); they are not in
-//   the per-block inner loop.
-// - No NSError construction on the inner loop.
+// - scratch buffer is pre-allocated in start(); reused across callbacks.
+// - halBufferStorage + halBufferList are pre-allocated in installHALInput();
+//   reused across callbacks.
+// - AudioUnitRender is the intended RT-safe way to pull input from a HAL unit.
+// - converter output buffer is pre-allocated and reused on the fallback path.
+// - PitchSlot.store is a single ManagedAtomic<UInt64> store.
+// - stopping.load is a single ManagedAtomic<Bool> load (relaxed).
+// - log.error / log.info on the hot path fire only on rare branches (errors,
+//   or every 200th HAL callback / 25th tap callback).
 //
-// Known violation (deferred to 1.4.7): the AVAudioConverter path itself is
-// not strictly allocation-free across all hardware sample rates. The fix is
-// to replace AVAudioConverter with a manual resample using a pre-allocated
-// kernel, which is a larger change than 1.4.6's scope.
+// Known fallback-path violation (carried from 1.4.6): AVAudioConverter is
+// not strictly allocation-free across all hardware SR ratios. The HAL path
+// avoids this — the unit's internal conversion does not touch our buffers.
