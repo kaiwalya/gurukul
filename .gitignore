@@ -3,3 +3,8 @@
 .DS_Store
 .moon/cache
 .claude/
+
+# Real-voice test fixtures live outside the repo for license/size
+# reasons. Drop wav files into `*/test_data/` and run the ignored
+# tests with `cargo test --release -- --ignored`.
+**/test_data/

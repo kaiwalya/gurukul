@@ -29,6 +29,10 @@ struct ContentView: View {
     /// tick. Passed by reference (via @State) to the visualiser subviews.
     @State private var snapshot: FeatureSnapshot = .empty
 
+    /// Latest waveform snapshot — independent slot, also refreshed each
+    /// UI tick. Lets us eyeball the raw input next to the derived pitch.
+    @State private var waveform: WaveformSnapshot = .empty
+
     private let tick = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -54,6 +58,9 @@ struct ContentView: View {
                 hzText
             }
 
+            WaveformView(waveform: waveform)
+                .frame(maxWidth: .infinity, minHeight: 80)
+
             PitchTraceView(snapshot: snapshot)
                 .frame(maxWidth: .infinity, minHeight: 260)
 
@@ -73,7 +80,7 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
         }
         .padding(24)
-        .frame(minWidth: 520, minHeight: 680)
+        .frame(minWidth: 520, minHeight: 780)
         .task {
             await startIfPermitted()
         }
@@ -129,6 +136,11 @@ struct ContentView: View {
     }
 
     private func refreshDisplay(now: Date) {
+        // Waveform refreshes every tick regardless of feature seq —
+        // it's a separate slot and we want the scrolling envelope to
+        // look continuous even on idle frames.
+        waveform = pipeline.waveformSlot.load()
+
         let next = pipeline.featureSlot.load()
         if next.seq == lastSeq { return }
         lastSeq = next.seq

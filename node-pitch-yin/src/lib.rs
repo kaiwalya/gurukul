@@ -176,6 +176,16 @@ impl PitchYin {
             return;
         }
 
+        // If the chosen tau is pinned to the fmin floor, it's almost certainly
+        // the argmin fallback "giving up" — the actual periodic content is
+        // outside [fmin..fmax] or there's no periodic content at all. Without
+        // this guard, near-silent / non-tonal input gets reported as the fmin
+        // frequency, which displays as a fake low note.
+        if chosen_tau >= tau_max {
+            self.held_f0 = 0.0;
+            return;
+        }
+
         // --- Step 4: parabolic interpolation ---
         let tau_hat = parabolic_interp(dprime, chosen_tau, tau_search_min, tau_max);
 

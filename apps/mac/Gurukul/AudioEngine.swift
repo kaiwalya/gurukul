@@ -36,7 +36,31 @@ nonisolated final class AudioPipeline {
     /// Public, read-only handle the view polls every UI tick.
     let featureSlot = FeatureSlot()
 
-    private var enginePtr: OpaquePointer?
+    /// Decimated 1 s waveform snapshot, published from the same hot path.
+    let waveformSlot = WaveformSlot()
+
+    /// Ring buffer of min/max pairs. One entry covers `samplesPerBucket`
+    /// raw frames. `wfHead` is the index of the *next* bucket to write
+    /// into; the oldest bucket is at `(wfHead) % kWaveformBuckets`.
+    /// `wfFill` counts how many frames have accumulated into the current
+    /// bucket; when it hits `samplesPerBucket` we close the bucket and
+    /// advance head.
+    private var wfLo: [Float] = Array(repeating: 0, count: kWaveformBuckets)
+    private var wfHi: [Float] = Array(repeating: 0, count: kWaveformBuckets)
+    private var wfHead: Int = 0
+    private var wfFill: Int = 0
+    private var wfCurLo: Float = 0
+    private var wfCurHi: Float = 0
+    /// 48000 samples/s × 1 s ÷ 150 buckets = 320 samples per bucket.
+    private let samplesPerBucket: Int = 320
+
+    /// Pre-allocated scratch the audio thread copies the unwrapped ring
+    /// into before calling `WaveformSlot.store`. Lives at instance scope
+    /// so no allocation happens on the hot path.
+    private var wfLoOut: [Float] = Array(repeating: 0, count: kWaveformBuckets)
+    private var wfHiOut: [Float] = Array(repeating: 0, count: kWaveformBuckets)
+
+private var enginePtr: OpaquePointer?
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
     private var pitchOut: UInt32 = GURUKUL_INVALID_PORT
     private var onsetOut: UInt32 = GURUKUL_INVALID_PORT
@@ -63,7 +87,7 @@ nonisolated final class AudioPipeline {
     /// We publish the YIN value only when the hop's RMS is above this
     /// floor; below it, we publish NaN so the UI dims. -50 dBFS ≈
     /// 0.00316 linear.
-    private let silenceRmsFloor: Float = 0.00316
+    private let silenceRmsFloor: Float = 0.01
 
     /// Pre-allocated scratch that holds mono float frames between
     /// callbacks. Sized for `maxFramesPerSlice + hop` so the IO proc
@@ -80,31 +104,28 @@ nonisolated final class AudioPipeline {
     /// uses it as scratch sizing for the same reason.
     private let maxFramesPerSlice: Int = 4096
 
-    // MARK: - HAL state
+    // MARK: - HAL state (direct AudioDevice IO proc)
 
-    /// HAL output AudioUnit. Nil when the fallback path is in use.
-    private var halUnit: AudioUnit?
+    /// IO proc handle returned by `AudioDeviceCreateIOProcID`. Nil when
+    /// the fallback path is in use or no device is wired.
+    private var halProcID: AudioDeviceIOProcID?
 
-    /// Backing storage for the IO proc's `AudioBufferList`. Sized to
-    /// `maxFramesPerSlice` so an unexpected jump in `inNumberFrames`
-    /// (route change, SR change) cannot overflow it.
-    private var halBufferStorage: UnsafeMutableBufferPointer<Float>?
+    /// Pre-allocated downmix scratch. The IO proc receives the device's
+    /// native channels (potentially interleaved, potentially multi-ch)
+    /// and we write the mono-downmixed result here before handing it to
+    /// `appendAndDrain`. Sized to a generous upper bound on per-callback
+    /// frames so the IO proc never allocates.
+    private var downmixScratch: UnsafeMutableBufferPointer<Float>?
 
-    /// Pre-built `AudioBufferList` we hand to `AudioUnitRender`. Has
-    /// one buffer pointing at `halBufferStorage`. The `mDataByteSize`
-    /// field is reset per-callback to match `inNumberFrames`.
-    private var halBufferList: UnsafeMutableAudioBufferListPointer?
+    /// The native format of the currently-engaged input device. Captured
+    /// at install time so the IO proc knows how many channels to fold
+    /// down per frame.
+    private var halDeviceFormat: AudioStreamBasicDescription = AudioStreamBasicDescription()
 
-    /// M3: set BEFORE `AudioOutputUnitStop`. The IO proc checks this
-    /// at entry and bails immediately if set, so a late callback that
+    /// M3: set BEFORE `AudioDeviceStop`. The IO proc checks this at
+    /// entry and bails immediately if set, so a late callback that
     /// lands after Stop returns cannot touch torn-down state.
     private let stopping = ManagedAtomic<Bool>(false)
-
-    /// Counts IO-proc callbacks for throttled logging on the HAL path.
-    private var halCallbackCount: Int = 0
-
-    /// Counts tap callbacks for throttled logging on the fallback path.
-    private var tapCallbackCount: Int = 0
 
     /// True while the HAL unit is started and running. Drives `stop()`
     /// path selection.
@@ -138,7 +159,7 @@ nonisolated final class AudioPipeline {
     private var converter: AVAudioConverter?
     private var fallbackActive: Bool = false
 
-    /// The world driving the engine: one mic in-port, four analyzers,
+/// The world driving the engine: one mic in-port, four analyzers,
     /// five boundary out-ports. Node ids and boundary port ids must
     /// stay disjoint (PHASE_1_4.md §2 validation rule), hence
     /// `pitch_yin` / `onset_det` / `breath_det` / `vibrato_det` on the
@@ -201,8 +222,17 @@ nonisolated final class AudioPipeline {
         try buildEngineIfNeeded()
         allocateScratch(capacity: maxFramesPerSlice + hop)
         pendingDiscontinuity = true
-
-        // Try HAL first. If anything along the chain fails, log and
+        // Reset waveform ring so a previous device's tail doesn't bleed
+        // into the new session's first second.
+        for i in 0..<kWaveformBuckets {
+            wfLo[i] = 0
+            wfHi[i] = 0
+        }
+        wfHead = 0
+        wfFill = 0
+        wfCurLo = 0
+        wfCurHi = 0
+// Try HAL first. If anything along the chain fails, log and
         // fall back to the AVAudioEngine tap path. Failures are
         // expected on exotic devices (aggregate, non-Float32 native,
         // …); the fallback keeps the app usable.
@@ -253,11 +283,8 @@ nonisolated final class AudioPipeline {
         if let scratch = scratch {
             scratch.deallocate()
         }
-        if let halBufferStorage = halBufferStorage {
-            halBufferStorage.deallocate()
-        }
-        if let halBufferList = halBufferList {
-            halBufferList.unsafeMutablePointer.deallocate()
+        if let downmixScratch = downmixScratch {
+            downmixScratch.deallocate()
         }
     }
 
@@ -310,206 +337,144 @@ nonisolated final class AudioPipeline {
         scratchFill = 0
     }
 
-    // MARK: - HAL setup
+    // MARK: - HAL setup (direct AudioDevice IO proc)
+    //
+    // We install the IO proc directly on the input AudioDevice instead
+    // of going through an AUHAL AudioUnit. AUHAL's `AudioUnitRender`
+    // path is supposed to deliver every produced device sample, but in
+    // practice on loopback / virtual devices (BlackHole 2ch) the unit's
+    // IO proc fires at a faster cadence than the device's natural
+    // buffer cycle while only delivering 512 frames per call. The
+    // intervening samples are silently dropped, corrupting the signal.
+    // Installing the IO proc directly gives us the device's natural
+    // buffer cadence with every sample present.
 
     private func installHALInput() throws {
-        // Component description: HAL output unit (used for both input
-        // and output on macOS; the EnableIO flags below select input).
-        var desc = AudioComponentDescription(
-            componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
-            componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0,
-            componentFlagsMask: 0
-        )
-        guard let component = AudioComponentFindNext(nil, &desc) else {
-            throw pipelineError("AudioComponentFindNext failed")
-        }
-
-        var unit: AudioUnit?
-        var status = AudioComponentInstanceNew(component, &unit)
-        try check(status, "AudioComponentInstanceNew")
-        guard let unit else {
-            throw pipelineError("AudioComponentInstanceNew returned nil")
-        }
-
-        // EnableIO Input/1 = 1
-        var enableInput: UInt32 = 1
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Input,
-            1,
-            &enableInput,
-            UInt32(MemoryLayout<UInt32>.size)
-        )
-        try check(status, "SetProperty(EnableIO, Input, 1)")
-
-        // EnableIO Output/0 = 0
-        var disableOutput: UInt32 = 0
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Output,
-            0,
-            &disableOutput,
-            UInt32(MemoryLayout<UInt32>.size)
-        )
-        try check(status, "SetProperty(EnableIO, Output, 0)")
-
-        // CurrentDevice Global/0 = <default input device>
-        var deviceID = try defaultInputDeviceID()
+        let deviceID = try defaultInputDeviceID()
         halCurrentDeviceID = deviceID
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        try check(status, "SetProperty(CurrentDevice)")
 
-        // Capture native ASBD for diagnostics. Bus 1, Input scope = the
-        // format coming FROM the device (before any internal conversion
-        // the unit performs).
-        var nativeASBD = AudioStreamBasicDescription()
-        var asbdSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        status = AudioUnitGetProperty(
-            unit,
-            kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input,
-            1,
-            &nativeASBD,
-            &asbdSize
-        )
-        try check(status, "GetProperty(StreamFormat, Input, 1)")
+        // Read the device's native input stream format. We'll downmix
+        // to mono Float32 in the IO proc but we need to know what we're
+        // starting from (channel count, sample rate, etc).
+        var nativeASBD = try streamFormat(for: deviceID)
+        halDeviceFormat = nativeASBD
 
-        // StreamFormat Output/1 = clientASBD. NB: bus 1 is input from
-        // device; element 1's *Output* scope is the format the unit
-        // produces to our callback — that's the side we set, not Input.
-        var clientASBD = makeClientASBD()
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Output,
-            1,
-            &clientASBD,
-            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        )
-        try check(status, "SetProperty(StreamFormat, Output, 1)")
-
-        // MaximumFramesPerSlice Global/0 = maxFramesPerSlice. M2:
-        // `inNumberFrames` on the IO proc is not pinned to the
-        // device's current buffer frame size — it can jump on route
-        // change. Set an explicit upper bound and size our buffer
-        // list to match.
-        var maxFrames: UInt32 = UInt32(maxFramesPerSlice)
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioUnitProperty_MaximumFramesPerSlice,
-            kAudioUnitScope_Global,
-            0,
-            &maxFrames,
-            UInt32(MemoryLayout<UInt32>.size)
-        )
-        try check(status, "SetProperty(MaximumFramesPerSlice)")
-
-        // Allocate the buffer list to maxFramesPerSlice. mDataByteSize
-        // is reset per-callback inside the IO proc to match the actual
-        // inNumberFrames; the underlying storage is fixed.
-        //
-        // Re-use existing buffers if present (device-swap path
-        // re-enters installHALInput on the same pipeline, and we don't
-        // want to leak the previous allocation).
-        if halBufferStorage == nil {
-            let backing = UnsafeMutableBufferPointer<Float>.allocate(capacity: maxFramesPerSlice)
-            backing.initialize(repeating: 0)
-            halBufferStorage = backing
+        // Sanity-check the format. The current pipeline assumes Float32
+        // samples at our engine's sample rate (48 kHz). Anything else
+        // would need resampling we don't currently do — bail rather
+        // than silently delivering wrong-rate audio to YIN.
+        let isFloat = (nativeASBD.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        if !isFloat || nativeASBD.mBitsPerChannel != 32 {
+            throw pipelineError("device format not Float32 (bits=\(nativeASBD.mBitsPerChannel), flags=\(nativeASBD.mFormatFlags))")
         }
-        if halBufferList == nil, let backing = halBufferStorage {
-            let listPtr = AudioBufferList.allocate(maximumBuffers: 1)
-            listPtr[0] = AudioBuffer(
-                mNumberChannels: 1,
-                mDataByteSize: UInt32(maxFramesPerSlice * MemoryLayout<Float>.size),
-                mData: UnsafeMutableRawPointer(backing.baseAddress)
-            )
-            halBufferList = listPtr
+        if UInt32(nativeASBD.mSampleRate.rounded()) != sampleRate {
+            throw pipelineError("device sample rate \(nativeASBD.mSampleRate) != engine rate \(sampleRate); resampling not implemented")
         }
 
-        // SetInputCallback Global/0 = (ioCallback, self)
-        var callbackStruct = AURenderCallbackStruct(
-            inputProc: Self.ioCallback,
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        // BufferFrameSize controls how many frames the device hands us
+        // per IO-proc callback. On BlackHole the IO proc fires on a
+        // wall-clock cycle that's independent of BufferFrameSize, so
+        // if BufferFrameSize is smaller than (sampleRate * cycle),
+        // the device drops the extra frames. We start with the max
+        // (4096 covers a ~85ms cycle at 48 kHz, far above anything
+        // we've seen) so the IO proc drains the full ring each call.
+        var deviceBufFrames: UInt32 = 4096
+        var deviceBufAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
         )
-        status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_SetInputCallback,
-            kAudioUnitScope_Global,
-            0,
-            &callbackStruct,
-            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        _ = AudioObjectSetPropertyData(
+            deviceID,
+            &deviceBufAddress,
+            0, nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &deviceBufFrames
         )
-        try check(status, "SetProperty(SetInputCallback)")
+        // Allocate the downmix scratch sized for the requested buffer
+        // frame size — one device-buffer-worth of frames is the most
+        // any IO-proc callback should deliver.
+        if downmixScratch == nil {
+            let buf = UnsafeMutableBufferPointer<Float>.allocate(capacity: maxFramesPerSlice)
+            buf.initialize(repeating: 0)
+            downmixScratch = buf
+        }
 
-        status = AudioUnitInitialize(unit)
-        try check(status, "AudioUnitInitialize")
-
-        halUnit = unit
+        // Install the IO proc on the device.
+        var procID: AudioDeviceIOProcID?
+        let createStatus = AudioDeviceCreateIOProcID(
+            deviceID,
+            Self.deviceIOProc,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &procID
+        )
+        try check(createStatus, "AudioDeviceCreateIOProcID")
+        guard let procID else {
+            throw pipelineError("AudioDeviceCreateIOProcID returned nil procID")
+        }
+        halProcID = procID
 
         let deviceName = deviceNameOrUnknown(for: deviceID)
         let nativeDesc = describe(nativeASBD)
-        let clientDesc = describe(clientASBD)
-        let conversion = asbdsDiffer(nativeASBD, clientASBD)
         log.info("""
-        HAL engaged: device='\(deviceName, privacy: .public)' id=\(deviceID, privacy: .public)
+        HAL engaged (direct device IO): device='\(deviceName, privacy: .public)' id=\(deviceID, privacy: .public)
           native=\(nativeDesc, privacy: .public)
-          client=\(clientDesc, privacy: .public)
-          internalConversion=\(conversion, privacy: .public)
-          maxFramesPerSlice=\(self.maxFramesPerSlice, privacy: .public)
+          downmixToMono=true
         """)
     }
 
     private func startHALUnit() throws {
-        guard let unit = halUnit else {
-            throw pipelineError("startHALUnit called without halUnit")
+        guard let procID = halProcID else {
+            throw pipelineError("startHALUnit called without procID")
         }
         stopping.store(false, ordering: .relaxed)
-        let status = AudioOutputUnitStart(unit)
-        try check(status, "AudioOutputUnitStart")
+        let status = AudioDeviceStart(halCurrentDeviceID, procID)
+        try check(status, "AudioDeviceStart")
     }
 
     private func stopHALUnit() {
-        // M3: flip the flag before AudioOutputUnitStop so any late
-        // callback that fires after Stop returns bails at the
-        // entry-check rather than touching torn-down state.
+        // M3: flip the flag before AudioDeviceStop so any late callback
+        // bails at the entry-check rather than touching torn-down state.
         stopping.store(true, ordering: .relaxed)
-        if let unit = halUnit {
-            AudioOutputUnitStop(unit)
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
+        if let procID = halProcID {
+            AudioDeviceStop(halCurrentDeviceID, procID)
+            AudioDeviceDestroyIOProcID(halCurrentDeviceID, procID)
         }
-        halUnit = nil
-        halCallbackCount = 0
+        halProcID = nil
     }
 
     private func tearDownHALUnit() {
-        // Called when HAL setup throws partway through. Some properties
-        // may have been set; the unit may be allocated but not started.
         stopping.store(true, ordering: .relaxed)
-        if let unit = halUnit {
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
+        if let procID = halProcID {
+            AudioDeviceDestroyIOProcID(halCurrentDeviceID, procID)
         }
-        halUnit = nil
-        if let backing = halBufferStorage {
+        halProcID = nil
+        if let backing = downmixScratch {
             backing.deallocate()
-            halBufferStorage = nil
+            downmixScratch = nil
         }
-        if let listPtr = halBufferList {
-            listPtr.unsafeMutablePointer.deallocate()
-            halBufferList = nil
-        }
+    }
+
+    /// Read the device's input-scope StreamFormat. Used at install time
+    /// to capture channel count / sample rate / format flags before
+    /// installing the IO proc.
+    private func streamFormat(for deviceID: AudioDeviceID) throws -> AudioStreamBasicDescription {
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &addr,
+            0, nil,
+            &size,
+            &asbd
+        )
+        try check(status, "GetProperty(StreamFormat) on input device")
+        return asbd
     }
 
     // MARK: - Default-input change handling
@@ -605,100 +570,122 @@ nonisolated final class AudioPipeline {
         }
     }
 
-    /// Stop the unit, re-target it to `newID`, restart. Reuses the
-    /// same AudioUnit instance — cheaper and less race-prone than
-    /// re-creating from scratch.
+    /// Stop the IO proc on the old device, tear it down, install + start
+    /// a fresh IO proc on `newID`. Direct AudioDevice IO procs are tied
+    /// to a specific device, so unlike the AUHAL path we can't just
+    /// swap CurrentDevice — we must rebuild.
     private func swapHALDevice(to newID: AudioDeviceID) throws {
-        guard let unit = halUnit else {
-            throw pipelineError("swapHALDevice called without halUnit")
-        }
         // M3 mirror: flag so any in-flight IO proc bails before we
-        // touch the unit. Cleared after restart succeeds.
+        // touch state. Cleared after restart succeeds.
         stopping.store(true, ordering: .relaxed)
-        AudioOutputUnitStop(unit)
+        if let procID = halProcID {
+            AudioDeviceStop(halCurrentDeviceID, procID)
+            AudioDeviceDestroyIOProcID(halCurrentDeviceID, procID)
+            halProcID = nil
+        }
 
-        var deviceID = newID
-        let status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        try check(status, "SetProperty(CurrentDevice) during swap")
-        halCurrentDeviceID = newID
-
-        stopping.store(false, ordering: .relaxed)
-        let startStatus = AudioOutputUnitStart(unit)
-        try check(startStatus, "AudioOutputUnitStart during swap")
+        // Reuse the install/start helpers — they'll read the new
+        // default-input device and install on it. We override
+        // halCurrentDeviceID for the swap by pointing the listener at
+        // the new value; installHALInput re-reads from
+        // defaultInputDeviceID() so the system must have settled on
+        // newID before this swap runs (true: the listener fired because
+        // the default changed).
+        _ = newID  // newID is implicit via defaultInputDeviceID()
+        try installHALInput()
+        try startHALUnit()
 
         // Reset scratch — the device change is a discontinuity and we
         // don't want to feed a stitched-together hop into YIN. Flag
         // the next publish so the UI ring buffers clear too.
         scratchFill = 0
         pendingDiscontinuity = true
-        log.info("HAL device swap complete")
+        log.info("HAL device swap complete (new id=\(self.halCurrentDeviceID, privacy: .public))")
     }
 
-    // MARK: - HAL IO proc
+    // MARK: - Device IO proc
 
-    /// C trampoline. Pulls the pipeline out of the refcon and
-    /// dispatches to `handleHALInput`. Lives at file scope (via
-    /// `static let`) so the closure can be `@convention(c)`.
-    private static let ioCallback: AURenderCallback = { refcon, flags, ts, busNum, nFrames, _ in
-        let pipeline = Unmanaged<AudioPipeline>.fromOpaque(refcon).takeUnretainedValue()
-        return pipeline.handleHALInput(flags: flags, ts: ts, busNum: busNum, nFrames: nFrames)
+    /// C trampoline for `AudioDeviceCreateIOProcID`. Pulls the pipeline
+    /// out of the clientData and dispatches to `handleDeviceInput`.
+    private static let deviceIOProc: AudioDeviceIOProc = {
+        _, _, inInputData, _, _, _, clientData in
+        guard let clientData else { return noErr }
+        let pipeline = Unmanaged<AudioPipeline>.fromOpaque(clientData).takeUnretainedValue()
+        return pipeline.handleDeviceInput(input: inInputData)
     }
 
-    private func handleHALInput(
-        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-        ts: UnsafePointer<AudioTimeStamp>,
-        busNum: UInt32,
-        nFrames: UInt32
+    private func handleDeviceInput(
+        input: UnsafePointer<AudioBufferList>
     ) -> OSStatus {
         // M3 entry-check.
         if stopping.load(ordering: .relaxed) {
             return noErr
         }
 
-        // M2 defense: the unit shouldn't deliver more than we set, but
-        // bail safely if it does instead of writing past our buffer.
-        let frames = Int(nFrames)
-        if frames > maxFramesPerSlice {
-            log.error("HAL inNumberFrames=\(frames, privacy: .public) > max=\(self.maxFramesPerSlice, privacy: .public); skipping callback")
+        let listPtr = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: input)
+        )
+        guard listPtr.count > 0 else { return noErr }
+
+        // The device delivers either interleaved (one buffer, N channels)
+        // or non-interleaved (N buffers, one channel each). Detect from
+        // the captured native ASBD.
+        let nChannels = Int(halDeviceFormat.mChannelsPerFrame)
+        let isNonInterleaved =
+            (halDeviceFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+
+        let firstBuf = listPtr[0]
+        let bytesPerSample = MemoryLayout<Float>.size
+        let framesInBuffer: Int
+        if isNonInterleaved {
+            framesInBuffer = Int(firstBuf.mDataByteSize) / bytesPerSample
+        } else {
+            framesInBuffer = Int(firstBuf.mDataByteSize) / (bytesPerSample * nChannels)
+        }
+        if framesInBuffer <= 0 { return noErr }
+        if framesInBuffer > maxFramesPerSlice {
+            log.error("device IO proc framesInBuffer=\(framesInBuffer, privacy: .public) > max=\(self.maxFramesPerSlice, privacy: .public); skipping")
             return noErr
         }
 
-        guard let unit = halUnit, let listPtr = halBufferList else {
-            return noErr
-        }
+        guard let scratch = downmixScratch?.baseAddress else { return noErr }
 
-        // Re-arm mDataByteSize to the requested write size; the storage
-        // capacity is fixed at maxFramesPerSlice.
-        listPtr[0].mDataByteSize = UInt32(frames * MemoryLayout<Float>.size)
-
-        let status = AudioUnitRender(unit, flags, ts, busNum, nFrames, listPtr.unsafeMutablePointer)
-        if status != noErr {
-            log.error("AudioUnitRender failed: \(status, privacy: .public)")
-            return noErr
-        }
-
-        guard let raw = listPtr[0].mData else { return noErr }
-        let src = raw.bindMemory(to: Float.self, capacity: frames)
-
-        appendAndDrain(src: src, count: frames)
-
-        halCallbackCount += 1
-        // ~10 ms callbacks → every 200 ≈ 2 s.
-        if halCallbackCount % 200 == 1 {
-            var peak: Float = 0
-            for i in 0..<frames {
-                let v = abs(src[i])
-                if v > peak { peak = v }
+        // Downmix to mono. Mono devices: copy through. Stereo+ devices:
+        // average across channels per frame.
+        if nChannels == 1 {
+            guard let src = firstBuf.mData?.bindMemory(to: Float.self, capacity: framesInBuffer) else {
+                return noErr
             }
-            log.info("HAL #\(self.halCallbackCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
+            memcpy(scratch, src, framesInBuffer * bytesPerSample)
+        } else if isNonInterleaved {
+            // N buffers, one Float channel each. Sum then divide.
+            for f in 0..<framesInBuffer {
+                var sum: Float = 0
+                for c in 0..<min(nChannels, listPtr.count) {
+                    let buf = listPtr[c]
+                    if let p = buf.mData?.bindMemory(to: Float.self, capacity: framesInBuffer) {
+                        sum += p[f]
+                    }
+                }
+                scratch[f] = sum / Float(nChannels)
+            }
+        } else {
+            // Interleaved [c0 c1 c0 c1 ...]. Average per frame.
+            guard let src = firstBuf.mData?.bindMemory(to: Float.self, capacity: framesInBuffer * nChannels) else {
+                return noErr
+            }
+            let inv = 1.0 / Float(nChannels)
+            for f in 0..<framesInBuffer {
+                var sum: Float = 0
+                let base = f * nChannels
+                for c in 0..<nChannels {
+                    sum += src[base + c]
+                }
+                scratch[f] = sum * inv
+            }
         }
+
+        appendAndDrain(src: scratch, count: framesInBuffer)
         return noErr
     }
 
@@ -770,8 +757,6 @@ nonisolated final class AudioPipeline {
         _ buffer: AVAudioPCMBuffer,
         when _: AVAudioTime
     ) {
-        tapCallbackCount += 1
-
         let frames: Int
         let src: UnsafePointer<Float>
 
@@ -802,15 +787,6 @@ nonisolated final class AudioPipeline {
         }
 
         appendAndDrain(src: src, count: frames)
-
-        if tapCallbackCount % 25 == 1 {
-            var peak: Float = 0
-            for i in 0..<frames {
-                let v = abs(src[i])
-                if v > peak { peak = v }
-            }
-            log.info("tap #\(self.tapCallbackCount, privacy: .public) frames=\(frames, privacy: .public) peak=\(peak, format: .fixed(precision: 4), privacy: .public) scratchFill=\(self.scratchFill, privacy: .public)")
-        }
     }
 
     // MARK: - Shared hot path (HAL + fallback both call this)
@@ -839,8 +815,26 @@ nonisolated final class AudioPipeline {
             log.error("scratch overflow — dropped \(overflow, privacy: .public) frames")
         }
 
-        scratch.baseAddress!.advanced(by: scratchFill)
-            .update(from: src, count: count)
+        let dst = scratch.baseAddress!.advanced(by: scratchFill)
+        for i in 0..<count {
+            let y = src[i]
+            dst[i] = y
+
+            if wfFill == 0 {
+                wfCurLo = y
+                wfCurHi = y
+            } else {
+                if y < wfCurLo { wfCurLo = y }
+                if y > wfCurHi { wfCurHi = y }
+            }
+            wfFill += 1
+            if wfFill >= samplesPerBucket {
+                wfLo[wfHead] = wfCurLo
+                wfHi[wfHead] = wfCurHi
+                wfHead = (wfHead + 1) % kWaveformBuckets
+                wfFill = 0
+            }
+        }
         scratchFill += count
 
         var consumed = 0
@@ -893,6 +887,55 @@ nonisolated final class AudioPipeline {
             pendingDiscontinuity = false
             featureSlot.store(snapshot)
 
+            // Publish a waveform snapshot too. Unwrap the ring into the
+            // pre-allocated output arrays (oldest-bucket-first → newest)
+            // so the UI just iterates 0..<N to draw left-to-right.
+            for k in 0..<kWaveformBuckets {
+                let src = (wfHead + k) % kWaveformBuckets
+                wfLoOut[k] = wfLo[src]
+                wfHiOut[k] = wfHi[src]
+            }
+            wfLoOut.withUnsafeBufferPointer { lo in
+                wfHiOut.withUnsafeBufferPointer { hi in
+                    if let lp = lo.baseAddress, let hp = hi.baseAddress {
+                        waveformSlot.store(seq: seq, lo: lp, hi: hp)
+                    }
+                }
+            }
+
+            // ~1 s cadence (writer is ~94 Hz). Print global min/max and
+            // mean across the visible 1 s window, plus a coarse-decimated
+            // envelope so we can see the shape in the log.
+            if seq % 94 == 0 {
+                var gLo: Float = wfLoOut[0]
+                var gHi: Float = wfHiOut[0]
+                var sumLo: Float = 0
+                var sumHi: Float = 0
+                for k in 0..<kWaveformBuckets {
+                    if wfLoOut[k] < gLo { gLo = wfLoOut[k] }
+                    if wfHiOut[k] > gHi { gHi = wfHiOut[k] }
+                    sumLo += wfLoOut[k]
+                    sumHi += wfHiOut[k]
+                }
+                let meanLo = sumLo / Float(kWaveformBuckets)
+                let meanHi = sumHi / Float(kWaveformBuckets)
+                // 10-point coarse decimation of the hi envelope so we
+                // can see the shape (positive peaks per ~100 ms).
+                var shapeHi = ""
+                var shapeLo = ""
+                let step = kWaveformBuckets / 10
+                for k in 0..<10 {
+                    shapeHi += String(format: "%+.3f ", wfHiOut[k * step])
+                    shapeLo += String(format: "%+.3f ", wfLoOut[k * step])
+                }
+                log.info("""
+                wf: gMin=\(gLo, format: .fixed(precision: 4), privacy: .public) gMax=\(gHi, format: .fixed(precision: 4), privacy: .public) \
+                meanLo=\(meanLo, format: .fixed(precision: 4), privacy: .public) meanHi=\(meanHi, format: .fixed(precision: 4), privacy: .public)
+                  hi: \(shapeHi, privacy: .public)
+                  lo: \(shapeLo, privacy: .public)
+                """)
+            }
+
             consumed += hop
         }
 
@@ -943,27 +986,6 @@ nonisolated final class AudioPipeline {
     }
 
     // MARK: - HAL helpers
-
-    private func makeClientASBD() -> AudioStreamBasicDescription {
-        // Mono Float32 non-interleaved at the engine's sample rate.
-        // mBytesPerFrame = mBytesPerPacket = sizeof(Float) — for
-        // non-interleaved formats CoreAudio expects per-channel byte
-        // counts here.
-        let bytesPerSample = UInt32(MemoryLayout<Float>.size)
-        return AudioStreamBasicDescription(
-            mSampleRate: Float64(sampleRate),
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat
-                | kAudioFormatFlagIsPacked
-                | kAudioFormatFlagIsNonInterleaved,
-            mBytesPerPacket: bytesPerSample,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: bytesPerSample,
-            mChannelsPerFrame: 1,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-    }
 
     private func defaultInputDeviceID() throws -> AudioDeviceID {
         var address = AudioObjectPropertyAddress(
