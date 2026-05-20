@@ -32,6 +32,12 @@ struct DebugPaneView: View {
     /// so the audio thread sees a strictly-increasing value.
     @State private var generation: UInt32 = 0
 
+    /// Monitor toggle — routes audio-shaped port samples into the HAL
+    /// output ring so the developer can hear what they're inspecting.
+    /// Off on every appearance; the pipeline also force-clears it on
+    /// engine reset / device swap (via DebugSelectionSlot.clear).
+    @State private var monitorOn: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -70,6 +76,22 @@ struct DebugPaneView: View {
                 .onChange(of: selectedPort) { _, _ in
                     publishSelection()
                 }
+
+                Spacer()
+
+                // Monitor toggle. Only meaningful for audio-shaped ports
+                // (writeMono ignores feature/control values anyway).
+                // Hidden — not just disabled — for non-audio shapes so
+                // the toggle's mere presence doesn't suggest it would do
+                // anything on a numeric readout.
+                if currentShape == .audio {
+                    Toggle("Monitor", isOn: $monitorOn)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .onChange(of: monitorOn) { _, _ in
+                            publishSelection()
+                        }
+                }
             }
 
             body(for: currentShape)
@@ -101,11 +123,8 @@ struct DebugPaneView: View {
         if let shape {
             switch shape {
             case .audio:
-                // Audio widget lands in PR 5.3 with the monitor route.
-                // Until then, show a hint so the case is exhaustive.
-                Text("Audio port — rendering and monitor route land in PR 5.3.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                DebugAudioBlockView(tap: tap)
+                    .frame(height: 80)
             case .featureHz:
                 FeatureHzReadout(tap: tap)
             case .featureEvent:
@@ -156,13 +175,17 @@ struct DebugPaneView: View {
         } else {
             typeTag = PortShapeTable.shape(node: node, port: port).rawValue
         }
+        // Only an audio-shaped port may engage monitor. Defensively
+        // gate here so a stale `monitorOn = true` from a previous audio
+        // selection can't sneak through when the user picks a
+        // non-audio port.
+        let allowMonitor = (typeTag == PortShape.audio.rawValue) && monitorOn
         pipeline.debugSelectionSlot.store(
             generation: generation,
             nodeId: node,
             port: port,
             typeTag: typeTag,
-            // Monitor stays off in PR 5.2 — lit up in 5.3.
-            monitor: false
+            monitor: allowMonitor
         )
     }
 
@@ -246,6 +269,52 @@ private struct FeatureEventTicks: View {
             if v > m { m = v }
         }
         return m
+    }
+}
+
+/// One block (up to kDebugTapMaxSamples = 512 floats) drawn as a min/max
+/// envelope. Unlike WaveformView, this is a single block — no horizontal
+/// scrolling, no per-bucket aggregation. Auto-scales to the loudest
+/// sample so quiet signals are still legible.
+private struct DebugAudioBlockView: View {
+    let tap: DebugTapSnapshot
+
+    var body: some View {
+        Canvas { ctx, size in
+            let bgRect = CGRect(origin: .zero, size: size)
+            ctx.fill(Path(bgRect), with: .color(.black.opacity(0.18)))
+
+            var center = Path()
+            center.move(to: CGPoint(x: 0, y: size.height / 2))
+            center.addLine(to: CGPoint(x: size.width, y: size.height / 2))
+            ctx.stroke(center, with: .color(.white.opacity(0.12)), lineWidth: 1)
+
+            let len = Int(tap.len)
+            if len == 0 { return }
+
+            var peak: Float = 0.02
+            for i in 0..<len {
+                let v = abs(tap.samples[i])
+                if v > peak { peak = v }
+            }
+            if peak > 1.0 { peak = 1.0 }
+
+            let halfH = size.height / 2
+            let xPerSample = size.width / CGFloat(len)
+
+            var line = Path()
+            for i in 0..<len {
+                let x = CGFloat(i) * xPerSample
+                let y = halfH - CGFloat(tap.samples[i] / peak) * halfH * 0.95
+                if i == 0 {
+                    line.move(to: CGPoint(x: x, y: y))
+                } else {
+                    line.addLine(to: CGPoint(x: x, y: y))
+                }
+            }
+            ctx.stroke(line, with: .color(.accentColor), lineWidth: 1.2)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 }
 

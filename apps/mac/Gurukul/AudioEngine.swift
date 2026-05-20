@@ -1430,10 +1430,20 @@ nonisolated final class AudioPipeline {
             src: src,
             count: outLen
         )
-        // Monitor route is wired in PR 5.3. For now, the flag is read
-        // and ignored — keeps the data path stable so 5.3 only touches
-        // the routing line.
-        _ = monitorOn
+        // Monitor route. Only audio-shaped ports may write to the
+        // output ring — feature/control values aren't samples. The
+        // typeTag was set by the UI when the user picked the port, so
+        // we trust it here without re-classifying.
+        //
+        // halOutput.writeMono is a no-op (just drops samples on the
+        // floor in the producer's view) when the output is not
+        // running, so we don't gate on halOutput.isRunning — that
+        // would race against the device-swap path which can null
+        // procID mid-hop. The drop counter in halOutput already covers
+        // any samples written-with-no-consumer.
+        if monitorOn && typeTag == PortShape.audio.rawValue {
+            halOutput.writeMono(UnsafePointer(src), count: outLen)
+        }
     }
 
     // MARK: - HAL helpers
