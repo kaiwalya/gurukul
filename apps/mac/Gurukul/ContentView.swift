@@ -25,6 +25,14 @@ struct ContentView: View {
     @State private var school: PitchSchool = .western
     @State private var westernCtx = WesternContext()
 
+    #if DEBUG
+    /// Developer-only sidetone toggle. Routes the mic input through to
+    /// the HAL output device — purely to verify end-to-end that the
+    /// output IO proc fires. Off on every (re)start. Not shipped in
+    /// release builds. See `HALOutput` and `AudioPipeline.setSidetoneEnabled`.
+    @State private var sidetoneOn: Bool = false
+    #endif
+
     /// Latest coherent snapshot of all four features, refreshed every UI
     /// tick. Passed by reference (via @State) to the visualiser subviews.
     @State private var snapshot: FeatureSnapshot = .empty
@@ -45,6 +53,17 @@ struct ContentView: View {
                 .fixedSize()
 
                 Spacer()
+
+                #if DEBUG
+                Toggle("Sidetone (debug)", isOn: $sidetoneOn)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .disabled(!isRunning)
+                    .help("Routes the mic input through the HAL output device. Developer aid; off on every start.")
+                    .onChange(of: sidetoneOn) { _, newValue in
+                        pipeline.setSidetoneEnabled(newValue)
+                    }
+                #endif
 
                 Button(isRunning ? "Stop" : "Start") {
                     Task { await toggleRunning() }
@@ -154,6 +173,11 @@ struct ContentView: View {
             pipeline.stop()
             isRunning = false
             status = "Stopped"
+            #if DEBUG
+            // Mirror the invariant in HALOutput / AudioPipeline.stop:
+            // sidetone disengages on every (re)start. Keep the UI in sync.
+            sidetoneOn = false
+            #endif
         } else {
             await startIfPermitted()
         }

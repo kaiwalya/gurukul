@@ -159,6 +159,24 @@ private var enginePtr: OpaquePointer?
     private var converter: AVAudioConverter?
     private var fallbackActive: Bool = false
 
+    // MARK: - HAL output (PR 1.4.8.3)
+
+    /// HAL output path. Owns the IO proc on the user-selected output
+    /// device. Always present alongside the input path so the cabinet
+    /// has an audible route the moment a consumer (PR 5 debug pane,
+    /// future synth nodes) wants to push samples through it. For PR 3
+    /// this ships dark: the ring is never written to except by the
+    /// debug-menu sidetone toggle (`#if DEBUG`).
+    private let halOutput = HALOutput(sampleRate: 48000)
+
+    /// Sidetone toggle. When true, the input IO proc copies its
+    /// downmixed mono scratch into the HALOutput ring, producing
+    /// audible mic-to-speaker passthrough. Debug-only — exists purely
+    /// so the developer can manually verify the output IO proc fires
+    /// and the sample clock advances end-to-end. Production code paths
+    /// never set this; PR 5 (debug pane) introduces the real consumer.
+    private let sidetoneEnabled = ManagedAtomic<Bool>(false)
+
 /// The world driving the engine: one mic in-port, four analyzers,
     /// five boundary out-ports. Node ids and boundary port ids must
     /// stay disjoint (PHASE_1_4.md §2 validation rule), hence
@@ -249,6 +267,15 @@ private var enginePtr: OpaquePointer?
             fallbackActive = true
             log.info("capture path: AVAudioEngine tap (fallback)")
         }
+
+        // Engage the HAL output path. Failure is non-fatal: the cabinet
+        // can still run input-only, just without an audible route. PR 3
+        // ships this dark — no production code writes to the ring.
+        do {
+            try halOutput.start()
+        } catch {
+            log.error("HAL output setup failed: \(error.localizedDescription, privacy: .public) — input path still active, no output route")
+        }
     }
 
     func stop() {
@@ -262,6 +289,12 @@ private var enginePtr: OpaquePointer?
             avEngine.stop()
             fallbackActive = false
         }
+        if halOutput.isRunning {
+            halOutput.stop()
+        }
+        // Sidetone defaults off on every (re)start — see invariant in
+        // PHASE_1_4_8.md §"PR 5" (monitor disengages on engine.reset).
+        sidetoneEnabled.store(false, ordering: .relaxed)
         if let ptr = enginePtr {
             engine_reset(ptr)
         }
@@ -287,6 +320,23 @@ private var enginePtr: OpaquePointer?
             downmixScratch.deallocate()
         }
     }
+
+    // MARK: - Debug sidetone (PR 1.4.8.3)
+
+    /// Developer-only: route the input mic into the HAL output ring so
+    /// the developer can hear mic-to-speaker passthrough and confirm
+    /// end-to-end that the output IO proc is alive. **Not** a user
+    /// feature — gated `#if DEBUG`; off on every start.
+    #if DEBUG
+    func setSidetoneEnabled(_ enabled: Bool) {
+        sidetoneEnabled.store(enabled, ordering: .relaxed)
+        log.info("sidetone (debug) set to \(enabled, privacy: .public)")
+    }
+
+    func isSidetoneEnabled() -> Bool {
+        sidetoneEnabled.load(ordering: .relaxed)
+    }
+    #endif
 
     // MARK: - Engine setup
 
@@ -684,6 +734,15 @@ private var enginePtr: OpaquePointer?
                 scratch[f] = sum * inv
             }
         }
+
+        // Debug-only sidetone: copy the just-downmixed mono frames into
+        // the HAL output ring. Production paths never set sidetoneEnabled;
+        // PR 5 (debug pane) introduces the real consumer of halOutput.
+        #if DEBUG
+        if sidetoneEnabled.load(ordering: .relaxed) {
+            halOutput.writeMono(scratch, count: framesInBuffer)
+        }
+        #endif
 
         appendAndDrain(src: scratch, count: framesInBuffer)
         return noErr
