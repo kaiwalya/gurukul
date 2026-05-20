@@ -1192,7 +1192,22 @@ nonisolated final class AudioPipeline {
         guard let scratch = scratch else { return }
         guard let ptr = enginePtr else { return }
 
-        // If the incoming chunk would overflow, drop the OLDEST frames.
+        // If the incoming chunk alone exceeds the scratch capacity, drop
+        // the oldest part of it before copying anything in — otherwise we
+        // can never make it fit and would write past the buffer. This is
+        // the AVAudioEngine tap fallback path's defense; the HAL IO proc
+        // path enforces `framesInBuffer <= maxFramesPerSlice` upstream.
+        var src = src
+        var count = count
+        if count > scratchCapacity {
+            let dropped = count - scratchCapacity
+            src = src.advanced(by: dropped)
+            count = scratchCapacity
+            log.error("incoming chunk > scratch capacity — dropped \(dropped, privacy: .public) oldest frames from chunk")
+        }
+
+        // If the incoming chunk would overflow, drop the OLDEST frames
+        // from the existing scratch contents to make room.
         if scratchFill + count > scratchCapacity {
             let overflow = scratchFill + count - scratchCapacity
             if overflow < scratchFill {
