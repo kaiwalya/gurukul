@@ -29,6 +29,11 @@ struct ContentView: View {
     @State private var school: PitchSchool = .western
     @State private var westernCtx = WesternContext()
 
+    /// Whether the inline debug pane is expanded. Defaults off so the
+    /// pane is out-of-the-way for normal use — it's a developer
+    /// affordance, not a primary feature.
+    @State private var debugPaneOpen: Bool = false
+
     #if DEBUG
     /// Developer-only sidetone toggle. Routes the mic input through to
     /// the HAL output device — purely to verify end-to-end that the
@@ -102,6 +107,12 @@ struct ContentView: View {
                 rate: snapshot.vibratoRate,
                 depth: snapshot.vibratoDepth
             )
+
+            DisclosureGroup("Debug pane", isExpanded: $debugPaneOpen) {
+                DebugPaneView(pipeline: pipeline)
+                    .padding(.top, 4)
+            }
+            .font(.callout)
 
             Spacer()
 

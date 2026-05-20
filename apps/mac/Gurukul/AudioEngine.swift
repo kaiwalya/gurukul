@@ -602,6 +602,66 @@ nonisolated final class AudioPipeline {
     }
     #endif
 
+    // MARK: - Engine introspection (debug pane)
+
+    /// List of node ids in the live engine, in topological order. Empty
+    /// when the engine is not built (idle or mid-rebuild).
+    ///
+    /// Calls `engine_node_ids` — NOT realtime-safe. Intended for picker-
+    /// open use only. The UI calls this at debug-pane appear; if it
+    /// returns empty the user sees an empty picker (correct: there is
+    /// nothing to tap when the engine is down).
+    func nodeIds() -> [String] {
+        guard let ptr = enginePtr else { return [] }
+        // First call with cap=0 to learn the total count.
+        let total = engine_node_ids(ptr, nil, 0)
+        if total == 0 { return [] }
+        var buf = [UnsafePointer<CChar>?](repeating: nil, count: total)
+        let written = buf.withUnsafeMutableBufferPointer { dst -> Int in
+            guard let base = dst.baseAddress else { return 0 }
+            return engine_node_ids(ptr, base, total)
+        }
+        guard written > 0 else { return [] }
+        var out: [String] = []
+        out.reserveCapacity(min(written, total))
+        for i in 0..<min(written, total) {
+            if let cstr = buf[i] {
+                out.append(String(cString: cstr))
+            }
+        }
+        return out
+    }
+
+    /// Output port names for the given node id, in declaration order.
+    /// Empty when the node id is not recognised in the current engine.
+    /// Calls `engine_out_port_names` — NOT realtime-safe.
+    func outPortNames(for nodeId: String) -> [String] {
+        guard let ptr = enginePtr else { return [] }
+        // Probe with cap=0 to learn the count.
+        var total: Int = 0
+        let probeRC = nodeId.withCString { nodeCStr in
+            engine_out_port_names(ptr, nodeCStr, nil, 0, &total)
+        }
+        guard probeRC == GURUKUL_OK, total > 0 else { return [] }
+        var buf = [UnsafePointer<CChar>?](repeating: nil, count: total)
+        let rc = nodeId.withCString { nodeCStr -> Int32 in
+            buf.withUnsafeMutableBufferPointer { dst -> Int32 in
+                guard let base = dst.baseAddress else { return GURUKUL_ERR_UNKNOWN }
+                var got: Int = 0
+                return engine_out_port_names(ptr, nodeCStr, base, total, &got)
+            }
+        }
+        guard rc == GURUKUL_OK else { return [] }
+        var out: [String] = []
+        out.reserveCapacity(total)
+        for i in 0..<total {
+            if let cstr = buf[i] {
+                out.append(String(cString: cstr))
+            }
+        }
+        return out
+    }
+
     // MARK: - Engine setup
 
     private func buildEngineIfNeeded() throws {
@@ -1336,41 +1396,44 @@ nonisolated final class AudioPipeline {
     /// returns in the same hop. `engine_read_port` does a string lookup
     /// per call; the phase doc explicitly accepts this cost.
     private func publishDebugTap(ptr: OpaquePointer) {
-        #if DEBUG
-        // PR 1.4.8.5.1 dark wire-up: tap the pitch_yin.f0 port so we can
-        // verify the slot fills end-to-end before any UI exists. The UI
-        // PR (5.2) replaces this with a real selection driven by pickers.
-        let darkNode = "pitch_yin"
-        let darkPort = "f0"
-        let darkTypeTag: UInt8 = 1  // PortShape.featureHz placeholder
-
+        // Read the current selection from debugSelectionSlot. The slot's
+        // borrow() returns pointers directly into its internal storage —
+        // no allocation, no string bridging. If no selection is set,
+        // borrow() returns false and we skip the FFI call entirely.
+        var nodeBase: UnsafePointer<UInt8>? = nil
+        var portBase: UnsafePointer<UInt8>? = nil
+        var typeTag: UInt8 = 0
+        var monitorOn = false
+        let has = debugSelectionSlot.borrow(
+            nodeBase: &nodeBase,
+            portBase: &portBase,
+            typeTag: &typeTag,
+            monitor: &monitorOn
+        )
+        guard has, let nodeP = nodeBase, let portP = portBase else {
+            return
+        }
+        // The slot stores null-terminated UTF-8 buffers, so we can hand
+        // the UInt8 pointers to engine_read_port as `char*` directly.
+        let nodeCStr = UnsafeRawPointer(nodeP).assumingMemoryBound(to: CChar.self)
+        let portCStr = UnsafeRawPointer(portP).assumingMemoryBound(to: CChar.self)
         var outPtr: UnsafePointer<Float>?
         var outLen: Int = 0
-        let rc = darkNode.withCString { nodeCStr in
-            darkPort.withCString { portCStr in
-                engine_read_port(ptr, nodeCStr, portCStr, &outPtr, &outLen)
-            }
-        }
+        let rc = engine_read_port(ptr, nodeCStr, portCStr, &outPtr, &outLen)
         guard rc == GURUKUL_OK, let src = outPtr, outLen > 0 else {
             return
         }
         debugTapSeq &+= 1
         debugTapSlot.store(
             seq: debugTapSeq,
-            typeTag: darkTypeTag,
+            typeTag: typeTag,
             src: src,
             count: outLen
         )
-        // Lightweight log every ~94 hops (~1 s) so we can verify the
-        // tap is filling without spamming the console.
-        if debugTapSeq % 94 == 0 {
-            log.debug("debug-tap (dark): \(darkNode, privacy: .public).\(darkPort, privacy: .public) len=\(outLen, privacy: .public) first=\(src[0], privacy: .public)")
-        }
-        #else
-        // Release builds: no dark selection. PR 5.2 will read
-        // debugSelectionSlot here once UI exists.
-        _ = ptr
-        #endif
+        // Monitor route is wired in PR 5.3. For now, the flag is read
+        // and ignored — keeps the data path stable so 5.3 only touches
+        // the routing line.
+        _ = monitorOn
     }
 
     // MARK: - HAL helpers
