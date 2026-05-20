@@ -2,8 +2,9 @@
 //!
 //! Every domain that emits timestamps (telemetry, audio block stamps,
 //! retry backoffs, ...) takes a `&dyn Clock` rather than calling the
-//! OS directly. Adapters supply the real impl; tests supply
-//! [`TestClock`] for deterministic time control.
+//! OS directly. Adapters supply the real impl; consumer tests can use
+//! [`TestClock`] for deterministic time control (behind the
+//! `test-util` feature — see crate-root docs).
 //!
 //! # Contract
 //!
@@ -26,8 +27,6 @@
 //! resolution. `now_ms()` is provided as a convenience for log lines
 //! and human-readable stamps.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 /// Monotonic time source. See module docs for the contract.
 ///
 /// `Send + Sync` because adapters and tests are shared across threads
@@ -44,44 +43,63 @@ pub trait Clock: Send + Sync {
     }
 }
 
-/// Deterministic in-memory clock for tests. Lives next to the trait
-/// because it's part of the Clock domain — every test that takes a
-/// `&dyn Clock` uses this.
-///
-/// Internally an `AtomicU64` so it's `Send + Sync` and can be ticked
-/// from one thread while a system-under-test reads it from another.
-pub struct TestClock {
-    ns: AtomicU64,
-}
+// ---------------------------------------------------------------------
+// Test fake — gated. See crate-root docs ("test fakes") for the rule.
+//
+// `any(test, feature = "test-util")` makes the fake visible to:
+//   - this crate's own tests (via `cfg(test)`)
+//   - downstream crates that opt in via dev-dependencies with
+//     `features = ["test-util"]`
+// Production builds (default features, non-test) don't include it.
+// ---------------------------------------------------------------------
 
-impl TestClock {
-    /// New clock starting at `start_ns`.
-    pub fn new(start_ns: u64) -> Self {
-        Self {
-            ns: AtomicU64::new(start_ns),
+#[cfg(any(test, feature = "test-util"))]
+pub use fakes::TestClock;
+
+#[cfg(any(test, feature = "test-util"))]
+mod fakes {
+    use super::Clock;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Deterministic in-memory clock for consumer tests. Honors the
+    /// `Clock` contract (monotonic, `Send + Sync`) so tests that
+    /// substitute it are exercising the same shape as real adapters.
+    ///
+    /// Internally an `AtomicU64` so it can be ticked from one thread
+    /// while a system-under-test reads it from another.
+    pub struct TestClock {
+        ns: AtomicU64,
+    }
+
+    impl TestClock {
+        /// New clock starting at `start_ns`.
+        pub fn new(start_ns: u64) -> Self {
+            Self {
+                ns: AtomicU64::new(start_ns),
+            }
+        }
+
+        /// Advance the clock by `delta_ns`. Returns the new time.
+        pub fn advance_ns(&self, delta_ns: u64) -> u64 {
+            self.ns.fetch_add(delta_ns, Ordering::SeqCst) + delta_ns
+        }
+
+        /// Advance the clock by `delta_ms`. Returns the new time in ns.
+        pub fn advance_ms(&self, delta_ms: u64) -> u64 {
+            self.advance_ns(delta_ms * 1_000_000)
         }
     }
 
-    /// Advance the clock by `delta_ns`. Returns the new time.
-    pub fn advance_ns(&self, delta_ns: u64) -> u64 {
-        self.ns.fetch_add(delta_ns, Ordering::SeqCst) + delta_ns
+    impl Default for TestClock {
+        fn default() -> Self {
+            Self::new(0)
+        }
     }
 
-    /// Advance the clock by `delta_ms`. Returns the new time in ns.
-    pub fn advance_ms(&self, delta_ms: u64) -> u64 {
-        self.advance_ns(delta_ms * 1_000_000)
-    }
-}
-
-impl Default for TestClock {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
-impl Clock for TestClock {
-    fn now_ns(&self) -> u64 {
-        self.ns.load(Ordering::SeqCst)
+    impl Clock for TestClock {
+        fn now_ns(&self) -> u64 {
+            self.ns.load(Ordering::SeqCst)
+        }
     }
 }
 

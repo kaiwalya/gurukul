@@ -3,4 +3,12 @@ name = "domain-ports"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Exposes per-domain test fakes (e.g. `clock::TestClock`) for consumers'
+# tests. OFF by default so fakes don't ship in production binaries.
+# Consumers opt in via dev-dependencies:
+#   [dev-dependencies]
+#   domain-ports = { path = "...", features = ["test-util"] }
+test-util = []
+
 [dependencies]

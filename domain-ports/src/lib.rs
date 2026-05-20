@@ -28,6 +28,20 @@
 //!    encodes that (e.g. an `acquire()` that returns an error if one
 //!    is already out). The adapter enforces; the app consumes.
 //!
+//! 4. **Test fakes ship behind the `test-util` Cargo feature.** A
+//!    port may include a deterministic fake for consumer tests
+//!    (e.g. an in-memory implementation of the trait). Gate it with
+//!    `#[cfg(any(test, feature = "test-util"))]` so the fake is
+//!    visible to this crate's own tests and to downstream crates that
+//!    opt in via dev-dependencies, but does **not** ship in
+//!    production builds (default features, non-test). Downstream
+//!    `Cargo.toml`:
+//!
+//!    ```toml
+//!    [dev-dependencies]
+//!    domain-ports = { path = "...", features = ["test-util"] }
+//!    ```
+//!
 //! # Shape sketch
 //!
 //! ```ignore
