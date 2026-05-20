@@ -534,8 +534,18 @@ nonisolated final class AudioPipeline {
     }
 
     deinit {
+        // Order matters: every audio thread must have exited before we
+        // free the engine or its scratch buffers. AudioDeviceStop in
+        // stopInternal is blocking, so once it returns no IO proc is
+        // mid-flight against the about-to-be-freed memory.
+        //
+        // stopInternal is private and nonisolated, safe to call here.
+        // It is also idempotent — if the pipeline was never started,
+        // it's a cheap no-op.
+        stopInternal()
         if let ptr = enginePtr {
             engine_free(ptr)
+            enginePtr = nil
         }
         if let scratch = scratch {
             scratch.deallocate()

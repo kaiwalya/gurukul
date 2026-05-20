@@ -46,19 +46,22 @@ final class AudioDeviceCatalog: ObservableObject {
     }
 
     deinit {
-        // Best-effort: removePropertyListener captures self via the
-        // opaque pointer, but the listener uses unretained references so
-        // there's no retain cycle. CoreAudio cleans up on process exit
-        // if we miss this in deinit.
-        if listenerInstalled {
-            var address = Self.deviceListAddress
-            AudioObjectRemovePropertyListener(
-                AudioObjectID(kAudioObjectSystemObject),
-                &address,
-                Self.deviceListChanged,
-                Unmanaged.passUnretained(self).toOpaque()
-            )
-        }
+        // Best-effort: AudioObjectRemovePropertyListener is idempotent
+        // (returns an error if we weren't installed, which we ignore).
+        // We don't read `listenerInstalled` here because it's
+        // MainActor-isolated and deinit runs nonisolated.
+        //
+        // Critical: the listener captures self via an unretained opaque
+        // pointer. If a callback is mid-flight on a CoreAudio thread
+        // when deinit runs, removePropertyListener blocks until that
+        // callback returns — preventing use-after-free.
+        var address = Self.deviceListAddress
+        AudioObjectRemovePropertyListener(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            Self.deviceListChanged,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
     }
 
     // MARK: - Enumeration
@@ -233,8 +236,15 @@ final class AudioDeviceCatalog: ObservableObject {
         // Hop to main actor so @Published updates are SwiftUI-safe and
         // we can call back into the catalog without worrying about which
         // thread CoreAudio chose.
+        //
+        // We retain self for the lifetime of the hop so deinit cannot
+        // run between the callback firing and the @MainActor task body
+        // running — that would race with use-after-free. The matching
+        // release happens at the end of the task body.
         let unmanaged = Unmanaged<AudioDeviceCatalog>.fromOpaque(refcon)
+        _ = unmanaged.retain()
         Task { @MainActor in
+            defer { unmanaged.release() }
             unmanaged.takeUnretainedValue().refresh()
         }
         return noErr
