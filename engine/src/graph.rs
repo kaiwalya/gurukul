@@ -779,6 +779,39 @@ impl Engine {
         &self.topo_order_ids
     }
 
+    /// All node ids in the engine, in topological (process) order.
+    ///
+    /// Cheap borrowed view — no allocation. Intended for host code that needs
+    /// to enumerate every node (debug panels, port inspectors) without going
+    /// back to the source `World`.
+    pub fn node_ids(&self) -> &[String] {
+        &self.topo_order_ids
+    }
+
+    /// Output port names for `node_id`, in declaration order.
+    ///
+    /// Returns borrowed `&str`s — one small `Vec` allocation per call. Combined
+    /// with `node_ids`, this is the runtime port-enumeration surface a host
+    /// uses to drive pickers in a debug UI or wire up `peek` calls without
+    /// knowing the world JSON at compile time.
+    ///
+    /// Inputs are deliberately not exposed by a parallel `in_port_names`:
+    /// post-mux input buffers carry the same samples as their upstream
+    /// output port, so inspecting inputs adds no information over inspecting
+    /// the upstream output, and "the upstream output" is already addressable
+    /// by `(source_node_id, source_port_name)` via this method.
+    pub fn out_port_names(&self, node_id: &str) -> Result<Vec<&str>, EngineError> {
+        let node_idx = self
+            .node_index
+            .get(node_id)
+            .copied()
+            .ok_or_else(|| EngineError::NodeNotFound(node_id.to_string()))?;
+        Ok(self.output_port_names[node_idx]
+            .iter()
+            .map(String::as_str)
+            .collect())
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
