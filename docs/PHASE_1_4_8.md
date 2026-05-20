@@ -138,13 +138,24 @@ A manual-test-only "sidetone" toggle exists *only in a debug menu* (not a featur
 
 ### PR 1.4.8.4 — Audio preferences pane
 
-**What:** `SettingsView.swift` with input device picker + output device picker. Backed by `Prefs.swift` (UserDefaults wrapper, keyed by device UID). New device-list-changed listener in `AudioEngine.swift` (currently only default-device-changed exists). On pick, the cabinet stops the current HAL input/output, swaps in the new device, restarts.
+**What:** `SettingsView.swift` with three pickers: input device, output device, **engine sample rate**. Backed by `Prefs.swift` (UserDefaults wrapper). Device pickers keyed by device UID. Sample-rate picker offers a fixed list (44.1k / 48k / 96k); default 48k.
 
-**Why:** Standalone, no engine dependency, gives us the device-list infrastructure the debug pane will inherit.
+New device-list-changed listener in `AudioEngine.swift` (currently only default-device-changed exists). On device pick, the cabinet stops the current HAL input/output, swaps in the new device, restarts. On sample-rate pick, the cabinet performs a **full engine rebuild**: stop input + output, `engine_free`, rebuild at the new rate via `engine_build`, re-resolve port handles, re-allocate sample-rate-sized scratch buffers, restart input + output. The rebuild path is new infrastructure that PR 5 (debug pane) will also use when a future world reload feature lands.
 
-**Scope:** all Swift. Persistence trivial. Hot-swap mechanics already proven for input by PR 6.2.
+**Constraint:** input device, output device, and engine all run at the same rate. The picker does not resample — it aligns. If the user picks an output device whose native rate differs from the engine, the device picker surfaces this and offers to either (a) refuse, or (b) change the engine rate to match (one click). Same for input. The current behaviour of `HALOutput.start` (refuse with a clear log) becomes a UI message in the preferences pane.
 
-**Done when:** Pick a non-default input → preferences persist across app restart. Same for output. Unplug the chosen device → falls back gracefully to system default with a status message. Re-plug → silently re-claims if "follow this UID" is set.
+**Why:** Sample-rate alignment is the main thing the user can't currently fix without `Audio MIDI Setup`. Folding it into the preferences pane keeps all alignment in one place and earns us the engine-rebuild plumbing that PR 5 will inherit for free.
+
+**Scope:** all Swift on the cabinet side. Persistence is one extra key (`engineSampleRate: Int`). Hot-swap mechanics already proven for input by PR 6.2; engine-rebuild path is new. No engine / FFI changes — the engine already supports being built at arbitrary rates; we just rebuild the handle.
+
+**Done when:**
+
+- Pick a non-default input → preferences persist across app restart.
+- Same for output.
+- Pick a different sample rate → engine rebuild succeeds within ~1 s, pitch clock and waveform resume cleanly, no audio glitches, sidetone (if it was on) re-engages off (matches the existing reset-clears-sidetone invariant).
+- Pick an output device whose native rate ≠ engine rate → preferences pane offers to align; one click rebuilds at the device's rate.
+- Unplug the chosen device → falls back gracefully to system default with a status message.
+- Re-plug → silently re-claims if "follow this UID" is set.
 
 ### PR 1.4.8.5 — Debug pane
 

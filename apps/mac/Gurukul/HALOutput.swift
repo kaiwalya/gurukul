@@ -37,7 +37,18 @@ nonisolated final class HALOutput {
     /// Engine sample rate. The ring stores frames at this rate; the
     /// device's native rate must match (we don't resample on output for
     /// the same reasons we don't on input — see `installHALInput`).
-    private let sampleRate: UInt32
+    /// Mutable so the cabinet can re-target this output at a new rate
+    /// during an engine rebuild without reconstructing `HALOutput`.
+    private(set) var sampleRate: UInt32
+
+    /// Update the rate this HAL output expects. Caller must guarantee
+    /// the device is stopped before calling — checked by precondition.
+    /// Invoked by `AudioPipeline.rebuildEngine` during sample-rate
+    /// change; otherwise unused.
+    func setSampleRate(_ newRate: UInt32) {
+        precondition(!isRunning, "setSampleRate while HALOutput is running")
+        sampleRate = newRate
+    }
 
     /// Number of frames the ring can hold. 8192 mono frames = ~170 ms at
     /// 48 kHz, comfortably above any device buffer cycle we've seen.
@@ -146,7 +157,10 @@ nonisolated final class HALOutput {
         underflowCount.store(0, ordering: .relaxed)
         dropCount.store(0, ordering: .relaxed)
 
-        // Install the IO proc.
+        // Install the IO proc. If anything between here and the
+        // isRunning=true commit throws, we must destroy the procID —
+        // otherwise stopInternal's idempotency assumption (only clean
+        // up when isRunning) leaks it across the next rebuild.
         var pid: AudioDeviceIOProcID?
         let createStatus = AudioDeviceCreateIOProcID(
             deviceID,
@@ -158,11 +172,16 @@ nonisolated final class HALOutput {
         guard let pid else {
             throw outputError("AudioDeviceCreateIOProcID returned nil procID")
         }
-        procID = pid
 
-        stopping.store(false, ordering: .relaxed)
-        let startStatus = AudioDeviceStart(deviceID, pid)
-        try check(startStatus, "AudioDeviceStart (output)")
+        do {
+            stopping.store(false, ordering: .relaxed)
+            let startStatus = AudioDeviceStart(deviceID, pid)
+            try check(startStatus, "AudioDeviceStart (output)")
+        } catch {
+            AudioDeviceDestroyIOProcID(deviceID, pid)
+            throw error
+        }
+        procID = pid
         isRunning = true
 
         let name = deviceNameOrUnknown(for: deviceID)

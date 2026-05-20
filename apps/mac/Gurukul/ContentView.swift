@@ -14,7 +14,11 @@ private let silenceClearAfter: TimeInterval = 0.5
 /// readout) below, all driven by a 30 Hz timer polling the pipeline's
 /// lock-free `FeatureSlot`.
 struct ContentView: View {
-    @State private var pipeline = AudioPipeline()
+    /// Shared pipeline instance, constructed once at app launch in
+    /// `GurukulApp` and passed in so `SettingsView` and `ContentView`
+    /// both target the same audio infrastructure.
+    let pipeline: AudioPipeline
+
     @State private var status: String = "Idle"
     @State private var isRunning: Bool = false
 
@@ -229,5 +233,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(pipeline: AudioPipeline())
 }

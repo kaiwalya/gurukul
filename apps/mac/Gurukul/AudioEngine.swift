@@ -51,8 +51,11 @@ nonisolated final class AudioPipeline {
     private var wfFill: Int = 0
     private var wfCurLo: Float = 0
     private var wfCurHi: Float = 0
-    /// 48000 samples/s × 1 s ÷ 150 buckets = 320 samples per bucket.
-    private let samplesPerBucket: Int = 320
+    /// Samples per waveform bucket. Recomputed on every (re)build as
+    /// `sampleRate / kWaveformBuckets` so the waveform still represents
+    /// a 1-second window across all supported rates.
+    /// 48000 / 150 = 320; 96000 / 150 = 640; 44100 / 150 = 294.
+    private var samplesPerBucket: Int = 320
 
     /// Pre-allocated scratch the audio thread copies the unwrapped ring
     /// into before calling `WaveformSlot.store`. Lives at instance scope
@@ -60,7 +63,13 @@ nonisolated final class AudioPipeline {
     private var wfLoOut: [Float] = Array(repeating: 0, count: kWaveformBuckets)
     private var wfHiOut: [Float] = Array(repeating: 0, count: kWaveformBuckets)
 
-private var enginePtr: OpaquePointer?
+/// Live engine handle. Mutated during `applySettings` rebuild. The
+    /// load-bearing invariant: no IO proc may dereference this pointer
+    /// while it is being reassigned. The rebuild path guarantees this by
+    /// calling `AudioDeviceStop` on every audio thread before touching
+    /// `enginePtr`, and by remaining on `deviceSwapQueue` for the
+    /// duration so concurrent listener fires cannot race.
+    private var enginePtr: OpaquePointer?
     private var micHandle: UInt32 = GURUKUL_INVALID_PORT
     private var pitchOut: UInt32 = GURUKUL_INVALID_PORT
     private var onsetOut: UInt32 = GURUKUL_INVALID_PORT
@@ -74,10 +83,36 @@ private var enginePtr: OpaquePointer?
     /// buffers know to clear.
     private var pendingDiscontinuity: Bool = true
 
-    /// Sample rate the engine is built for. Both capture paths deliver
-    /// frames at this rate (HAL via the unit's internal conversion;
-    /// tap via AVAudioConverter or bypass).
-    private let sampleRate: UInt32 = 48000
+    /// Sample rate the engine is built for. Mutated only on rebuild
+    /// (via `applySettings`), never while audio threads are live. Both
+    /// capture paths deliver frames at this rate (HAL refuses devices
+    /// at a different native rate; tap path uses AVAudioConverter).
+    private var sampleRate: UInt32 = Prefs.defaultSampleRate
+
+    /// Live snapshot of the settings the pipeline is currently running
+    /// against. Updated atomically on the swap queue inside
+    /// `applySettings`. Reads from elsewhere (UI, listeners) must hop
+    /// onto the swap queue too.
+    private var currentSettings: AudioSettings = AudioSettings(
+        inputDeviceUID: nil,
+        outputDeviceUID: nil,
+        sampleRate: Prefs.defaultSampleRate,
+        bufferSize: Prefs.defaultBufferSize
+    )
+
+    /// Construct a pipeline pre-seeded with the given settings. The
+    /// pipeline does not start until `start()` (or `applySettings`) is
+    /// called.
+    init(initialSettings: AudioSettings = AudioSettings(
+        inputDeviceUID: nil,
+        outputDeviceUID: nil,
+        sampleRate: Prefs.defaultSampleRate,
+        bufferSize: Prefs.defaultBufferSize
+    )) {
+        self.currentSettings = initialSettings
+        self.sampleRate = initialSettings.sampleRate
+        self.samplesPerBucket = Int(initialSettings.sampleRate) / kWaveformBuckets
+    }
 
     /// Hop size that matches PitchYin's `hop` param in the world JSON.
     private let hop: Int = 512
@@ -167,7 +202,7 @@ private var enginePtr: OpaquePointer?
     /// future synth nodes) wants to push samples through it. For PR 3
     /// this ships dark: the ring is never written to except by the
     /// debug-menu sidetone toggle (`#if DEBUG`).
-    private let halOutput = HALOutput(sampleRate: 48000)
+    private let halOutput = HALOutput(sampleRate: Prefs.defaultSampleRate)
 
     /// Sidetone toggle. When true, the input IO proc copies its
     /// downmixed mono scratch into the HALOutput ring, producing
@@ -236,12 +271,61 @@ private var enginePtr: OpaquePointer?
 
     // MARK: - Lifecycle
 
+    /// Apply the given settings (initial start, or to swap devices /
+    /// sample rate). Synchronous from the caller's perspective: returns
+    /// once the new configuration is engaged (or has cleanly failed and
+    /// surfaced an error).
+    ///
+    /// The view layer reads/writes UserDefaults via `Prefs`; the
+    /// pipeline takes settings explicitly here and remains
+    /// UserDefaults-ignorant.
+    func applySettings(_ newSettings: AudioSettings) throws {
+        // Serialise on deviceSwapQueue so an in-flight property listener
+        // (e.g. default-input-changed) cannot race the rebuild. The
+        // listener already hops to this queue, so a sync dispatch from
+        // the caller establishes the ordering: either the listener runs
+        // before us (and we see its updated state), or we run before
+        // it (and it sees ours). No interleaving.
+        var caught: Error?
+        deviceSwapQueue.sync {
+            do {
+                let change = newSettings.change(from: currentSettings)
+                switch change {
+                case .none:
+                    if enginePtr == nil {
+                        try startInternal(newSettings)
+                    }
+                case .deviceOnly:
+                    try swapDevices(to: newSettings)
+                case .sampleRateChanged:
+                    try rebuildAt(newSettings)
+                }
+            } catch {
+                caught = error
+            }
+        }
+        if let caught { throw caught }
+    }
+
     func start() throws {
+        try startInternal(currentSettings)
+    }
+
+    /// Bring the pipeline up using `settings`. Builds the engine,
+    /// engages input + output HAL paths, installs listeners. Idempotent:
+    /// safe to call when already running (it tears down first).
+    private func startInternal(_ settings: AudioSettings) throws {
+        if enginePtr != nil || halRunning || fallbackActive || halOutput.isRunning {
+            stopInternal()
+        }
+        sampleRate = settings.sampleRate
+        samplesPerBucket = Int(settings.sampleRate) / kWaveformBuckets
+        currentSettings = settings
+        halOutput.setSampleRate(settings.sampleRate)
+
         try buildEngineIfNeeded()
         allocateScratch(capacity: maxFramesPerSlice + hop)
         pendingDiscontinuity = true
-        // Reset waveform ring so a previous device's tail doesn't bleed
-        // into the new session's first second.
         for i in 0..<kWaveformBuckets {
             wfLo[i] = 0
             wfHi[i] = 0
@@ -250,12 +334,17 @@ private var enginePtr: OpaquePointer?
         wfFill = 0
         wfCurLo = 0
         wfCurHi = 0
-// Try HAL first. If anything along the chain fails, log and
-        // fall back to the AVAudioEngine tap path. Failures are
-        // expected on exotic devices (aggregate, non-Float32 native,
-        // …); the fallback keeps the app usable.
+
+        // Resolve the preferred input device from its UID, if any. If
+        // the UID is set but the device isn't present, we fall through
+        // to system default rather than refusing — better UX than a
+        // hard failure.
+        let preferredInputID = settings.inputDeviceUID.flatMap { uid in
+            deviceID(forUID: uid, scope: kAudioObjectPropertyScopeInput)
+        }
+
         do {
-            try installHALInput()
+            try installHALInput(preferredDeviceID: preferredInputID)
             try startHALUnit()
             halRunning = true
             installDefaultInputListener()
@@ -268,17 +357,37 @@ private var enginePtr: OpaquePointer?
             log.info("capture path: AVAudioEngine tap (fallback)")
         }
 
-        // Engage the HAL output path. Failure is non-fatal: the cabinet
-        // can still run input-only, just without an audible route. PR 3
-        // ships this dark — no production code writes to the ring.
+        // Engage HAL output. Use a specific device UID if set, else
+        // system default. Failure is non-fatal — input-only is still
+        // useful.
+        let preferredOutputID = settings.outputDeviceUID.flatMap { uid in
+            deviceID(forUID: uid, scope: kAudioObjectPropertyScopeOutput)
+        }
         do {
-            try halOutput.start()
+            if let id = preferredOutputID {
+                try halOutput.start(deviceID: id)
+            } else {
+                try halOutput.start()
+            }
         } catch {
             log.error("HAL output setup failed: \(error.localizedDescription, privacy: .public) — input path still active, no output route")
         }
     }
 
     func stop() {
+        stopInternal()
+        if let ptr = enginePtr {
+            engine_reset(ptr)
+        }
+        log.info("stopped")
+    }
+
+    /// Internal teardown. Stops listeners and audio threads, frees no
+    /// memory and does NOT touch `enginePtr` (callers decide whether to
+    /// reset, free, or leave alone). The post-condition is the strong
+    /// invariant: every audio thread has exited via `AudioDeviceStop`,
+    /// so it is now safe to mutate engine state.
+    private func stopInternal() {
         removeDefaultInputListener()
         if halRunning {
             stopHALUnit()
@@ -295,9 +404,6 @@ private var enginePtr: OpaquePointer?
         // Sidetone defaults off on every (re)start — see invariant in
         // PHASE_1_4_8.md §"PR 5" (monitor disengages on engine.reset).
         sidetoneEnabled.store(false, ordering: .relaxed)
-        if let ptr = enginePtr {
-            engine_reset(ptr)
-        }
         scratchFill = 0
         #if DEBUG
         let counters = featureSlot.debugCounters()
@@ -306,7 +412,125 @@ private var enginePtr: OpaquePointer?
             : 0.0
         log.info("FeatureSlot reader: reads=\(counters.reads, privacy: .public) retries=\(counters.retries, privacy: .public) (\(pct, format: .fixed(precision: 2), privacy: .public)%)")
         #endif
-        log.info("stopped")
+    }
+
+    /// Device-only swap: stop the existing HAL paths, engage the new
+    /// devices, keep the engine intact. No engine rebuild — sample rate
+    /// has not changed.
+    private func swapDevices(to newSettings: AudioSettings) throws {
+        log.info("device swap: input \(self.currentSettings.inputDeviceUID ?? "<default>", privacy: .public) → \(newSettings.inputDeviceUID ?? "<default>", privacy: .public), output \(self.currentSettings.outputDeviceUID ?? "<default>", privacy: .public) → \(newSettings.outputDeviceUID ?? "<default>", privacy: .public)")
+        stopInternal()
+        currentSettings = newSettings
+        try startInternal(newSettings)
+    }
+
+    /// Sample-rate rebuild. Stop everything, free the engine, build a
+    /// fresh one at the new rate, restart. Re-targets HAL paths at the
+    /// settings' devices in the same step.
+    ///
+    /// The lifecycle invariant `enginePtr is only mutated when no IO
+    /// proc is in flight` is preserved by `stopInternal` blocking on
+    /// `AudioDeviceStop` for every running device before we touch the
+    /// pointer.
+    private func rebuildAt(_ newSettings: AudioSettings) throws {
+        log.info("engine rebuild: \(self.sampleRate, privacy: .public) Hz → \(newSettings.sampleRate, privacy: .public) Hz")
+        stopInternal()
+        if let ptr = enginePtr {
+            engine_free(ptr)
+            enginePtr = nil
+        }
+        micHandle = GURUKUL_INVALID_PORT
+        pitchOut = GURUKUL_INVALID_PORT
+        onsetOut = GURUKUL_INVALID_PORT
+        breathOut = GURUKUL_INVALID_PORT
+        vibratoRateOut = GURUKUL_INVALID_PORT
+        vibratoDepthOut = GURUKUL_INVALID_PORT
+        try startInternal(newSettings)
+        log.info("engine rebuild done at \(self.sampleRate, privacy: .public) Hz")
+    }
+
+    /// Resolve a persistent device UID to a runtime `AudioDeviceID` on
+    /// the requested scope. Returns nil if the UID is not present in
+    /// the current device list. CoreAudio's `kAudioHardwarePropertyTranslateUIDToDevice`
+    /// is the documented path; we walk the device list instead to keep
+    /// the dependency direction one-way (the catalog is the source of
+    /// truth, this is just a lookup).
+    private func deviceID(
+        forUID uid: String,
+        scope: AudioObjectPropertyScope
+    ) -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        if AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0, nil,
+            &size
+        ) != noErr || size == 0 {
+            return nil
+        }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        let status = ids.withUnsafeMutableBufferPointer { buf in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                0, nil,
+                &size,
+                buf.baseAddress!
+            )
+        }
+        guard status == noErr else { return nil }
+        // Filter: device must have channels on the requested scope.
+        for id in ids {
+            // UID is scope-global; channel count is scope-specific.
+            var uidAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var cf: Unmanaged<CFString>?
+            var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            let uidStatus = AudioObjectGetPropertyData(
+                id, &uidAddr, 0, nil, &uidSize, &cf
+            )
+            guard uidStatus == noErr, let cfStr = cf?.takeRetainedValue() else {
+                continue
+            }
+            if (cfStr as String) == uid && hasChannels(deviceID: id, scope: scope) {
+                return id
+            }
+        }
+        return nil
+    }
+
+    private func hasChannels(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr,
+              size > 0 else {
+            return false
+        }
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+        defer { buffer.deallocate() }
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, buffer) == noErr else {
+            return false
+        }
+        let list = buffer.assumingMemoryBound(to: AudioBufferList.self)
+        let ablPtr = UnsafeMutableAudioBufferListPointer(list)
+        var total: UInt32 = 0
+        for i in 0..<ablPtr.count {
+            total += ablPtr[i].mNumberChannels
+        }
+        return total > 0
     }
 
     deinit {
@@ -399,8 +623,11 @@ private var enginePtr: OpaquePointer?
     // Installing the IO proc directly gives us the device's natural
     // buffer cadence with every sample present.
 
-    private func installHALInput() throws {
-        let deviceID = try defaultInputDeviceID()
+    /// Engage the input HAL path. With no `preferredDeviceID`, follows
+    /// the system default input. With a specific id (from a UID lookup
+    /// in `AudioDeviceCatalog`), engages exactly that device.
+    private func installHALInput(preferredDeviceID: AudioDeviceID? = nil) throws {
+        let deviceID = try (preferredDeviceID ?? defaultInputDeviceID())
         halCurrentDeviceID = deviceID
 
         // Read the device's native input stream format. We'll downmix
@@ -588,6 +815,15 @@ private var enginePtr: OpaquePointer?
     private func handleDefaultInputChanged() {
         guard halRunning else { return }
 
+        // If the user pinned a specific input UID, ignore default-input
+        // changes — the pinned device IS the device. Only when settings
+        // says "system default" (uid == nil) should this listener drive
+        // a swap.
+        if currentSettings.inputDeviceUID != nil {
+            log.info("default input changed, but user has pinned an input — ignoring")
+            return
+        }
+
         let newID: AudioDeviceID
         do {
             newID = try defaultInputDeviceID()
@@ -634,15 +870,12 @@ private var enginePtr: OpaquePointer?
             halProcID = nil
         }
 
-        // Reuse the install/start helpers — they'll read the new
-        // default-input device and install on it. We override
-        // halCurrentDeviceID for the swap by pointing the listener at
-        // the new value; installHALInput re-reads from
-        // defaultInputDeviceID() so the system must have settled on
-        // newID before this swap runs (true: the listener fired because
-        // the default changed).
-        _ = newID  // newID is implicit via defaultInputDeviceID()
-        try installHALInput()
+        // Install on the exact newID the listener reported, rather than
+        // re-reading the system default. This both makes the call honest
+        // (no implicit-via-side-effect coupling) and lets future callers
+        // (e.g. an explicit applySettings device swap) target a specific
+        // device that may not be the system default.
+        try installHALInput(preferredDeviceID: newID)
         try startHALUnit()
 
         // Reset scratch — the device change is a discontinuity and we
@@ -833,7 +1066,8 @@ private var enginePtr: OpaquePointer?
                 return buffer
             }
             guard status != .error, error == nil else {
-                log.error("converter error: \(error?.localizedDescription ?? "unknown", privacy: .public)")
+                let errDesc = error?.localizedDescription ?? "unknown"
+                log.error("converter error: \(errDesc, privacy: .public)")
                 return
             }
             guard let ch = converted.floatChannelData?[0] else { return }
