@@ -7,7 +7,7 @@ Goal: turn the cabinet from "fixed pipeline, fixed I/O" into "user picks the I/O
 
 Phase 1.4 marked the cabinet *done*; this is the foundation polish before Phase 1.5 (interpretation). Naming it 1.4.8 — not 1.5 — keeps the phase boundary honest: this is live-surface work, not interpretation work.
 
-Status: **planning**. No code written.
+Status: **✓ done.** All six PRs landed (1.4.8.1 → 1.4.8.6). User-facing surface: Cmd-, opens the preferences pane (input/output device + engine sample-rate pickers with engine rebuild + per-device alignment affordance); the main view has a "Debug pane" disclosure with node + port pickers and shape-appropriate widgets (Hz readout, event-magnitude bar, control readout, audio waveform with monitor toggle).
 
 ---
 
