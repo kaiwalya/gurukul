@@ -4,5 +4,5 @@ type: application
 language: rust
 
 dependsOn:
-  - app-core
-  - platform-cli
+  - domain-ports
+  - domain-adapter-clock

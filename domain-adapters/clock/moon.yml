@@ -4,4 +4,4 @@ type: library
 language: rust
 
 dependsOn:
-  - app-core
+  - domain-ports

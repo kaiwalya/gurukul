@@ -20,8 +20,8 @@ members = [
     "dsp/node-onset",
     "dsp/node-synth-breath",
     "dsp/node-breath",
-    "app-core",
-    "platforms/cli",
+    "domain-ports",
+    "domain-adapters/clock",
     "apps/cli",
 ]
 resolver = "2"

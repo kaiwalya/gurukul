@@ -8,5 +8,5 @@ name = "gurukul-cli"
 path = "src/main.rs"
 
 [dependencies]
-app-core = { path = "../../app-core" }
-platform-cli = { path = "../../platforms/cli" }
+domain-ports = { path = "../../domain-ports" }
+domain-adapter-clock = { path = "../../domain-adapters/clock" }

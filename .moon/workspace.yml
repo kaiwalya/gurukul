@@ -26,11 +26,11 @@ projects:
   node-tracer: dsp/node-tracer
   node-vibrato: dsp/node-vibrato
 
-  # app-core layer
-  app-core: app-core
+  # domain ports (trait contracts)
+  domain-ports: domain-ports
 
-  # platform layer
-  platform-cli: platforms/cli
+  # domain adapters (port impls, named for what they adapt, not the host)
+  domain-adapter-clock: domain-adapters/clock
 
   # apps
   app-cli: apps/cli

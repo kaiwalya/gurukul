@@ -1,7 +1,6 @@
 [package]
-name = "platform-cli"
+name = "domain-ports"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-app-core = { path = "../../app-core" }
