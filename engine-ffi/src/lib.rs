@@ -79,6 +79,13 @@ pub struct GurukulEngine {
     in_port_ids: Vec<CString>,
     /// Null-terminated copies of out-port ids. Returned by `engine_out_port_id`.
     out_port_ids: Vec<CString>,
+    /// Null-terminated copies of every node id in topo order. Returned by
+    /// `engine_node_ids` for runtime port enumeration (debug UI, scopes).
+    node_id_cstrings: Vec<CString>,
+    /// Per-node null-terminated output port names, indexed by topo-order
+    /// node position. Returned by `engine_out_port_names`. Built once at
+    /// engine construction so the FFI does not allocate per call.
+    node_out_port_cstrings: Vec<Vec<CString>>,
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -164,10 +171,38 @@ pub extern "C" fn engine_build(
                         CString::new(s.id.as_str()).unwrap_or_else(|_| CString::new("?").unwrap())
                     })
                     .collect();
+                // Cache node ids (topo order) and per-node output port names
+                // so engine_node_ids / engine_out_port_names return stable
+                // *const c_char pointers without per-call allocation.
+                let node_id_cstrings: Vec<CString> = engine
+                    .node_ids()
+                    .iter()
+                    .map(|id| {
+                        CString::new(id.as_str()).unwrap_or_else(|_| CString::new("?").unwrap())
+                    })
+                    .collect();
+                let node_out_port_cstrings: Vec<Vec<CString>> = engine
+                    .node_ids()
+                    .iter()
+                    .map(|id| {
+                        // node_ids() came from the engine itself; out_port_names()
+                        // cannot fail on the same ids.
+                        engine
+                            .out_port_names(id)
+                            .expect("node id from engine.node_ids() must resolve")
+                            .iter()
+                            .map(|name| {
+                                CString::new(*name).unwrap_or_else(|_| CString::new("?").unwrap())
+                            })
+                            .collect()
+                    })
+                    .collect();
                 let boxed = Box::new(GurukulEngine {
                     engine,
                     in_port_ids,
                     out_port_ids,
+                    node_id_cstrings,
+                    node_out_port_cstrings,
                 });
                 // SAFETY: out_engine is non-null (checked above).
                 unsafe { *out_engine = Box::into_raw(boxed) };
@@ -485,6 +520,214 @@ pub extern "C" fn engine_out_port(
     }));
     result.unwrap_or_else(|_| {
         error::set_last_error("panic in engine_out_port");
+        GURUKUL_ERR_UNKNOWN
+    })
+}
+
+// ─── Runtime port enumeration ───────────────────────────────────────────────
+
+/// Fill `out` with up to `cap` pointers to node ids in topological (process)
+/// order, and return the total number of nodes in the engine.
+///
+/// If the return value is greater than `cap`, the caller's buffer was too
+/// small and only the first `cap` entries were written. Re-allocate and call
+/// again. Passing `out = NULL` and `cap = 0` is a valid way to query the count.
+///
+/// The returned `const char*` pointers are into engine-owned memory and are
+/// valid until `engine_free` is called. Never free them. Returns 0 if `engine`
+/// is null.
+///
+/// NOT realtime-safe: intended for build-time / picker-open use. Do not call
+/// per audio callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_node_ids(
+    engine: *const GurukulEngine,
+    out: *mut *const c_char,
+    cap: usize,
+) -> usize {
+    if engine.is_null() {
+        return 0;
+    }
+    // SAFETY: pointer came from engine_build and has not been freed.
+    let ids = unsafe { &(*engine).node_id_cstrings };
+    let n = ids.len();
+    if !out.is_null() && cap > 0 {
+        let to_write = n.min(cap);
+        for (i, cstring) in ids.iter().take(to_write).enumerate() {
+            // SAFETY: out is non-null, i < cap ≤ caller's allocation.
+            unsafe { *out.add(i) = cstring.as_ptr() };
+        }
+    }
+    n
+}
+
+/// Fill `out` with up to `cap` pointers to output port names of `node_id`,
+/// in declaration order. On success, writes the total port count to
+/// `*out_total` and returns `GURUKUL_OK`. If `*out_total > cap` the caller's
+/// buffer was too small and only the first `cap` entries were written.
+///
+/// Passing `out = NULL` and `cap = 0` is a valid way to query the count.
+/// `out_total` must be non-null.
+///
+/// The returned `const char*` pointers are into engine-owned memory and are
+/// valid until `engine_free` is called.
+///
+/// Returns `GURUKUL_ERR_INVALID_HANDLE` for null `engine`, null `node_id`,
+/// or null `out_total`. Returns `GURUKUL_ERR_NOT_FOUND` if `node_id` is not
+/// a recognised node in this engine; in that case `*out_total` is not
+/// modified.
+///
+/// NOT realtime-safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_out_port_names(
+    engine: *const GurukulEngine,
+    node_id: *const c_char,
+    out: *mut *const c_char,
+    cap: usize,
+    out_total: *mut usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if engine.is_null() {
+            error::set_last_error("engine pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        if node_id.is_null() {
+            error::set_last_error("node_id pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        if out_total.is_null() {
+            error::set_last_error("out_total pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        // SAFETY: caller guarantees a null-terminated UTF-8 string.
+        let id_str = match unsafe { CStr::from_ptr(node_id) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                error::set_last_error("node_id is not valid UTF-8");
+                return GURUKUL_ERR_INVALID_HANDLE;
+            }
+        };
+        // SAFETY: pointer came from engine_build and has not been freed.
+        let eng_ref = unsafe { &*engine };
+        // node_id_cstrings and node_out_port_cstrings share the same
+        // topo-order indexing (both built from engine.node_ids()), so we
+        // map id → index by a single linear search over the cached ids.
+        let topo_pos = match eng_ref
+            .node_id_cstrings
+            .iter()
+            .position(|c| c.to_bytes() == id_str.as_bytes())
+        {
+            Some(i) => i,
+            None => {
+                error::set_last_error(&format!("node '{id_str}' not found"));
+                return error::GURUKUL_ERR_NOT_FOUND;
+            }
+        };
+        let names = &eng_ref.node_out_port_cstrings[topo_pos];
+        let n = names.len();
+        if !out.is_null() && cap > 0 {
+            let to_write = n.min(cap);
+            for (i, cstring) in names.iter().take(to_write).enumerate() {
+                // SAFETY: out is non-null, i < cap ≤ caller's allocation.
+                unsafe { *out.add(i) = cstring.as_ptr() };
+            }
+        }
+        // SAFETY: out_total is non-null (checked above).
+        unsafe { *out_total = n };
+        GURUKUL_OK
+    }));
+    result.unwrap_or_else(|_| {
+        error::set_last_error("panic in engine_out_port_names");
+        GURUKUL_ERR_UNKNOWN
+    })
+}
+
+/// Read the last block written to any node's output port, addressed by
+/// `(node_id, port_name)` strings.
+///
+/// On success: `*out_ptr` points to `const float[*out_len]` of the most-recent
+/// block's samples for that port, and `GURUKUL_OK` is returned. `*out_len`
+/// matches the `n_frames` of the most recent `engine_process_block` (0 before
+/// any call).
+///
+/// Pointer lifetime: valid until the next `engine_process_block` or
+/// `engine_free` call — identical to `engine_out_port`.
+///
+/// Threading: realtime-safe **only** when called from the audio thread
+/// between `engine_process_block` calls, the same discipline as
+/// `engine_out_port`. Reading from a different thread races against the
+/// audio thread's writes and will see torn data.
+///
+/// String lookup does happen on each call (this is what makes it "read by
+/// path" rather than "read by handle"). For a port consumed every block,
+/// prefer `engine_out_port` with a pre-resolved handle. `engine_read_port`
+/// is for ports addressed by name — debug UI, scopes, future subscription
+/// consumers — where the lookup cost is incidental.
+///
+/// Naming: the underlying Rust `Engine::peek` carries a "debug affordance,
+/// not production read API" warning. The FFI surface uses a stable name
+/// (`engine_read_port`) so the cabinet binds to the verb, not the current
+/// implementation. When the subscribe-by-path API named in ARCHITECTURE.md
+/// lands, this function's implementation may swap to it without rename.
+///
+/// Returns `GURUKUL_ERR_INVALID_HANDLE` for null pointers, or
+/// `GURUKUL_ERR_NOT_FOUND` if `node_id` or `port` is not recognised.
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_read_port(
+    engine: *const GurukulEngine,
+    node_id: *const c_char,
+    port: *const c_char,
+    out_ptr: *mut *const f32,
+    out_len: *mut usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if engine.is_null() {
+            error::set_last_error("engine pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        if node_id.is_null() || port.is_null() {
+            error::set_last_error("node_id or port pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        if out_ptr.is_null() || out_len.is_null() {
+            error::set_last_error("out_ptr or out_len is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+
+        // SAFETY: caller guarantees null-terminated UTF-8 strings.
+        let node_str = match unsafe { CStr::from_ptr(node_id) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                error::set_last_error("node_id is not valid UTF-8");
+                return GURUKUL_ERR_INVALID_HANDLE;
+            }
+        };
+        let port_str = match unsafe { CStr::from_ptr(port) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                error::set_last_error("port is not valid UTF-8");
+                return GURUKUL_ERR_INVALID_HANDLE;
+            }
+        };
+
+        // SAFETY: pointer came from engine_build and has not been freed.
+        match unsafe { (*engine).engine.peek(node_str, port_str) } {
+            Ok(slice) => {
+                // SAFETY: out_ptr and out_len are non-null (checked above).
+                unsafe {
+                    *out_ptr = slice.as_ptr();
+                    *out_len = slice.len();
+                }
+                GURUKUL_OK
+            }
+            Err(e) => {
+                error::set_last_error(&format!("engine_read_port: {e}"));
+                error::GURUKUL_ERR_NOT_FOUND
+            }
+        }
+    }));
+    result.unwrap_or_else(|_| {
+        error::set_last_error("panic in engine_read_port");
         GURUKUL_ERR_UNKNOWN
     })
 }

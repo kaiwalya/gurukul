@@ -747,6 +747,12 @@ impl Engine {
     /// This is a debug / test affordance for inspecting internal ports without
     /// splicing a Tracer node into the graph. NOT the production read API —
     /// do not build host code on this.
+    ///
+    /// Lifetime contract: `output_buffers` is sized once during `build` and
+    /// never reallocated thereafter — `process_block` writes in place. The
+    /// returned slice is therefore valid until the next `process_block`
+    /// (which overwrites the contents) or engine drop. The engine-ffi
+    /// `engine_read_port` function relies on this invariant.
     pub fn peek(&self, node_id: &str, port: &str) -> Result<&[f32], EngineError> {
         let node_idx = self
             .node_index

@@ -307,3 +307,303 @@ fn smoke_null_engine_returns_error() {
     let rc2 = engine_ffi::engine_in_port(ptr::null_mut(), 0, &mut dummy_ptr, &mut dummy_len);
     assert!(rc2 < 0);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// PR 1.4.8.2: runtime port enumeration + engine_read_port
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Two-node world used to exercise enumeration with cap < n:
+///   SynthSine("src")  ──audio_out──►  Passthrough("pt").audio_in ──audio_out──► out
+const TWO_NODE_WORLD_JSON: &str = r#"{
+    "world_version": 1,
+    "in_ports": [],
+    "out_ports": [{ "id": "out" }],
+    "nodes": [
+        { "id": "src", "type": "SynthSine", "params": { "freq": 440.0, "amplitude": 0.5 } },
+        { "id": "pt",  "type": "Passthrough" }
+    ],
+    "connections": [
+        { "from": "src.audio_out", "to": "pt.audio_in" },
+        { "from": "pt.audio_out",  "to": "out" }
+    ]
+}"#;
+
+#[test]
+fn smoke_node_ids_enumeration() {
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    // Count-only query.
+    let n = engine_ffi::engine_node_ids(engine_ptr, ptr::null_mut(), 0);
+    assert_eq!(n, 1, "WORLD_JSON has one node");
+
+    // Buffer exactly large enough.
+    let mut tiny: [*const std::os::raw::c_char; 1] = [ptr::null()];
+    let n2 = engine_ffi::engine_node_ids(engine_ptr, tiny.as_mut_ptr(), 1);
+    assert_eq!(n2, 1);
+    assert!(!tiny[0].is_null());
+    // SAFETY: pointer is engine-owned, valid until engine_free.
+    let id = unsafe { CStr::from_ptr(tiny[0]) }.to_str().unwrap();
+    assert_eq!(id, "src");
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_node_ids_truncation_writes_first_cap_entries() {
+    // Two-node world; cap=1 must write the first id and still return total=2.
+    let world_json = cstr(TWO_NODE_WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    // Count-only confirms the world has 2 nodes.
+    let total = engine_ffi::engine_node_ids(engine_ptr, ptr::null_mut(), 0);
+    assert_eq!(total, 2);
+
+    // Sentinel after the first slot — must not be overwritten when cap=1.
+    let sentinel: *const std::os::raw::c_char = 0xDEAD_BEEF as *const _;
+    let mut buf: [*const std::os::raw::c_char; 2] = [ptr::null(), sentinel];
+    let n = engine_ffi::engine_node_ids(engine_ptr, buf.as_mut_ptr(), 1);
+    assert_eq!(n, 2, "total count returned even when cap < total");
+    assert!(!buf[0].is_null(), "first slot must be written");
+    assert_eq!(
+        buf[1], sentinel,
+        "out-of-range slots must NOT be touched when cap < total"
+    );
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_out_port_names_enumeration() {
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    // SynthSine has one output: audio_out.
+    let node_id = cstr("src");
+    let mut total: usize = 999;
+    let rc = engine_ffi::engine_out_port_names(
+        engine_ptr,
+        node_id.as_ptr(),
+        ptr::null_mut(),
+        0,
+        &mut total,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(total, 1);
+
+    let mut buf: [*const std::os::raw::c_char; 4] = [ptr::null(); 4];
+    let mut total2: usize = 0;
+    let rc2 = engine_ffi::engine_out_port_names(
+        engine_ptr,
+        node_id.as_ptr(),
+        buf.as_mut_ptr(),
+        4,
+        &mut total2,
+    );
+    assert_eq!(rc2, 0);
+    assert_eq!(total2, 1);
+    // SAFETY: pointer is engine-owned, valid until engine_free.
+    let name = unsafe { CStr::from_ptr(buf[0]) }.to_str().unwrap();
+    assert_eq!(name, "audio_out");
+
+    // Unknown node returns GURUKUL_ERR_NOT_FOUND; *out_total is not modified.
+    let bogus = cstr("nope");
+    let mut total3: usize = 999;
+    let rc3 = engine_ffi::engine_out_port_names(
+        engine_ptr,
+        bogus.as_ptr(),
+        ptr::null_mut(),
+        0,
+        &mut total3,
+    );
+    assert_eq!(rc3, -4, "GURUKUL_ERR_NOT_FOUND for unknown node");
+    assert_eq!(total3, 999, "*out_total must not be modified on not-found");
+    let msg_ptr = engine_ffi::engine_last_error_message();
+    assert!(!msg_ptr.is_null());
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_enumeration_pointers_survive_process_block() {
+    // The cached CString pointers must remain valid (same address, same bytes)
+    // across engine_process_block calls — that is the contract the header
+    // claims ("valid until engine_free").
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    let mut nodes: [*const std::os::raw::c_char; 1] = [ptr::null()];
+    let _ = engine_ffi::engine_node_ids(engine_ptr, nodes.as_mut_ptr(), 1);
+    let before = nodes[0];
+    assert!(!before.is_null());
+
+    // SAFETY: pointer valid until engine_free; copy the bytes for later cmp.
+    let before_bytes = unsafe { CStr::from_ptr(before) }.to_bytes().to_vec();
+
+    let rc = engine_ffi::engine_process_block(engine_ptr, 64);
+    assert_eq!(rc, 0);
+
+    // Re-enumerate and confirm pointer identity + contents survive.
+    let mut nodes2: [*const std::os::raw::c_char; 1] = [ptr::null()];
+    let _ = engine_ffi::engine_node_ids(engine_ptr, nodes2.as_mut_ptr(), 1);
+    assert_eq!(nodes2[0], before, "cached pointer must be the same address");
+    let after_bytes = unsafe { CStr::from_ptr(nodes2[0]) }.to_bytes();
+    assert_eq!(after_bytes, before_bytes.as_slice());
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_read_port_round_trips_against_out_port() {
+    // engine_read_port must produce the same samples as engine_out_port for
+    // the same underlying buffer when called immediately after process_block.
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    // Run one block.
+    let rc = engine_ffi::engine_process_block(engine_ptr, 64);
+    assert_eq!(rc, 0);
+
+    // Read via engine_read_port (the new path, by name).
+    let node = cstr("src");
+    let port = cstr("audio_out");
+    let mut read_ptr: *const f32 = ptr::null();
+    let mut read_len: usize = 0;
+    let rc = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        port.as_ptr(),
+        &mut read_ptr,
+        &mut read_len,
+    );
+    assert_eq!(rc, 0, "engine_read_port must return GURUKUL_OK");
+    assert_eq!(
+        read_len, 64,
+        "read_len must match the n_frames just processed"
+    );
+    assert!(!read_ptr.is_null());
+
+    // Read the boundary-mapped same port via engine_out_port for comparison.
+    let out_id = cstr("out");
+    let h_out = engine_ffi::engine_resolve_out_port(engine_ptr, out_id.as_ptr());
+    assert_ne!(h_out, GURUKUL_INVALID_PORT);
+    let mut bnd_ptr: *const f32 = ptr::null();
+    let mut bnd_len: usize = 0;
+    let rc = engine_ffi::engine_out_port(engine_ptr, h_out, &mut bnd_ptr, &mut bnd_len);
+    assert_eq!(rc, 0);
+
+    // SAFETY: both pointers point to engine-owned memory valid until next
+    // process_block. We haven't called process_block in between.
+    let read_slice = unsafe { std::slice::from_raw_parts(read_ptr, read_len) };
+    let bnd_slice = unsafe { std::slice::from_raw_parts(bnd_ptr, bnd_len) };
+    assert_eq!(
+        read_slice, bnd_slice,
+        "engine_read_port(src.audio_out) must equal engine_out_port(out) — \
+         they address the same underlying buffer"
+    );
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_read_port_unknown_returns_not_found() {
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    // Process one block so there's a buffer to read.
+    let _ = engine_ffi::engine_process_block(engine_ptr, 64);
+
+    let bogus_node = cstr("nope");
+    let port = cstr("audio_out");
+    let mut p: *const f32 = ptr::null();
+    let mut l: usize = 0;
+    let rc = engine_ffi::engine_read_port(
+        engine_ptr,
+        bogus_node.as_ptr(),
+        port.as_ptr(),
+        &mut p,
+        &mut l,
+    );
+    assert_eq!(
+        rc, -4,
+        "expected GURUKUL_ERR_NOT_FOUND (-4) for unknown node"
+    );
+
+    let good_node = cstr("src");
+    let bogus_port = cstr("no_such_port");
+    let rc2 = engine_ffi::engine_read_port(
+        engine_ptr,
+        good_node.as_ptr(),
+        bogus_port.as_ptr(),
+        &mut p,
+        &mut l,
+    );
+    assert_eq!(
+        rc2, -4,
+        "expected GURUKUL_ERR_NOT_FOUND for unknown port on a known node"
+    );
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_read_port_null_args_return_invalid_handle() {
+    // All null-pointer paths must return GURUKUL_ERR_INVALID_HANDLE without
+    // crashing. Each variant exercises a different null check.
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    let node = cstr("src");
+    let port = cstr("audio_out");
+    let mut p: *const f32 = ptr::null();
+    let mut l: usize = 0;
+
+    // 1. null engine.
+    let rc1 =
+        engine_ffi::engine_read_port(ptr::null(), node.as_ptr(), port.as_ptr(), &mut p, &mut l);
+    assert_eq!(rc1, -2);
+
+    // 2. null node_id.
+    let rc2 = engine_ffi::engine_read_port(engine_ptr, ptr::null(), port.as_ptr(), &mut p, &mut l);
+    assert_eq!(rc2, -2);
+
+    // 3. null port.
+    let rc3 = engine_ffi::engine_read_port(engine_ptr, node.as_ptr(), ptr::null(), &mut p, &mut l);
+    assert_eq!(rc3, -2);
+
+    // 4. null out_ptr.
+    let rc4 = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        port.as_ptr(),
+        ptr::null_mut(),
+        &mut l,
+    );
+    assert_eq!(rc4, -2);
+
+    // 5. null out_len.
+    let rc5 = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        port.as_ptr(),
+        &mut p,
+        ptr::null_mut(),
+    );
+    assert_eq!(rc5, -2);
+
+    engine_ffi::engine_free(engine_ptr);
+}

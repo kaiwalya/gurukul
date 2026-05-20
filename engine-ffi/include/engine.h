@@ -14,11 +14,17 @@
  * engine_reset) may touch the thread-local error state and should be called
  * from a non-realtime thread.
  *
- * Audio-thread calls (engine_in_port, engine_out_port,
- * engine_process_block) are realtime-safe: no allocation, no locks, no
- * string lookup.  They may still return error codes for programmer errors
- * (null handle, oversized block), which the host should treat as fatal bugs
- * caught during development.
+ * Audio-thread calls (engine_in_port, engine_out_port, engine_read_port,
+ * engine_process_block) are realtime-safe when called between
+ * engine_process_block calls: no allocation, no locks.  engine_in_port and
+ * engine_out_port avoid string lookup (handle-based); engine_read_port does
+ * a name lookup on each call and is only intended for ports addressed by
+ * path (debug UI, scopes).  These may still return error codes for
+ * programmer errors (null handle, oversized block), which the host should
+ * treat as fatal bugs caught during development.
+ *
+ * Enumeration calls (engine_node_ids, engine_out_port_names) are NOT
+ * realtime-safe: intended for build-time or picker-open use.
  *
  * Error reporting
  * ---------------
@@ -179,6 +185,49 @@ GurukulInPort engine_resolve_in_port(const GurukulEngine *engine, const char *id
  */
 GurukulOutPort engine_resolve_out_port(const GurukulEngine *engine, const char *id);
 
+/* ── Runtime port enumeration ─────────────────────────────────────────────── */
+
+/**
+ * Fill `out` with up to `cap` pointers to node ids (in topological / process
+ * order) and return the total number of nodes in the engine.
+ *
+ * If the return value is greater than `cap`, the caller's buffer was too small
+ * and only the first `cap` entries were written.  Re-allocate and call again.
+ * Passing out=NULL and cap=0 is a valid way to query the count.
+ *
+ * Returned pointers are into engine-owned memory and are valid until
+ * engine_free is called.  Never free them.  Returns 0 if engine is NULL.
+ *
+ * NOT realtime-safe: intended for build-time or picker-open use (e.g.
+ * populating a debug UI's node dropdown).  Do not call per audio callback.
+ */
+size_t engine_node_ids(
+    const GurukulEngine  *engine,
+    const char          **out,
+    size_t                cap);
+
+/**
+ * Fill `out` with up to `cap` pointers to output port names of `node_id`
+ * (in declaration order).  On success, writes the total port count to
+ * *out_total and returns GURUKUL_OK.  If *out_total > cap the caller's
+ * buffer was too small; re-allocate and call again.  Passing out=NULL and
+ * cap=0 is a valid way to query the count (out_total still required).
+ *
+ * Same pointer lifetime as engine_node_ids (valid until engine_free).
+ *
+ * Returns GURUKUL_ERR_INVALID_HANDLE for null engine / node_id / out_total.
+ * Returns GURUKUL_ERR_NOT_FOUND if node_id is not a recognised node in this
+ * engine; in that case *out_total is not modified.
+ *
+ * NOT realtime-safe.
+ */
+int32_t engine_out_port_names(
+    const GurukulEngine  *engine,
+    const char           *node_id,
+    const char          **out,
+    size_t                cap,
+    size_t               *out_total);
+
 /* ── I/O buffer access ────────────────────────────────────────────────────── */
 
 /**
@@ -220,6 +269,38 @@ int32_t engine_in_port(
 int32_t engine_out_port(
     const GurukulEngine  *engine,
     GurukulOutPort        handle,
+    const float         **out_ptr,
+    size_t               *out_len);
+
+/**
+ * Read the last block written to any node's output port, addressed by
+ * (node_id, port) strings.
+ *
+ * On success: *out_ptr points to const float[*out_len] of the most-recent
+ * block's samples and GURUKUL_OK is returned.  *out_len matches the n_frames
+ * of the most recent engine_process_block (0 before any call).
+ *
+ * Pointer lifetime: valid until the next engine_process_block or engine_free
+ * — identical to engine_out_port.
+ *
+ * Threading: realtime-safe ONLY when called from the audio thread between
+ * engine_process_block calls, the same discipline as engine_out_port.
+ * Reading from a different thread races against the audio thread's writes
+ * and will see torn data.  Cabinets should push samples into an SPSC slot
+ * here and let the UI read the slot, never the engine.
+ *
+ * String lookup happens on every call (that is the point — read by name,
+ * not by handle).  For a port consumed every block, prefer engine_out_port
+ * with a pre-resolved handle.  Use engine_read_port for ports addressed by
+ * name: debug UI selections, scopes, future subscription consumers.
+ *
+ * Returns GURUKUL_ERR_INVALID_HANDLE for null pointers, or
+ * GURUKUL_ERR_NOT_FOUND if node_id or port is not recognised.
+ */
+int32_t engine_read_port(
+    const GurukulEngine  *engine,
+    const char           *node_id,
+    const char           *port,
     const float         **out_ptr,
     size_t               *out_len);
 

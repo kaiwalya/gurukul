@@ -6,11 +6,11 @@ pub const GURUKUL_OK: i32 = 0;
 pub const GURUKUL_ERR_UNKNOWN: i32 = -1;
 pub const GURUKUL_ERR_INVALID_HANDLE: i32 = -2;
 pub const GURUKUL_ERR_BUILD_FAILED: i32 = -3;
-/// Returned by future functions that look up a resource by id and find nothing.
-/// Currently not used directly in function return codes (resolve functions
-/// return `GURUKUL_INVALID_PORT` instead), but defined here for completeness
-/// and kept in sync with the engine.h header.
-#[allow(dead_code)]
+/// Returned by functions that look up a resource by id and find nothing.
+/// Used by `engine_read_port` when the requested node or port name is
+/// unknown. Resolve functions (`engine_resolve_in_port`,
+/// `engine_resolve_out_port`) return `GURUKUL_INVALID_PORT` instead, since
+/// their return type is a port-handle u32, not an error code.
 pub const GURUKUL_ERR_NOT_FOUND: i32 = -4;
 pub const GURUKUL_ERR_BLOCK_TOO_BIG: i32 = -5;
 
