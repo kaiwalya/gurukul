@@ -112,6 +112,49 @@ final class DebugTapSlot {
         latest.store(target, ordering: .releasing)
     }
 
+    /// Prescriptive-border write: pick the target slot, hand back its
+    /// destination pointer and capacity. The caller writes into it
+    /// directly (e.g. via `engine_read_port`) and then calls
+    /// `commitWrite(writtenCount:)` to publish. Wait-free.
+    ///
+    /// This avoids the intermediate engine→Swift→slot copy that the older
+    /// `store(src:count:)` path performs: the engine writes straight into
+    /// the slot's storage. The returned pointer is valid until the next
+    /// `commitWrite` / `store` / `clear` call on this slot.
+    ///
+    /// Returns: (`destination buffer`, `capacity in floats`).
+    func beginWrite() -> (UnsafeMutablePointer<Float>, Int) {
+        let cur = latest.load(ordering: .relaxed)
+        let claim = readerClaim.load(ordering: .relaxed)
+        let target: UInt8
+        if cur != 0 && claim != 0 {
+            target = 0
+        } else if cur != 1 && claim != 1 {
+            target = 1
+        } else {
+            target = 2
+        }
+        pendingTarget = target
+        let base = storage.advanced(by: Int(target) * kDebugTapMaxSamples)
+        return (base, kDebugTapMaxSamples)
+    }
+
+    /// Pairs with `beginWrite()`. Stamps the slot's header with the given
+    /// `seq` / `typeTag` / `written` and atomically publishes the slot.
+    /// `written` is clamped to `kDebugTapMaxSamples`.
+    func commitWrite(seq: UInt32, typeTag: DebugTapTypeTag, written: Int) {
+        let target = pendingTarget
+        let capped = min(written, kDebugTapMaxSamples)
+        seqs[Int(target)] = seq
+        typeTags[Int(target)] = typeTag
+        lens[Int(target)] = UInt16(capped)
+        latest.store(target, ordering: .releasing)
+    }
+
+    /// Slot chosen by the most recent `beginWrite()`; consumed by
+    /// `commitWrite`. SPSC audio-thread-only — no atomic needed.
+    private var pendingTarget: UInt8 = 0
+
     /// Audio thread (or any thread between audio-thread runs) clears the
     /// slot. Publishes an empty snapshot so any in-flight UI read sees
     /// `len = 0` and renders nothing. Called from the engine rebuild /

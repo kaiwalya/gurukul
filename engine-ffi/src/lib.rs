@@ -643,32 +643,39 @@ pub extern "C" fn engine_out_port_names(
 }
 
 /// Read the last block written to any node's output port, addressed by
-/// `(node_id, port_name)` strings.
+/// `(node_id, port_name)` strings. The engine copies frames into the
+/// caller-provided destination buffer.
 ///
-/// On success: `*out_ptr` points to `const float[*out_len]` of the most-recent
-/// block's samples for that port, and `GURUKUL_OK` is returned. `*out_len`
-/// matches the `n_frames` of the most recent `engine_process_block` (0 before
-/// any call).
+/// On success: `dst[0..*written]` holds the most-recent block's samples
+/// for that port, and `GURUKUL_OK` is returned. `*written` is
+/// `min(dst_capacity, last_block_n_frames)`. Once this call returns the
+/// caller owns the bytes — subsequent `engine_process_block` /
+/// `engine_reset` / `engine_free` activity will not affect them.
 ///
-/// Pointer lifetime: valid until the next `engine_process_block` or
-/// `engine_free` call — identical to `engine_out_port`.
+/// This is the prescriptive-border read API. No engine-owned pointer
+/// escapes; callers do not need to obey a "valid until next
+/// process_block" lifetime contract.
 ///
 /// Threading: realtime-safe **only** when called from the audio thread
-/// between `engine_process_block` calls, the same discipline as
-/// `engine_out_port`. Reading from a different thread races against the
-/// audio thread's writes and will see torn data.
+/// between `engine_process_block` calls. Reading from a different thread
+/// races against the audio thread's writes and will see torn data.
 ///
-/// String lookup does happen on each call (this is what makes it "read by
+/// `dst_capacity` should be at least `engine_block_size(engine)` so the
+/// whole block fits. A shorter buffer is permitted; the leading prefix
+/// is copied and the rest of the block is silently dropped (use
+/// `*written` to detect this).
+///
+/// String lookup happens on each call (this is what makes it "read by
 /// path" rather than "read by handle"). For a port consumed every block,
 /// prefer `engine_out_port` with a pre-resolved handle. `engine_read_port`
 /// is for ports addressed by name — debug UI, scopes, future subscription
 /// consumers — where the lookup cost is incidental.
 ///
-/// Naming: the underlying Rust `Engine::peek` carries a "debug affordance,
-/// not production read API" warning. The FFI surface uses a stable name
-/// (`engine_read_port`) so the cabinet binds to the verb, not the current
-/// implementation. When the subscribe-by-path API named in ARCHITECTURE.md
-/// lands, this function's implementation may swap to it without rename.
+/// Naming: the underlying Rust `Engine::read_into` is the production
+/// "read by path" entry point. The FFI surface uses a stable name
+/// (`engine_read_port`) so the cabinet binds to the verb. When the
+/// subscribe-by-path API named in ARCHITECTURE.md lands, this function's
+/// implementation may swap to it without rename.
 ///
 /// Returns `GURUKUL_ERR_INVALID_HANDLE` for null pointers, or
 /// `GURUKUL_ERR_NOT_FOUND` if `node_id` or `port` is not recognised.
@@ -677,8 +684,9 @@ pub extern "C" fn engine_read_port(
     engine: *const GurukulEngine,
     node_id: *const c_char,
     port: *const c_char,
-    out_ptr: *mut *const f32,
-    out_len: *mut usize,
+    dst: *mut f32,
+    dst_capacity: usize,
+    written: *mut usize,
 ) -> i32 {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if engine.is_null() {
@@ -689,8 +697,12 @@ pub extern "C" fn engine_read_port(
             error::set_last_error("node_id or port pointer is null");
             return GURUKUL_ERR_INVALID_HANDLE;
         }
-        if out_ptr.is_null() || out_len.is_null() {
-            error::set_last_error("out_ptr or out_len is null");
+        if written.is_null() {
+            error::set_last_error("written pointer is null");
+            return GURUKUL_ERR_INVALID_HANDLE;
+        }
+        if dst.is_null() && dst_capacity != 0 {
+            error::set_last_error("dst is null but dst_capacity > 0");
             return GURUKUL_ERR_INVALID_HANDLE;
         }
 
@@ -710,14 +722,21 @@ pub extern "C" fn engine_read_port(
             }
         };
 
+        // SAFETY: dst is non-null when dst_capacity > 0 (checked above),
+        // and the caller guarantees it's valid for writes of dst_capacity
+        // f32s. When dst_capacity == 0 the slice is empty and dst is
+        // never dereferenced.
+        let dst_slice: &mut [f32] = if dst_capacity == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(dst, dst_capacity) }
+        };
+
         // SAFETY: pointer came from engine_build and has not been freed.
-        match unsafe { (*engine).engine.peek(node_str, port_str) } {
-            Ok(slice) => {
-                // SAFETY: out_ptr and out_len are non-null (checked above).
-                unsafe {
-                    *out_ptr = slice.as_ptr();
-                    *out_len = slice.len();
-                }
+        match unsafe { (*engine).engine.read_into(node_str, port_str, dst_slice) } {
+            Ok(n) => {
+                // SAFETY: written is non-null (checked above).
+                unsafe { *written = n };
                 GURUKUL_OK
             }
             Err(e) => {

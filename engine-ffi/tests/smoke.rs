@@ -474,24 +474,24 @@ fn smoke_read_port_round_trips_against_out_port() {
     let rc = engine_ffi::engine_process_block(engine_ptr, 64);
     assert_eq!(rc, 0);
 
-    // Read via engine_read_port (the new path, by name).
+    // Read via engine_read_port — caller provides the destination buffer.
     let node = cstr("src");
     let port = cstr("audio_out");
-    let mut read_ptr: *const f32 = ptr::null();
-    let mut read_len: usize = 0;
+    let mut read_buf = vec![0.0f32; 64];
+    let mut written: usize = 0;
     let rc = engine_ffi::engine_read_port(
         engine_ptr,
         node.as_ptr(),
         port.as_ptr(),
-        &mut read_ptr,
-        &mut read_len,
+        read_buf.as_mut_ptr(),
+        read_buf.len(),
+        &mut written,
     );
     assert_eq!(rc, 0, "engine_read_port must return GURUKUL_OK");
     assert_eq!(
-        read_len, 64,
-        "read_len must match the n_frames just processed"
+        written, 64,
+        "written must match the n_frames just processed"
     );
-    assert!(!read_ptr.is_null());
 
     // Read the boundary-mapped same port via engine_out_port for comparison.
     let out_id = cstr("out");
@@ -502,14 +502,45 @@ fn smoke_read_port_round_trips_against_out_port() {
     let rc = engine_ffi::engine_out_port(engine_ptr, h_out, &mut bnd_ptr, &mut bnd_len);
     assert_eq!(rc, 0);
 
-    // SAFETY: both pointers point to engine-owned memory valid until next
-    // process_block. We haven't called process_block in between.
-    let read_slice = unsafe { std::slice::from_raw_parts(read_ptr, read_len) };
+    // SAFETY: engine_out_port pointer is valid until next process_block.
     let bnd_slice = unsafe { std::slice::from_raw_parts(bnd_ptr, bnd_len) };
     assert_eq!(
-        read_slice, bnd_slice,
+        &read_buf[..written],
+        bnd_slice,
         "engine_read_port(src.audio_out) must equal engine_out_port(out) — \
          they address the same underlying buffer"
+    );
+
+    engine_ffi::engine_free(engine_ptr);
+}
+
+#[test]
+fn smoke_read_port_short_dst_truncates() {
+    // dst shorter than block size: the leading prefix is copied, written
+    // reflects what fit. This is the documented partial-copy behaviour.
+    let world_json = cstr(WORLD_JSON);
+    let mut engine_ptr: *mut engine_ffi::GurukulEngine = ptr::null_mut();
+    let rc = engine_ffi::engine_build(world_json.as_ptr(), 48_000, 64, &mut engine_ptr);
+    assert_eq!(rc, 0);
+
+    let _ = engine_ffi::engine_process_block(engine_ptr, 64);
+
+    let node = cstr("src");
+    let port = cstr("audio_out");
+    let mut short_buf = vec![0.0f32; 16];
+    let mut written: usize = 0;
+    let rc = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        port.as_ptr(),
+        short_buf.as_mut_ptr(),
+        short_buf.len(),
+        &mut written,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        written, 16,
+        "short dst should receive its capacity, no more"
     );
 
     engine_ffi::engine_free(engine_ptr);
@@ -527,14 +558,15 @@ fn smoke_read_port_unknown_returns_not_found() {
 
     let bogus_node = cstr("nope");
     let port = cstr("audio_out");
-    let mut p: *const f32 = ptr::null();
-    let mut l: usize = 0;
+    let mut buf = vec![0.0f32; 64];
+    let mut written: usize = 0;
     let rc = engine_ffi::engine_read_port(
         engine_ptr,
         bogus_node.as_ptr(),
         port.as_ptr(),
-        &mut p,
-        &mut l,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut written,
     );
     assert_eq!(
         rc, -4,
@@ -547,8 +579,9 @@ fn smoke_read_port_unknown_returns_not_found() {
         engine_ptr,
         good_node.as_ptr(),
         bogus_port.as_ptr(),
-        &mut p,
-        &mut l,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut written,
     );
     assert_eq!(
         rc2, -4,
@@ -569,41 +602,75 @@ fn smoke_read_port_null_args_return_invalid_handle() {
 
     let node = cstr("src");
     let port = cstr("audio_out");
-    let mut p: *const f32 = ptr::null();
-    let mut l: usize = 0;
+    let mut buf = vec![0.0f32; 64];
+    let mut written: usize = 0;
 
     // 1. null engine.
-    let rc1 =
-        engine_ffi::engine_read_port(ptr::null(), node.as_ptr(), port.as_ptr(), &mut p, &mut l);
+    let rc1 = engine_ffi::engine_read_port(
+        ptr::null(),
+        node.as_ptr(),
+        port.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut written,
+    );
     assert_eq!(rc1, -2);
 
     // 2. null node_id.
-    let rc2 = engine_ffi::engine_read_port(engine_ptr, ptr::null(), port.as_ptr(), &mut p, &mut l);
+    let rc2 = engine_ffi::engine_read_port(
+        engine_ptr,
+        ptr::null(),
+        port.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut written,
+    );
     assert_eq!(rc2, -2);
 
     // 3. null port.
-    let rc3 = engine_ffi::engine_read_port(engine_ptr, node.as_ptr(), ptr::null(), &mut p, &mut l);
+    let rc3 = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        ptr::null(),
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut written,
+    );
     assert_eq!(rc3, -2);
 
-    // 4. null out_ptr.
+    // 4. null dst with non-zero capacity.
     let rc4 = engine_ffi::engine_read_port(
         engine_ptr,
         node.as_ptr(),
         port.as_ptr(),
         ptr::null_mut(),
-        &mut l,
+        64,
+        &mut written,
     );
     assert_eq!(rc4, -2);
 
-    // 5. null out_len.
+    // 5. null written.
     let rc5 = engine_ffi::engine_read_port(
         engine_ptr,
         node.as_ptr(),
         port.as_ptr(),
-        &mut p,
+        buf.as_mut_ptr(),
+        buf.len(),
         ptr::null_mut(),
     );
     assert_eq!(rc5, -2);
+
+    // 6. null dst with zero capacity is allowed (caller asked for nothing).
+    let rc6 = engine_ffi::engine_read_port(
+        engine_ptr,
+        node.as_ptr(),
+        port.as_ptr(),
+        ptr::null_mut(),
+        0,
+        &mut written,
+    );
+    assert_eq!(rc6, 0, "null dst with capacity 0 must succeed");
+    assert_eq!(written, 0, "zero-capacity read writes nothing");
 
     engine_ffi::engine_free(engine_ptr);
 }

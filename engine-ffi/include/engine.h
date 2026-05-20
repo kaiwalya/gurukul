@@ -277,32 +277,45 @@ int32_t engine_out_port(
  * (node_id, port) strings.
  *
  * On success: *out_ptr points to const float[*out_len] of the most-recent
- * block's samples and GURUKUL_OK is returned.  *out_len matches the n_frames
- * of the most recent engine_process_block (0 before any call).
+ * block's samples and GURUKUL_OK is returned.  The engine copies frames
+ * into the caller-provided destination buffer; once this call returns the
+ * caller owns the bytes — subsequent engine_process_block / engine_reset /
+ * engine_free activity will not affect them.
  *
- * Pointer lifetime: valid until the next engine_process_block or engine_free
- * — identical to engine_out_port.
+ * dst_capacity should be at least engine_block_size(engine) so the whole
+ * block fits.  A shorter buffer is permitted; the leading prefix is copied
+ * and the rest of the block is silently dropped (use *written to detect).
+ * *written is set to min(dst_capacity, last_block_n_frames).
+ *
+ * This is the prescriptive-border read API. No engine-owned pointer
+ * escapes; callers do not need to obey a "valid until next process_block"
+ * lifetime contract.
  *
  * Threading: realtime-safe ONLY when called from the audio thread between
- * engine_process_block calls, the same discipline as engine_out_port.
- * Reading from a different thread races against the audio thread's writes
- * and will see torn data.  Cabinets should push samples into an SPSC slot
- * here and let the UI read the slot, never the engine.
+ * engine_process_block calls.  Reading from a different thread races
+ * against the audio thread's writes and will see torn data.  Cabinets
+ * should push the resulting bytes into an SPSC slot here and let the UI
+ * read the slot, never the engine.
  *
  * String lookup happens on every call (that is the point — read by name,
  * not by handle).  For a port consumed every block, prefer engine_out_port
  * with a pre-resolved handle.  Use engine_read_port for ports addressed by
  * name: debug UI selections, scopes, future subscription consumers.
  *
- * Returns GURUKUL_ERR_INVALID_HANDLE for null pointers, or
- * GURUKUL_ERR_NOT_FOUND if node_id or port is not recognised.
+ * dst may be NULL only if dst_capacity is 0 (zero-capacity reads succeed
+ * and set *written to 0).
+ *
+ * Returns GURUKUL_ERR_INVALID_HANDLE for null pointers (other than the
+ * NULL-dst-with-zero-capacity case), or GURUKUL_ERR_NOT_FOUND if node_id
+ * or port is not recognised.
  */
 int32_t engine_read_port(
     const GurukulEngine  *engine,
     const char           *node_id,
     const char           *port,
-    const float         **out_ptr,
-    size_t               *out_len);
+    float                *dst,
+    size_t                dst_capacity,
+    size_t               *written);
 
 /* ── Hot path ─────────────────────────────────────────────────────────────── */
 

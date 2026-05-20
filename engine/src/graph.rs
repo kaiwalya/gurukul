@@ -773,6 +773,30 @@ impl Engine {
         self.peek(node_id, port_name)
     }
 
+    /// Copy the last block written to `(node_id, port)` into `dst`. Returns
+    /// the number of frames written (`min(dst.len(), last_n_frames)`).
+    ///
+    /// This is the prescriptive-border read API: the caller owns the
+    /// destination buffer, the engine copies into it, and the engine's
+    /// internal storage never escapes through the FFI. Once this call
+    /// returns, the caller's data is independent of subsequent
+    /// `process_block` / `reset` / drop activity on the engine.
+    ///
+    /// If `dst` is shorter than the available frames, the leading prefix
+    /// is copied and any remaining samples are silently dropped — the
+    /// caller is expected to size `dst` to at least `block_size`.
+    pub fn read_into(
+        &self,
+        node_id: &str,
+        port: &str,
+        dst: &mut [f32],
+    ) -> Result<usize, EngineError> {
+        let src = self.peek(node_id, port)?;
+        let n = src.len().min(dst.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        Ok(n)
+    }
+
     // -------------------------------------------------------------------------
     // Accessors
     // -------------------------------------------------------------------------

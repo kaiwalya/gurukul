@@ -1403,13 +1403,19 @@ nonisolated final class AudioPipeline {
 
     /// If the user (or, in DEBUG, the hardcoded dark selection) has
     /// chosen a (node, port), read its most-recent block via
-    /// `engine_read_port` and copy into `debugTapSlot`. No-op when
-    /// `debugSelectionSlot` is empty — the audio thread skips the FFI
-    /// call entirely, which is the "no selection" steady state today.
+    /// `engine_read_port` directly into `debugTapSlot`'s next target
+    /// buffer. No-op when `debugSelectionSlot` is empty — the audio
+    /// thread skips the FFI call entirely, which is the "no selection"
+    /// steady state today.
     ///
     /// Must run on the audio thread, after `engine_process_block`
     /// returns in the same hop. `engine_read_port` does a string lookup
     /// per call; the phase doc explicitly accepts this cost.
+    ///
+    /// Prescriptive-border read: the engine never returns a pointer into
+    /// its own memory. We hand it the destination buffer (slot storage)
+    /// and the engine copies frames in. Once the call returns the bytes
+    /// are ours — independent of any subsequent engine activity.
     private func publishDebugTap(ptr: OpaquePointer) {
         // Read the current selection from debugSelectionSlot. The slot's
         // borrow() returns pointers directly into its internal storage —
@@ -1432,32 +1438,23 @@ nonisolated final class AudioPipeline {
         // the UInt8 pointers to engine_read_port as `char*` directly.
         let nodeCStr = UnsafeRawPointer(nodeP).assumingMemoryBound(to: CChar.self)
         let portCStr = UnsafeRawPointer(portP).assumingMemoryBound(to: CChar.self)
-        var outPtr: UnsafePointer<Float>?
-        var outLen: Int = 0
-        let rc = engine_read_port(ptr, nodeCStr, portCStr, &outPtr, &outLen)
-        guard rc == GURUKUL_OK, let src = outPtr, outLen > 0 else {
+
+        // Pick the target slot up front and read straight into it. No
+        // intermediate copy, no engine-owned pointer in the cabinet.
+        let (dst, dstCap) = debugTapSlot.beginWrite()
+        var written: Int = 0
+        let rc = engine_read_port(ptr, nodeCStr, portCStr, dst, dstCap, &written)
+        guard rc == GURUKUL_OK else {
+            // No commit on failure — the slot's `latest` index is unchanged
+            // so readers continue to see the previous valid snapshot.
             return
         }
-        #if DEBUG
-        // Debug-only sanity checks. outLen should never exceed the
-        // hop size the engine was built with (== kDebugTapMaxSamples
-        // today). If it does, our PortShape classification is likely
-        // wrong, or someone bumped the hop without updating the slot
-        // size. Either way: silent truncation in DebugTapSlot.store
-        // could mask the underlying bug, so flag it loudly here.
-        if outLen > kDebugTapMaxSamples {
-            assertionFailure(
-                "debug-tap outLen=\(outLen) > kDebugTapMaxSamples=\(kDebugTapMaxSamples) — port read exceeded slot capacity"
-            )
+        if written == 0 {
+            return
         }
-        #endif
         debugTapSeq &+= 1
-        debugTapSlot.store(
-            seq: debugTapSeq,
-            typeTag: typeTag,
-            src: src,
-            count: outLen
-        )
+        debugTapSlot.commitWrite(seq: debugTapSeq, typeTag: typeTag, written: written)
+
         // Monitor route. Only audio-shaped ports may write to the
         // output ring — feature/control values aren't samples. The
         // typeTag was set by the UI when the user picked the port, so
@@ -1470,7 +1467,7 @@ nonisolated final class AudioPipeline {
         // procID mid-hop. The drop counter in halOutput already covers
         // any samples written-with-no-consumer.
         if monitorOn && typeTag == PortShape.audio.rawValue {
-            halOutput.writeMono(UnsafePointer(src), count: outLen)
+            halOutput.writeMono(UnsafePointer(dst), count: written)
         }
     }
 
