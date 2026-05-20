@@ -1,0 +1,12 @@
+[package]
+name = "app-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gurukul-cli"
+path = "src/main.rs"
+
+[dependencies]
+app-core = { path = "../../app-core" }
+platform-cli = { path = "../../platforms/cli" }
