@@ -4,7 +4,7 @@ type: configuration
 language: unknown
 
 # cli is an application layer; moon forbids configuration→application deps.
-# Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
+# Tasks below invoke cargo directly and must be run after `cargo build -p dsp-cli`.
 
 tasks:
   # No Cargo crate here — disable the inherited Rust tasks.
@@ -31,13 +31,13 @@ tasks:
       runFromWorkspaceRoot: true
 
   validate:
-    command: 'cargo run -p cli -- validate worlds/hello.json'
+    command: 'cargo run -p dsp-cli -- validate dsp/worlds/hello.json'
     inputs:
       - 'hello.json'
     options:
       runFromWorkspaceRoot: true
 
   test-worlds:
-    command: 'cargo run -p cli -- test worlds/test'
+    command: 'cargo run -p dsp-cli -- test dsp/worlds/test'
     options:
       runFromWorkspaceRoot: true

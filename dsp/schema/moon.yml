@@ -4,7 +4,7 @@ type: configuration
 language: unknown
 
 # cli is an application layer; moon forbids configuration→application deps.
-# Tasks below invoke cargo directly and must be run after `cargo build -p cli`.
+# Tasks below invoke cargo directly and must be run after `cargo build -p dsp-cli`.
 
 tasks:
   # No Cargo crate here — disable the inherited Rust tasks.
@@ -29,11 +29,11 @@ tasks:
       runFromWorkspaceRoot: true
 
   regenerate:
-    command: 'bash -c "cargo run --quiet -p cli -- emit-schema > schema/world.schema.json"'
+    command: 'bash -c "cargo run --quiet -p dsp-cli -- emit-schema > dsp/schema/world.schema.json"'
     options:
       runFromWorkspaceRoot: true
 
   check:
-    command: 'bash -c "cargo run --quiet -p cli -- emit-schema | diff - schema/world.schema.json"'
+    command: 'bash -c "cargo run --quiet -p dsp-cli -- emit-schema | diff - dsp/schema/world.schema.json"'
     options:
       runFromWorkspaceRoot: true

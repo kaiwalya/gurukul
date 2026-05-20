@@ -9,9 +9,9 @@ Every fact has one source of truth. Don't duplicate it elsewhere; link instead.
 - Product vision, architecture, roadmap, testing, research → [`docs/*.md`](docs/)
 - Phase status → [`docs/ROADMAP.md`](docs/ROADMAP.md) (the "Current phase" line). Never restate phase state in `README.md`, commits, or other docs.
 - Workspace / crate list → [`Cargo.toml`](Cargo.toml) workspace members.
-- Node types, ports, parameters → `cargo run -p cli -- list-nodes` and `describe-node <name>`.
-- CLI commands and flags → `cargo run -p cli -- --help`. Don't restate semantics in Markdown.
-- World file format → [`schema/world.schema.json`](schema/world.schema.json), derived from Rust types.
+- Node types, ports, parameters → `cargo run -p dsp-cli -- list-nodes` and `describe-node <name>`.
+- CLI commands and flags → `cargo run -p dsp-cli -- --help`. Don't restate semantics in Markdown.
+- World file format → [`dsp/schema/world.schema.json`](dsp/schema/world.schema.json), derived from Rust types.
 - Quick-start commands → [`README.md`](README.md).
 
 Corollary: **no per-directory `README.md`.** Code + tool output is the authoritative surface. Per-crate READMEs restate what `describe-node`, `--help`, and `lib.rs` already say, and drift the moment signatures change.

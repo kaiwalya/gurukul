@@ -1,27 +1,43 @@
 $schema: 'https://moonrepo.dev/schemas/workspace.json'
 
+# Project IDs are explicit (map form) because directory leaves are
+# not unique — both `dsp/cli` and `apps/cli` exist. The ID on the left
+# matches the Cargo package name for that crate.
 projects:
-  - dsp/cli
-  - dsp/engine
-  - dsp/engine-ffi
-  - dsp/node-assert-near
-  - dsp/node-gain
-  - dsp/node-mix-sum
-  - dsp/node-null-sink
-  - dsp/node-onset
-  - dsp/node-passthrough
-  - dsp/node-pitch-error
-  - dsp/node-pitch-yin
-  - dsp/node-rms-meter
-  - dsp/node-breath
-  - dsp/node-synth-breath
-  - dsp/node-synth-onsets
-  - dsp/node-synth-pink-noise
-  - dsp/node-synth-sine
-  - dsp/node-synth-vibrato-sine
-  - dsp/node-tracer
-  - dsp/node-vibrato
-  - schema
-  - worlds
+  # dsp layer
+  dsp-cli: dsp/cli
+  engine: dsp/engine
+  engine-ffi: dsp/engine-ffi
+  node-assert-near: dsp/node-assert-near
+  node-breath: dsp/node-breath
+  node-gain: dsp/node-gain
+  node-mix-sum: dsp/node-mix-sum
+  node-null-sink: dsp/node-null-sink
+  node-onset: dsp/node-onset
+  node-passthrough: dsp/node-passthrough
+  node-pitch-error: dsp/node-pitch-error
+  node-pitch-yin: dsp/node-pitch-yin
+  node-rms-meter: dsp/node-rms-meter
+  node-synth-breath: dsp/node-synth-breath
+  node-synth-onsets: dsp/node-synth-onsets
+  node-synth-pink-noise: dsp/node-synth-pink-noise
+  node-synth-sine: dsp/node-synth-sine
+  node-synth-vibrato-sine: dsp/node-synth-vibrato-sine
+  node-tracer: dsp/node-tracer
+  node-vibrato: dsp/node-vibrato
+
+  # app-core layer
+  app-core: app-core
+
+  # platform layer
+  platform-cli: platforms/cli
+
+  # apps
+  app-cli: apps/cli
+
+  # data (lives under dsp/ — schema is derived from engine types,
+  # worlds are example inputs to the dsp engine)
+  schema: dsp/schema
+  worlds: dsp/worlds
 
 telemetry: false
