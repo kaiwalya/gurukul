@@ -2,25 +2,26 @@
 
 An AI singing coach. See [`docs/VISION.md`](docs/VISION.md).
 
+The repo splits into layers, each with its own `AGENTS.md` where local
+rules apply:
+
+- [`dsp/AGENTS.md`](dsp/AGENTS.md) — engine, nodes, world schema, example worlds
+- `domain-ports/`, `domain-adapters/` — port traits and their adapter impls. The port convention lives in [`domain-ports/src/lib.rs`](domain-ports/src/lib.rs) (code is the source of truth).
+- `apps/` — host applications (CLI, mac)
+
 ## Where information lives
 
 Every fact has one source of truth. Don't duplicate it elsewhere; link instead.
 
-- Product vision, architecture, roadmap, testing, research → [`docs/*.md`](docs/)
+- Product vision, roadmap, testing, research → [`docs/*.md`](docs/)
 - Phase status → [`docs/ROADMAP.md`](docs/ROADMAP.md) (the "Current phase" line). Never restate phase state in `README.md`, commits, or other docs.
 - Workspace / crate list → [`Cargo.toml`](Cargo.toml) workspace members.
-- Node types, ports, parameters → `cargo run -p dsp-cli -- list-nodes` and `describe-node <name>`.
-- CLI commands and flags → `cargo run -p dsp-cli -- --help`. Don't restate semantics in Markdown.
-- World file format → [`dsp/schema/world.schema.json`](dsp/schema/world.schema.json), derived from Rust types.
 - Quick-start commands → [`README.md`](README.md).
 
-Corollary: **no per-directory `README.md`.** Code + tool output is the authoritative surface. Per-crate READMEs restate what `describe-node`, `--help`, and `lib.rs` already say, and drift the moment signatures change.
+Corollary: **no per-directory `README.md`.** Code + tool output is the authoritative surface. Per-crate READMEs restate what `--help`, `describe-node`, and `lib.rs` already say, and drift the moment signatures change.
 
 ## Rules that aren't obvious from the code
 
-- **The world JSON Schema is the interface contract,** not a debug dump. Editors, agents, and humans author against it. Treat the JSON format as a public API; breaking it is a versioned interface change.
-- **One crate per node: `node-<name>/`.** Not grouped under `nodes-core/` or similar. Each node earns its own workspace member — matches `ARCHITECTURE.md`'s single-file-scope rule and gives moon finer-grained caching.
-- **Realtime discipline is phase-gated.** `ARCHITECTURE.md` says no allocations / no locks in `process()`, but that's aspirational until phase 1.2+ when real DSP lands on a hot path. Before then, ergonomics wins. From 1.2, hold the line.
 - **Scope discipline: honor the "Explicitly deferred" lists.** Each phase in `ROADMAP.md` (and each plan file) names what *not* to build. Don't wander into the visual editor, synth library, or UI before their phase. If unsure, ask.
 
 ## Conventions

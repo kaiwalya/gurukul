@@ -68,7 +68,7 @@ This is VST3/CLAP/AU with the names changed. Do not invent a new protocol — sc
 
 ### The synthesizer/analyzer duality
 
-A feature *extractor* and a feature *synthesizer* are the same interface running in opposite directions. A vibrato synthesizer takes `(rate, depth)` parameters and emits audio; a vibrato analyzer takes audio and emits `(rate, depth)`. Connect them in a loop and you have an automated test (see `TESTING.md`). Connect the analyzer to a visualizer and you have the product. Same engine, different topology.
+A feature *extractor* and a feature *synthesizer* are the same interface running in opposite directions. A vibrato synthesizer takes `(rate, depth)` parameters and emits audio; a vibrato analyzer takes audio and emits `(rate, depth)`. Connect them in a loop and you have an automated test (see [`../docs/TESTING.md`](../docs/TESTING.md)). Connect the analyzer to a visualizer and you have the product. Same engine, different topology.
 
 This duality is load-bearing for the testing strategy and should be preserved as a deliberate design property.
 
