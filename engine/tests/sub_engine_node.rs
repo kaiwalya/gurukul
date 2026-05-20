@@ -49,16 +49,8 @@ impl SubEngineNode {
             .collect::<Result<_, _>>()?;
 
         // Build static PortSpec mirrors for Node::input_ports / output_ports.
-        let in_specs: Vec<PortSpec> = inner
-            .in_port_specs()
-            .iter()
-            .map(|s| to_port_spec(s))
-            .collect();
-        let out_specs: Vec<PortSpec> = inner
-            .out_port_specs()
-            .iter()
-            .map(|s| to_port_spec(s))
-            .collect();
+        let in_specs: Vec<PortSpec> = inner.in_port_specs().iter().map(to_port_spec).collect();
+        let out_specs: Vec<PortSpec> = inner.out_port_specs().iter().map(to_port_spec).collect();
 
         Ok(SubEngineNode {
             inner,
