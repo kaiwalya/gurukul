@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 domain-ports = { path = "../../domain-ports" }
+
+[dev-dependencies]
+# Unit tests use TestClock from the port; smoke test uses the real clock.
+domain-ports = { path = "../../domain-ports", features = ["test-util"] }
+domain-adapter-clock = { path = "../clock" }

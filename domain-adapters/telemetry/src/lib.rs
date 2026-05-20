@@ -1,37 +1,47 @@
 //! domain-adapter-telemetry: the Telemetry port adapter that writes to
 //! `io::Stderr`.
 //!
-//! Format per line: `[LEVEL] msg {k=v, k2=v2}` — keys sorted by
-//! `Fields`' `BTreeMap` order, the trailing `{}` omitted when there
-//! are no fields. Greppable, no JSON dep.
+//! Format per line:
 //!
-//! Apps call [`new`] to get an `impl Telemetry`. The concrete type is
-//! private. Children (built via [`domain_ports::telemetry::Telemetry::child`])
-//! share the parent's `Stderr` handle through an `Arc<Mutex<_>>`, so
-//! interleaved writes from multiple threads stay line-atomic.
+//! - logs: `[LEVEL] msg {k=v, k2=v2}` — keys sorted by `Fields`'
+//!   `BTreeMap` order, the trailing `{}` omitted when there are no
+//!   fields.
+//! - events: `[EVENT] {event="<name>", t_ms=N, ...}` — the variant
+//!   name and timestamp are stamped into the fields bag by
+//!   `TelemetryCore::stamp`; the adapter just renders the bag.
+//!
+//! Greppable, no JSON dep.
+//!
+//! Apps call [`new`] with an `Arc<dyn Clock>` to get an `impl Telemetry`.
+//! The clock supplies `t_ms` for events. Children share the parent's
+//! `Stderr` handle through an `Arc<Mutex<_>>`, so interleaved writes
+//! from multiple threads stay line-atomic.
 
-use domain_ports::telemetry::{Fields, Level, Telemetry, TelemetryCore};
+use domain_ports::clock::Clock;
+use domain_ports::telemetry::{Event, Fields, Level, Telemetry, TelemetryCore};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 /// Build a stderr-backed Telemetry. Cheap — does not touch the stderr
-/// handle until the first log call.
+/// handle until the first log call. The `clock` is used to stamp
+/// `t_ms` on every event.
 ///
 /// Apps call this once at boot and pass the returned `impl Telemetry`
 /// (typically wrapped in `Arc<dyn Telemetry>`) to whatever subsystems
 /// need to log.
-pub fn new() -> impl Telemetry {
+pub fn new(clock: Arc<dyn Clock>) -> impl Telemetry {
     StderrTelemetry {
-        core: TelemetryCore::new(),
+        core: TelemetryCore::new(clock),
         out: Arc::new(Mutex::new(io::stderr())),
     }
 }
 
 /// Build a stderr-backed Telemetry with an initial context bag whose
-/// fields appear on every line.
-pub fn with_context(context: Fields) -> impl Telemetry {
+/// fields appear on every log line. Events do not pick up context;
+/// see [`domain_ports::telemetry::Event`].
+pub fn with_context(clock: Arc<dyn Clock>, context: Fields) -> impl Telemetry {
     StderrTelemetry {
-        core: TelemetryCore::with_context(context),
+        core: TelemetryCore::with_context(clock, context),
         out: Arc::new(Mutex::new(io::stderr())),
     }
 }
@@ -60,6 +70,12 @@ impl Telemetry for StderrTelemetry {
             out: Arc::clone(&self.out),
         })
     }
+
+    fn event(&self, e: &Event) {
+        let stamped = self.core.stamp(e);
+        let mut out = self.out.lock().unwrap();
+        let _ = writeln!(out, "[EVENT] {stamped}");
+    }
 }
 
 #[cfg(test)]
@@ -73,8 +89,9 @@ mod tests {
     //! End-to-end "did the line actually hit stderr" is covered by the
     //! integration test in `tests/stderr_smoke.rs`.
 
+    use domain_ports::clock::{Clock, TestClock};
     use domain_ports::fields;
-    use domain_ports::telemetry::{Fields, Level, Telemetry, TelemetryCore};
+    use domain_ports::telemetry::{Event, Fields, Level, Telemetry, TelemetryCore};
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -100,17 +117,28 @@ mod tests {
                 out: Arc::clone(&self.out),
             })
         }
+
+        fn event(&self, e: &Event) {
+            let stamped = self.core.stamp(e);
+            let mut out = self.out.lock().unwrap();
+            let _ = writeln!(out, "[EVENT] {stamped}");
+        }
     }
 
-    fn buf() -> (BufTelemetry, Arc<Mutex<Vec<u8>>>) {
+    fn buf_at(start_ns: u64) -> (BufTelemetry, Arc<Mutex<Vec<u8>>>) {
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(start_ns));
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
         (
             BufTelemetry {
-                core: TelemetryCore::new(),
+                core: TelemetryCore::new(clock),
                 out: Arc::clone(&out),
             },
             out,
         )
+    }
+
+    fn buf() -> (BufTelemetry, Arc<Mutex<Vec<u8>>>) {
+        buf_at(0)
     }
 
     fn dump(out: &Mutex<Vec<u8>>) -> String {
@@ -154,6 +182,21 @@ mod tests {
         assert_eq!(
             dump(&out),
             "[TRACE] t\n[DEBUG] d\n[INFO] i\n[WARN] w\n[ERROR] e\n"
+        );
+    }
+
+    #[test]
+    fn event_renders_stamped_fields() {
+        // 42 ms in ns.
+        let (tel, out) = buf_at(42_000_000);
+        tel.event(&Event::Boot {
+            app_version: "0.1.0",
+        });
+        tel.event(&Event::Shutdown { uptime_ms: 1458 });
+        assert_eq!(
+            dump(&out),
+            "[EVENT] {app_version=\"0.1.0\", event=\"boot\", t_ms=42}\n\
+             [EVENT] {event=\"shutdown\", t_ms=42, uptime_ms=1458}\n"
         );
     }
 }

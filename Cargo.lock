@@ -233,6 +233,7 @@ dependencies = [
 name = "domain-adapter-telemetry"
 version = "0.1.0"
 dependencies = [
+ "domain-adapter-clock",
  "domain-ports",
 ]
 
