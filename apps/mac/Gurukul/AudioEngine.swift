@@ -39,6 +39,21 @@ nonisolated final class AudioPipeline {
     /// Decimated 1 s waveform snapshot, published from the same hot path.
     let waveformSlot = WaveformSlot()
 
+    /// Most-recent block read from a user-selected engine port. Filled
+    /// by the audio thread when `debugSelectionSlot` has a non-empty
+    /// selection; the UI tick reads it in PR 1.4.8.5.2.
+    let debugTapSlot = DebugTapSlot()
+
+    /// Which engine port the debug pane wants tapped this hop. Written
+    /// by the UI when the user changes pickers; written-to-empty on any
+    /// engine rebuild / reset. Audio thread reads every hop.
+    let debugSelectionSlot = DebugSelectionSlot()
+
+    /// Monotonically incremented every time the audio thread publishes a
+    /// debug tap (or clears it). Decoupled from `seq` so a re-publish of
+    /// a cleared snapshot is detectable by the UI.
+    private var debugTapSeq: UInt32 = 0
+
     /// Ring buffer of min/max pairs. One entry covers `samplesPerBucket`
     /// raw frames. `wfHead` is the index of the *next* bucket to write
     /// into; the oldest bucket is at `(wfHead) % kWaveformBuckets`.
@@ -401,6 +416,21 @@ nonisolated final class AudioPipeline {
         if halOutput.isRunning {
             halOutput.stop()
         }
+
+        // Debug-pane invariants from PHASE_1_4_8.md:
+        //   - DebugTapSlot clears on engine rebuild / reset.
+        //   - Monitor toggle auto-disengages on engine reset (a click
+        //     into the user's headphones at a route change is worse than
+        //     silence).
+        // Both invariants are satisfied by publishing empty selection +
+        // empty tap here, BEFORE engine_free / engine_reset run. The
+        // audio thread is already stopped (stopHALUnit / halOutput.stop
+        // above blocked on AudioDeviceStop), so this is just main-thread
+        // memory work — no race.
+        debugSelectionSlot.clear()
+        debugTapSeq &+= 1
+        debugTapSlot.clear(seq: debugTapSeq)
+
         // Sidetone defaults off on every (re)start — see invariant in
         // PHASE_1_4_8.md §"PR 5" (monitor disengages on engine.reset).
         sidetoneEnabled.store(false, ordering: .relaxed)
@@ -1206,6 +1236,14 @@ nonisolated final class AudioPipeline {
                 }
             }
 
+            // Debug-pane tap. If the user (or in DEBUG, the hardcoded
+            // selection below) has picked a (node, port), call
+            // engine_read_port and copy the result into debugTapSlot.
+            // engine_read_port is realtime-safe between process blocks —
+            // string lookup happens once per hop, which the phase doc
+            // explicitly accepts.
+            publishDebugTap(ptr: ptr)
+
             // ~1 s cadence (writer is ~94 Hz). Print global min/max and
             // mean across the visible 1 s window, plus a coarse-decimated
             // envelope so we can see the shape in the log.
@@ -1286,6 +1324,53 @@ nonisolated final class AudioPipeline {
             if v > maxAbs { maxAbs = v }
         }
         return maxAbs
+    }
+
+    /// If the user (or, in DEBUG, the hardcoded dark selection) has
+    /// chosen a (node, port), read its most-recent block via
+    /// `engine_read_port` and copy into `debugTapSlot`. No-op when
+    /// `debugSelectionSlot` is empty — the audio thread skips the FFI
+    /// call entirely, which is the "no selection" steady state today.
+    ///
+    /// Must run on the audio thread, after `engine_process_block`
+    /// returns in the same hop. `engine_read_port` does a string lookup
+    /// per call; the phase doc explicitly accepts this cost.
+    private func publishDebugTap(ptr: OpaquePointer) {
+        #if DEBUG
+        // PR 1.4.8.5.1 dark wire-up: tap the pitch_yin.f0 port so we can
+        // verify the slot fills end-to-end before any UI exists. The UI
+        // PR (5.2) replaces this with a real selection driven by pickers.
+        let darkNode = "pitch_yin"
+        let darkPort = "f0"
+        let darkTypeTag: UInt8 = 1  // PortShape.featureHz placeholder
+
+        var outPtr: UnsafePointer<Float>?
+        var outLen: Int = 0
+        let rc = darkNode.withCString { nodeCStr in
+            darkPort.withCString { portCStr in
+                engine_read_port(ptr, nodeCStr, portCStr, &outPtr, &outLen)
+            }
+        }
+        guard rc == GURUKUL_OK, let src = outPtr, outLen > 0 else {
+            return
+        }
+        debugTapSeq &+= 1
+        debugTapSlot.store(
+            seq: debugTapSeq,
+            typeTag: darkTypeTag,
+            src: src,
+            count: outLen
+        )
+        // Lightweight log every ~94 hops (~1 s) so we can verify the
+        // tap is filling without spamming the console.
+        if debugTapSeq % 94 == 0 {
+            log.debug("debug-tap (dark): \(darkNode, privacy: .public).\(darkPort, privacy: .public) len=\(outLen, privacy: .public) first=\(src[0], privacy: .public)")
+        }
+        #else
+        // Release builds: no dark selection. PR 5.2 will read
+        // debugSelectionSlot here once UI exists.
+        _ = ptr
+        #endif
     }
 
     // MARK: - HAL helpers
