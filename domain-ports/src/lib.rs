@@ -10,12 +10,15 @@
 //! sub-instances, plain reader, whatever fits — but the boot-time
 //! ceremony is uniform.
 //!
-//! 1. **One trait per port module, named after the domain.** No
-//!    `Trait` suffix, no `Root` prefix. The trait *is* the domain's
-//!    full contract: instance methods, factory methods for sub-types
-//!    it hands out, lifecycle operations, error types. Everything the
-//!    domain offers hangs off this trait or off types its methods
-//!    return.
+//! 1. **One app-facing trait per port module, named after the
+//!    domain.** No `Trait` suffix, no `Root` prefix. The trait is the
+//!    contract apps depend on. Beyond that, the port may expose
+//!    additional adapter-facing types (a `<Domain>Core` helper
+//!    struct, error types, etc.) as the domain warrants — these are
+//!    contracts between the port and its adapters, not part of the
+//!    app-facing surface. Simple ports (Clock) won't need them; rich
+//!    ports often will. See `domain-ports/AGENTS.md` for the
+//!    `<Domain>Core` pattern.
 //!
 //! 2. **The matching adapter crate exposes one factory:**
 //!    `pub fn new(...) -> impl <Domain>`.
@@ -63,3 +66,4 @@
 //! same.
 
 pub mod clock;
+pub mod telemetry;
