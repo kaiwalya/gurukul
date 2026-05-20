@@ -1,0 +1,14 @@
+[package]
+name = "coach-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "coach-cli"
+path = "src/main.rs"
+
+[dependencies]
+domain-ports = { path = "../../domain-ports" }
+adapter-clock-std = { path = "../../domain-adapters/clock-std" }
+adapter-telemetry-std = { path = "../../domain-adapters/telemetry-std" }
+adapter-app-coach = { path = "../../domain-adapters/app-coach" }

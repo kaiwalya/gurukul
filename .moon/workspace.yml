@@ -1,8 +1,8 @@
 $schema: 'https://moonrepo.dev/schemas/workspace.json'
 
 # Project IDs are explicit (map form) because directory leaves are
-# not unique — both `dsp/cli` and `apps/cli` exist. The ID on the left
-# matches the Cargo package name for that crate.
+# not unique — both `dsp/cli` and `apps/coach-cli` exist. The ID on the
+# left matches the Cargo package name for that crate.
 projects:
   # dsp layer
   dsp-cli: dsp/cli
@@ -29,12 +29,13 @@ projects:
   # domain ports (trait contracts)
   domain-ports: domain-ports
 
-  # domain adapters (port impls, named for what they adapt, not the host)
-  adapter-clock: domain-adapters/clock
-  adapter-telemetry: domain-adapters/telemetry
+  # domain adapters (port impls; flavor suffix identifies backing tech)
+  adapter-clock-std: domain-adapters/clock-std
+  adapter-telemetry-std: domain-adapters/telemetry-std
+  adapter-app-coach: domain-adapters/app-coach
 
-  # apps
-  app-cli: apps/cli
+  # apps (hosts — <product>-<surface>)
+  coach-cli: apps/coach-cli
 
   # data (lives under dsp/ — schema is derived from engine types,
   # worlds are example inputs to the dsp engine)

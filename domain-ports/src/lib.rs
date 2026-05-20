@@ -65,5 +65,6 @@
 //! one trait, one adapter `new()`, called once at boot — stays the
 //! same.
 
+pub mod app_coach;
 pub mod clock;
 pub mod telemetry;

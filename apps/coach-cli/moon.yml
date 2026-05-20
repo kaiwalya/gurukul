@@ -1,0 +1,10 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+type: application
+language: rust
+
+dependsOn:
+  - domain-ports
+  - adapter-clock-std
+  - adapter-telemetry-std
+  - adapter-app-coach

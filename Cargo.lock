@@ -3,17 +3,24 @@
 version = 4
 
 [[package]]
-name = "adapter-clock"
+name = "adapter-app-coach"
 version = "0.1.0"
 dependencies = [
  "domain-ports",
 ]
 
 [[package]]
-name = "adapter-telemetry"
+name = "adapter-clock-std"
 version = "0.1.0"
 dependencies = [
- "adapter-clock",
+ "domain-ports",
+]
+
+[[package]]
+name = "adapter-telemetry-std"
+version = "0.1.0"
+dependencies = [
+ "adapter-clock-std",
  "domain-ports",
 ]
 
@@ -95,15 +102,6 @@ name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
-
-[[package]]
-name = "app-cli"
-version = "0.1.0"
-dependencies = [
- "adapter-clock",
- "adapter-telemetry",
- "domain-ports",
-]
 
 [[package]]
 name = "assert_no_alloc"
@@ -219,6 +217,16 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "coach-cli"
+version = "0.1.0"
+dependencies = [
+ "adapter-app-coach",
+ "adapter-clock-std",
+ "adapter-telemetry-std",
+ "domain-ports",
+]
 
 [[package]]
 name = "colorchoice"

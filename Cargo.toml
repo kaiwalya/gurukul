@@ -21,9 +21,10 @@ members = [
     "dsp/node-synth-breath",
     "dsp/node-breath",
     "domain-ports",
-    "domain-adapters/clock",
-    "domain-adapters/telemetry",
-    "apps/cli",
+    "domain-adapters/clock-std",
+    "domain-adapters/telemetry-std",
+    "domain-adapters/app-coach",
+    "apps/coach-cli",
 ]
 resolver = "2"
 

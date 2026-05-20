@@ -1,4 +1,4 @@
-//! adapter-clock: the Clock port adapter for native targets.
+//! adapter-clock-std: the Clock port adapter backed by `std::time`.
 //!
 //! `std::time::Instant` wraps the monotonic OS clock on every supported
 //! target (macOS `mach_absolute_time`, Linux `CLOCK_MONOTONIC`, Windows

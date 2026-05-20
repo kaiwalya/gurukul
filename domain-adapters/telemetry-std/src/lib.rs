@@ -1,4 +1,4 @@
-//! adapter-telemetry: the Telemetry port adapter that writes to
+//! adapter-telemetry-std: the Telemetry port adapter that writes to
 //! `io::Stderr`.
 //!
 //! Format per line:
