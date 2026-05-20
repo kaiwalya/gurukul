@@ -6,9 +6,10 @@
 //!
 //! # Surface
 //!
-//! - [`Telemetry`] — the app-facing trait. Apps log through this.
+//! - [`Telemetry`] — the app-facing trait. Apps log through this and
+//!   build scoped child loggers via [`Telemetry::child`].
 //! - [`TelemetryCore`] — adapter-side helper holding the shared logic
-//!   (currently: a context bag and the field-merge rule). See
+//!   (context bag, field-merge rule, child construction). See
 //!   `domain-ports/AGENTS.md` for the `<Domain>Core` pattern.
 //! - [`Fields`], [`Value`], [`Level`] — the data types that flow
 //!   through the trait.
@@ -40,6 +41,7 @@
 
 use core::fmt;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------
 // Public data types
@@ -232,6 +234,18 @@ pub trait Telemetry: Send + Sync {
     /// The adapter is responsible for merging in any context it
     /// carries (typically via [`TelemetryCore::merge`]).
     fn log(&self, level: Level, msg: &str, fields: &Fields);
+
+    /// Return a new logger that inherits this one's context with
+    /// `fields` layered on top. Child-supplied keys win over inherited
+    /// ones. Children share the same sink as the parent — they are a
+    /// *context scope*, not a separate destination.
+    ///
+    /// Adapters implement this by building the merged context via
+    /// [`TelemetryCore::child`] and constructing a new instance of
+    /// themselves around it (cloning whatever sink/state is shared).
+    /// Any I/O handle the adapter holds must be cheap to share across
+    /// children — typically by wrapping it in an `Arc`.
+    fn child(&self, fields: Fields) -> Arc<dyn Telemetry>;
 }
 
 // ---------------------------------------------------------------------
@@ -274,6 +288,20 @@ impl TelemetryCore {
     /// the rule callers expect: more-specific scopes win).
     pub fn merge(&self, fields: &Fields) -> Fields {
         self.context.merged_with(fields)
+    }
+
+    /// Produce a new Core whose context is the parent's context with
+    /// `fields` layered on top. Child-supplied keys win over inherited
+    /// ones — same precedence rule as [`merge`](Self::merge).
+    ///
+    /// Adapters call this from their `impl Telemetry::child` so the
+    /// merge rule lives in one place. The adapter then constructs a
+    /// new instance of itself around the returned Core, sharing any
+    /// I/O state (sink, mutex, etc.) with the parent.
+    pub fn child(&self, fields: Fields) -> TelemetryCore {
+        TelemetryCore {
+            context: self.context.merged_with(&fields),
+        }
     }
 }
 
@@ -363,7 +391,7 @@ pub use fakes::{Captured, TestTelemetry};
 #[cfg(any(test, feature = "test-util"))]
 mod fakes {
     use super::{Fields, Level, Telemetry, TelemetryCore};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// A single captured log call. Used by [`TestTelemetry`] for
     /// consumer-side assertions.
@@ -378,27 +406,32 @@ mod fakes {
     /// `TelemetryCore` exactly the way a real adapter would — so
     /// tests using `TestTelemetry::with_context(...)` exercise the
     /// same context-merge code path as production adapters.
+    ///
+    /// Children created via [`Telemetry::child`] share the same
+    /// capture buffer with their parent: a single `captured()` snapshot
+    /// reads every line logged through the parent or any descendant.
     pub struct TestTelemetry {
         core: TelemetryCore,
-        captured: Mutex<Vec<Captured>>,
+        captured: Arc<Mutex<Vec<Captured>>>,
     }
 
     impl TestTelemetry {
         pub fn new() -> Self {
             Self {
                 core: TelemetryCore::new(),
-                captured: Mutex::new(Vec::new()),
+                captured: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         pub fn with_context(context: Fields) -> Self {
             Self {
                 core: TelemetryCore::with_context(context),
-                captured: Mutex::new(Vec::new()),
+                captured: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        /// Snapshot of everything logged so far.
+        /// Snapshot of everything logged so far through this logger
+        /// or any of its descendants.
         pub fn captured(&self) -> Vec<Captured> {
             self.captured.lock().unwrap().clone()
         }
@@ -419,6 +452,13 @@ mod fakes {
                 fields: merged,
             });
         }
+
+        fn child(&self, fields: Fields) -> Arc<dyn Telemetry> {
+            Arc::new(TestTelemetry {
+                core: self.core.child(fields),
+                captured: Arc::clone(&self.captured),
+            })
+        }
     }
 }
 
@@ -429,7 +469,6 @@ mod fakes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn fields_dedup_and_override() {
@@ -542,5 +581,84 @@ mod tests {
         // Down-cast not required — we don't need to read captured here,
         // just prove the vtable dispatch compiles and runs.
         let _ = tel;
+    }
+
+    #[test]
+    fn core_child_merges_context() {
+        let parent = TelemetryCore::with_context(fields! {
+            phase = "boot",
+            device = "parent-mic",
+        });
+        let child = parent.child(fields! {
+            device = "child-mic",
+            take = 1u32,
+        });
+        // Inherited and not overridden:
+        assert_eq!(
+            child.context().get("phase"),
+            Some(&Value::Str("boot".into()))
+        );
+        // Child-supplied keys win:
+        assert_eq!(
+            child.context().get("device"),
+            Some(&Value::Str("child-mic".into()))
+        );
+        // Child-only key present:
+        assert_eq!(child.context().get("take"), Some(&Value::U64(1)));
+        // Parent context untouched:
+        assert_eq!(
+            parent.context().get("device"),
+            Some(&Value::Str("parent-mic".into()))
+        );
+        assert_eq!(parent.context().get("take"), None);
+    }
+
+    #[test]
+    fn telemetry_child_inherits_and_merges_on_log() {
+        let parent = TestTelemetry::with_context(fields! { phase = "boot" });
+        let child = parent.child(fields! { device = "MacBook Mic" });
+        tel_info!(child, "opened", rate = 48_000u32);
+        let cap = parent.captured();
+        assert_eq!(cap.len(), 1);
+        let c = &cap[0];
+        // Parent context, child context, and call-site fields all present:
+        assert_eq!(c.fields.get("phase"), Some(&Value::Str("boot".into())));
+        assert_eq!(
+            c.fields.get("device"),
+            Some(&Value::Str("MacBook Mic".into()))
+        );
+        assert_eq!(c.fields.get("rate"), Some(&Value::U64(48_000)));
+    }
+
+    #[test]
+    fn child_call_site_overrides_inherited_context() {
+        let parent = TestTelemetry::with_context(fields! { device = "parent-mic" });
+        let child = parent.child(fields! { device = "child-mic" });
+        // Call-site field beats child context, which beats parent context.
+        tel_info!(child, "x", device = "call-mic");
+        let cap = parent.captured();
+        assert_eq!(
+            cap[0].fields.get("device"),
+            Some(&Value::Str("call-mic".into()))
+        );
+    }
+
+    #[test]
+    fn nested_children_share_capture_buffer() {
+        let parent = TestTelemetry::new();
+        let a = parent.child(fields! { scope = "a" });
+        let b = a.child(fields! { scope2 = "b" });
+        tel_info!(parent, "from-parent");
+        tel_info!(a, "from-a");
+        tel_info!(b, "from-b");
+        // All three lines visible from the parent's snapshot.
+        let cap = parent.captured();
+        assert_eq!(cap.len(), 3);
+        assert_eq!(cap[0].msg, "from-parent");
+        assert_eq!(cap[1].msg, "from-a");
+        assert_eq!(cap[2].msg, "from-b");
+        // And the grandchild has both scope fields inherited:
+        assert_eq!(cap[2].fields.get("scope"), Some(&Value::Str("a".into())));
+        assert_eq!(cap[2].fields.get("scope2"), Some(&Value::Str("b".into())));
     }
 }
