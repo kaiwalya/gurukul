@@ -1,0 +1,7 @@
+[package]
+name = "domain-adapter-telemetry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain-ports = { path = "../../domain-ports" }

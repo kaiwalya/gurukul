@@ -10,7 +10,8 @@ path = "src/main.rs"
 [dependencies]
 domain-ports = { path = "../../domain-ports" }
 domain-adapter-clock = { path = "../../domain-adapters/clock" }
+domain-adapter-telemetry = { path = "../../domain-adapters/telemetry" }
 
 [dev-dependencies]
-# Pull in `domain_ports::clock::TestClock` and friends for tests.
+# Pull in TestClock, TestTelemetry, and friends for tests.
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
