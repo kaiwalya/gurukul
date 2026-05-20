@@ -53,11 +53,11 @@
 //!     // ...whatever the Foo domain needs...
 //! }
 //!
-//! // domain-adapters/foo/src/lib.rs
+//! // domain-adapters/foo/src/lib.rs  (crate name: adapter-foo)
 //! pub fn new() -> impl Foo { /* private concrete impl */ }
 //!
 //! // apps/<host>/src/main.rs
-//! let foo = domain_adapter_foo::new();   // once, at boot
+//! let foo = adapter_foo::new();   // once, at boot
 //! ```
 //!
 //! Domains that need richer shapes (sub-instances, lifecycle gates,

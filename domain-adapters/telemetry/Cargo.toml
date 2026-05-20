@@ -1,5 +1,5 @@
 [package]
-name = "domain-adapter-telemetry"
+name = "adapter-telemetry"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,4 +9,4 @@ domain-ports = { path = "../../domain-ports" }
 [dev-dependencies]
 # Unit tests use TestClock from the port; smoke test uses the real clock.
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
-domain-adapter-clock = { path = "../clock" }
+adapter-clock = { path = "../clock" }

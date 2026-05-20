@@ -16,7 +16,9 @@ that affect this directory:
   its own.
 
 Naming: directory is the bare port name (`clock/`, not `clock-std/`); crate
-name is `domain-adapter-<port>` (matches the moon project ID so the
-inherited `cargo build -p $project` task just works).
+name is `adapter-<port>` (matches the moon project ID so the
+inherited `cargo build -p $project` task just works). The directory
+tree (`domain-adapters/`) preserves the layer; the crate name stays
+short because call sites read it on every line (`adapter_clock::new()`).
 
 Project-wide rules: [`../AGENTS.md`](../AGENTS.md).

@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "adapter-clock"
+version = "0.1.0"
+dependencies = [
+ "domain-ports",
+]
+
+[[package]]
+name = "adapter-telemetry"
+version = "0.1.0"
+dependencies = [
+ "adapter-clock",
+ "domain-ports",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -85,8 +100,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "app-cli"
 version = "0.1.0"
 dependencies = [
- "domain-adapter-clock",
- "domain-adapter-telemetry",
+ "adapter-clock",
+ "adapter-telemetry",
  "domain-ports",
 ]
 
@@ -220,21 +235,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "domain-adapter-clock"
-version = "0.1.0"
-dependencies = [
- "domain-ports",
-]
-
-[[package]]
-name = "domain-adapter-telemetry"
-version = "0.1.0"
-dependencies = [
- "domain-adapter-clock",
- "domain-ports",
 ]
 
 [[package]]

@@ -30,8 +30,8 @@ projects:
   domain-ports: domain-ports
 
   # domain adapters (port impls, named for what they adapt, not the host)
-  domain-adapter-clock: domain-adapters/clock
-  domain-adapter-telemetry: domain-adapters/telemetry
+  adapter-clock: domain-adapters/clock
+  adapter-telemetry: domain-adapters/telemetry
 
   # apps
   app-cli: apps/cli

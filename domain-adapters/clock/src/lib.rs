@@ -1,4 +1,4 @@
-//! domain-adapter-clock: the Clock port adapter for native targets.
+//! adapter-clock: the Clock port adapter for native targets.
 //!
 //! `std::time::Instant` wraps the monotonic OS clock on every supported
 //! target (macOS `mach_absolute_time`, Linux `CLOCK_MONOTONIC`, Windows

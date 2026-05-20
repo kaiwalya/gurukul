@@ -3,7 +3,7 @@
 //! The app's only job here is wiring: call each adapter's `new()` to
 //! get an `impl Clock` / `impl Telemetry` / ... and hand them to the
 //! domain code. As more ports land, this stays a short list of
-//! `let x = domain_adapter_x::new();` followed by the domain entry.
+//! `let x = adapter_x::new();` followed by the domain entry.
 
 use domain_ports::clock::Clock;
 use domain_ports::tel_info;
@@ -15,8 +15,8 @@ fn greet(clock: &dyn Clock, tel: &dyn Telemetry) {
 }
 
 fn main() {
-    let clock: Arc<dyn Clock> = Arc::new(domain_adapter_clock::new());
-    let tel = domain_adapter_telemetry::new(Arc::clone(&clock));
+    let clock: Arc<dyn Clock> = Arc::new(adapter_clock::new());
+    let tel = adapter_telemetry::new(Arc::clone(&clock));
 
     tel.event(&Event::Boot {
         app_version: env!("CARGO_PKG_VERSION"),

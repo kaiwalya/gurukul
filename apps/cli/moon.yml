@@ -5,5 +5,5 @@ language: rust
 
 dependsOn:
   - domain-ports
-  - domain-adapter-clock
-  - domain-adapter-telemetry
+  - adapter-clock
+  - adapter-telemetry

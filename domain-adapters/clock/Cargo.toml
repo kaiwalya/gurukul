@@ -1,5 +1,5 @@
 [package]
-name = "domain-adapter-clock"
+name = "adapter-clock"
 version = "0.1.0"
 edition = "2021"
 
