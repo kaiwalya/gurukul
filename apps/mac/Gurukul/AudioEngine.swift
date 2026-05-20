@@ -1423,6 +1423,19 @@ nonisolated final class AudioPipeline {
         guard rc == GURUKUL_OK, let src = outPtr, outLen > 0 else {
             return
         }
+        #if DEBUG
+        // Debug-only sanity checks. outLen should never exceed the
+        // hop size the engine was built with (== kDebugTapMaxSamples
+        // today). If it does, our PortShape classification is likely
+        // wrong, or someone bumped the hop without updating the slot
+        // size. Either way: silent truncation in DebugTapSlot.store
+        // could mask the underlying bug, so flag it loudly here.
+        if outLen > kDebugTapMaxSamples {
+            assertionFailure(
+                "debug-tap outLen=\(outLen) > kDebugTapMaxSamples=\(kDebugTapMaxSamples) — port read exceeded slot capacity"
+            )
+        }
+        #endif
         debugTapSeq &+= 1
         debugTapSlot.store(
             seq: debugTapSeq,

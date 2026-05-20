@@ -164,13 +164,20 @@ final class DebugSelectionSlot {
     /// pointing at the current slot's null-terminated buffers if a
     /// selection exists; false otherwise. No allocation, no copy.
     ///
-    /// The returned pointers are valid until the next `store` /  `clear`
+    /// The returned pointers are valid until the next `store` / `clear`
     /// call. The audio thread holds them only for the duration of one
-    /// `engine_read_port` invocation — which the writer cannot interleave
-    /// against in practice (writes come from the swap queue or the UI tick,
-    /// both of which serialise against the audio thread elsewhere). The
-    /// double-buffer guarantees the slot we read from is not the slot a
-    /// concurrent writer would target.
+    /// `engine_read_port` invocation.
+    ///
+    /// **Writer-cadence precondition: at most one `store`/`clear` may
+    /// occur per audio hop.** Today this holds because writes come from
+    /// either (a) the UI tick on user picker change, which can't fire
+    /// twice in one hop interval (~10 ms at 48 kHz hop=512), or (b) the
+    /// engine swap queue during reset, which is serial and only runs
+    /// after the audio thread has been stopped via `AudioDeviceStop`. A
+    /// second writer landing in the same hop would target the slot the
+    /// audio thread is reading and overwrite it mid-FFI-call. If any
+    /// future caller breaks this invariant we need a third buffer or a
+    /// generation-check on the audio side.
     func borrow(
         nodeBase: inout UnsafePointer<UInt8>?,
         portBase: inout UnsafePointer<UInt8>?,
