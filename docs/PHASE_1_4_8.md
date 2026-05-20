@@ -38,12 +38,12 @@ The audio prefs pane is comparatively pedestrian — table-stakes UI every audio
 
 The engine already runs in the cabinet via `engine-ffi`. Two small gaps:
 
-- **Runtime port enumeration.** `Engine` has `node_index()` and `topo_order()` but no way to ask "what output ports does node X have?" without going back to `NodeRegistry` and knowing the node's type. Add a public API that takes a node id and returns its port list. ([`engine/src/graph.rs:750`](../engine/src/graph.rs) `peek` is adjacent — same neighborhood.)
+- **Runtime port enumeration.** `Engine` has `node_index()` and `topo_order()` but no way to ask "what output ports does node X have?" without going back to `NodeRegistry` and knowing the node's type. Add a public API that takes a node id and returns its port list. ([`engine/src/graph.rs:750`](../dsp/engine/src/graph.rs) `peek` is adjacent — same neighborhood.)
 - **`peek` as the read primitive.** Already public, already realtime-safe-when-called-between-blocks, already documented as the right call for "give me this port's last block." The CLI's `--peek <node.port>` is the existing user. We re-use it for the cabinet — but rename or wrap it once we're sure of the shape (see §6).
 
 ### engine-ffi (Rust → C ABI)
 
-Three new functions, all following the existing `engine_resolve_*` / `engine_in_port` / `engine_out_port` pattern at [`engine-ffi/src/lib.rs`](../engine-ffi/src/lib.rs):
+Three new functions, all following the existing `engine_resolve_*` / `engine_in_port` / `engine_out_port` pattern at [`engine-ffi/src/lib.rs`](../dsp/engine-ffi/src/lib.rs):
 
 ```c
 // Enumerate node ids in topo order. Returns count; fills caller's array.
@@ -68,7 +68,7 @@ GurukulError engine_read_port(GurukulEngine*, const char* node_id,
                           const char* port, const float** ptr, size_t* len);
 ```
 
-Header at [`engine-ffi/include/engine.h`](../engine-ffi/include/engine.h) gets the three new signatures, with the realtime-safety and lifetime contracts in the doc comments.
+Header at [`engine-ffi/include/engine.h`](../dsp/engine-ffi/include/engine.h) gets the three new signatures, with the realtime-safety and lifetime contracts in the doc comments.
 
 ### Cabinet (Swift)
 

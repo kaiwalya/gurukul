@@ -1,26 +1,26 @@
 $schema: 'https://moonrepo.dev/schemas/workspace.json'
 
 projects:
-  - cli
-  - engine
-  - engine-ffi
-  - node-assert-near
-  - node-gain
-  - node-mix-sum
-  - node-null-sink
-  - node-onset
-  - node-passthrough
-  - node-pitch-error
-  - node-pitch-yin
-  - node-rms-meter
-  - node-breath
-  - node-synth-breath
-  - node-synth-onsets
-  - node-synth-pink-noise
-  - node-synth-sine
-  - node-synth-vibrato-sine
-  - node-tracer
-  - node-vibrato
+  - dsp/cli
+  - dsp/engine
+  - dsp/engine-ffi
+  - dsp/node-assert-near
+  - dsp/node-gain
+  - dsp/node-mix-sum
+  - dsp/node-null-sink
+  - dsp/node-onset
+  - dsp/node-passthrough
+  - dsp/node-pitch-error
+  - dsp/node-pitch-yin
+  - dsp/node-rms-meter
+  - dsp/node-breath
+  - dsp/node-synth-breath
+  - dsp/node-synth-onsets
+  - dsp/node-synth-pink-noise
+  - dsp/node-synth-sine
+  - dsp/node-synth-vibrato-sine
+  - dsp/node-tracer
+  - dsp/node-vibrato
   - schema
   - worlds
 

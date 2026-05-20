@@ -309,7 +309,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../engine-ffi/include";
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../dsp/engine-ffi/include";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Gurukul needs the microphone to hear you sing and give feedback.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -345,7 +345,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../engine-ffi/include";
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../dsp/engine-ffi/include";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Gurukul needs the microphone to hear you sing and give feedback.";
 				LD_RUNPATH_SEARCH_PATHS = (
