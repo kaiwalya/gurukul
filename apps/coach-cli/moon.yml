@@ -8,3 +8,4 @@ dependsOn:
   - adapter-clock-std
   - adapter-telemetry-std
   - adapter-app-coach
+  - adapter-audio-cpal

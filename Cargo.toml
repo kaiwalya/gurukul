@@ -24,6 +24,7 @@ members = [
     "domain-adapters/clock-std",
     "domain-adapters/telemetry-std",
     "domain-adapters/app-coach",
+    "domain-adapters/audio-cpal",
     "apps/coach-cli",
 ]
 resolver = "2"
@@ -36,3 +37,4 @@ jsonschema = "0.29"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
+cpal = "0.17"

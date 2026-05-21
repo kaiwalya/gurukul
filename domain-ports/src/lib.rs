@@ -66,5 +66,6 @@
 //! same.
 
 pub mod app_coach;
+pub mod audio_devices;
 pub mod clock;
 pub mod telemetry;

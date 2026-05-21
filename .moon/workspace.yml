@@ -33,6 +33,7 @@ projects:
   adapter-clock-std: domain-adapters/clock-std
   adapter-telemetry-std: domain-adapters/telemetry-std
   adapter-app-coach: domain-adapters/app-coach
+  adapter-audio-cpal: domain-adapters/audio-cpal
 
   # apps (hosts — <product>-<surface>)
   coach-cli: apps/coach-cli
