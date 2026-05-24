@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 domain-ports = { path = "../../domain-ports" }
 cpal = { workspace = true }
+
+[dev-dependencies]
+domain-ports = { path = "../../domain-ports", features = ["test-util"] }
