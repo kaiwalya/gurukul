@@ -1,82 +1,41 @@
 //! adapter-app-coach: the canonical [`AppCoach`] implementation.
 //!
-//! Hosts wire peripheral adapters (clock, telemetry, ...) into an
-//! [`AppCoachDeps`] and call [`AppCoach::main`]. The behaviour is
-//! intentionally trivial today (Boot event, greeting log, Shutdown
-//! event with uptime) — this crate is the seam where future coaching
-//! logic (mic capture, pitch tracking, session state) will land.
+//! v1 implements just the control plane plus a direct AudioCapture
+//! stream — no pitch detection, no separate data-plane worker. See
+//! `docs/SPEC-AppCoach.md` §0 and §7 for the v1 scope and §13 for the
+//! Phase 2 work that builds on this.
 //!
-//! Why is this an adapter and not the trait's default? The port
-//! defines the *contract*; alternative implementations may exist for
-//! testing or specialised hosts. Keeping the canonical impl in a
-//! crate lets hosts depend on a name (`adapter-app-coach`) rather
-//! than a struct from inside `domain-ports`.
+//! Hosts wire peripheral adapters (clock, telemetry, audio devices,
+//! audio capture) into [`AppCoachDeps`] and call [`new`] to get an
+//! `impl AppCoach`. They then drive the coach via [`AppCoach::send_command`]
+//! and drain state changes via [`AppCoach::poll_events`].
 
-use domain_ports::app_coach::{AppCoach, AppCoachDeps};
-use domain_ports::tel_info;
-use domain_ports::telemetry::Event;
+use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, Command, ShutdownResult};
+use std::time::Duration;
 
-/// Build the canonical [`AppCoach`]. Cheap — no allocation, no I/O.
-/// Hosts call this once and invoke `.main(deps)`.
-pub fn new() -> impl AppCoach {
-    CoachApp
+/// Build the canonical [`AppCoach`].
+///
+/// **TODO(PR 18):** this returns a stub that panics on every call.
+/// PR 18 fills in the control-plane thread, drain loop, and session
+/// state machine. The port + the new boundary land in this PR (PR 17)
+/// so the trait shape can be reviewed independently of the
+/// implementation.
+pub fn new(_deps: AppCoachDeps) -> impl AppCoach {
+    StubCoach
 }
 
-struct CoachApp;
+struct StubCoach;
 
-impl AppCoach for CoachApp {
-    fn main(&self, deps: AppCoachDeps) {
-        deps.telemetry.event(&Event::Boot {
-            app_version: deps.host_version,
-        });
-        let boot_ms = deps.clock.now_ms();
-
-        tel_info!(
-            &*deps.telemetry,
-            "gurukul: hello",
-            t_ms = deps.clock.now_ms()
-        );
-
-        deps.telemetry.event(&Event::Shutdown {
-            uptime_ms: deps.clock.now_ms().saturating_sub(boot_ms),
-        });
+impl AppCoach for StubCoach {
+    fn send_command(&self, _cmd: Command) {
+        todo!("adapter-app-coach v2 lands in PR 18")
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use domain_ports::clock::{Clock, TestClock};
-    use domain_ports::telemetry::{Level, Telemetry, TestTelemetry, Value};
-    use std::sync::Arc;
+    fn poll_events(&self, _out: &mut Vec<CoachEvent>) {
+        todo!("adapter-app-coach v2 lands in PR 18")
+    }
 
-    #[test]
-    fn main_emits_boot_then_log_then_shutdown() {
-        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(42_000_000)); // 42 ms
-        let tel = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
-        let coach = new();
-
-        coach.main(AppCoachDeps {
-            clock: Arc::clone(&clock),
-            telemetry: tel.clone() as Arc<dyn Telemetry>,
-            host_version: "1.2.3",
-        });
-
-        let logs = tel.logs();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].level, Level::Info);
-        assert_eq!(logs[0].msg, "gurukul: hello");
-        assert_eq!(logs[0].fields.get("t_ms"), Some(&Value::U64(42)));
-
-        let events = tel.events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].name, "boot");
-        assert_eq!(
-            events[0].fields.get("app_version"),
-            Some(&Value::Str("1.2.3".into()))
-        );
-        assert_eq!(events[1].name, "shutdown");
-        // Same TestClock for boot+shutdown stamps → uptime is 0.
-        assert_eq!(events[1].fields.get("uptime_ms"), Some(&Value::U64(0)));
+    fn shutdown(&self, _timeout: Duration) -> ShutdownResult {
+        todo!("adapter-app-coach v2 lands in PR 18")
     }
 }

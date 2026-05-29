@@ -5,7 +5,6 @@
 //! and the other adapters.
 
 use clap::{Parser, Subcommand};
-use domain_ports::app_coach::{AppCoach, AppCoachDeps};
 use domain_ports::audio_capture::{AudioCapture, CaptureConfig, CaptureFrame};
 use domain_ports::audio_devices::{
     AudioDevices, DeviceId, InputDevice, SampleRateSupport, Transport,
@@ -55,13 +54,20 @@ fn main() {
 }
 
 fn run_coach() {
+    // TODO(PR 19): rewire via AppCoach::send_command + poll_events.
+    // PRs 17-18 land the new boundary + implementation; this host body
+    // is rewritten in PR 19. Until then, keep the trivial boot/log/
+    // shutdown behaviour inline so the workspace stays green.
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
-    let coach = adapter_app_coach::new();
-    coach.main(AppCoachDeps {
-        clock,
-        telemetry,
-        host_version: env!("CARGO_PKG_VERSION"),
+    use domain_ports::telemetry::Event;
+    telemetry.event(&Event::Boot {
+        app_version: env!("CARGO_PKG_VERSION"),
+    });
+    let boot_ms = clock.now_ms();
+    tel_info!(&*telemetry, "gurukul: hello", t_ms = clock.now_ms());
+    telemetry.event(&Event::Shutdown {
+        uptime_ms: clock.now_ms().saturating_sub(boot_ms),
     });
 }
 

@@ -1,48 +1,219 @@
 //! AppCoach port: the singing-coach product's headless behaviour.
 //!
-//! The coach is the *product*, not a host. It owns the lifecycle of a
-//! coaching session (boot, run, shutdown) and emits telemetry along
-//! the way. A host (`coach-cli`, future `coach-mac`, `coach-watch`)
-//! wires the peripheral adapters (clock, telemetry, ...) and calls
-//! [`AppCoach::main`] from its platform entry point.
+//! The coach is the *product*, not a host. It owns a coaching session
+//! (open a mic, run the pipeline, surface state changes) and is driven
+//! from the outside via a flat command/event boundary. Hosts
+//! (`coach-cli`, future `coach-mac`, `coach-watch`) wire the
+//! peripheral adapters into [`AppCoachDeps`] and then talk to the
+//! coach only through [`AppCoach`].
 //!
-//! # Why a port for the app?
+//! # The boundary
 //!
-//! Hosts are platform shells — `fn main()`, `@main struct App`, watch
-//! glance, etc. Without this port the coach's behaviour would scatter
-//! across each host's entry point and drift. With it, each host stays
-//! a wire-only adapter and the coach behaviour lives in
-//! `adapter-app-coach`, exercised by tests that inject fakes through
-//! [`AppCoachDeps`].
+//! Three operations:
 //!
-//! # Shape
+//! - [`AppCoach::send_command`] — enqueue an intent (non-blocking).
+//! - [`AppCoach::poll_events`] — drain the outbound event queue.
+//! - [`AppCoach::shutdown`] — synchronously tear down with a timeout.
 //!
-//! [`AppCoachDeps`] is a plain-old-data bag of `Arc<dyn Port>`s the
-//! coach needs. Hosts construct it once at boot; the coach uses it for
-//! the duration of `main`. Add fields here as new ports land.
+//! The boundary is deliberately FFI-friendly. Phase 2 will add
+//! `latest_pitch()` as a snapshot read for the firehose of pitch
+//! readings; v1 does no pitch detection so that method does not exist
+//! yet.
+//!
+//! See `docs/SPEC-AppCoach.md` for the full design context and the
+//! deferred Phase 2 scope.
+//!
+//! # Sealed subsystem
+//!
+//! Once constructed, the coach is sealed: it owns its internal
+//! threading and the lifecycle of any open audio stream. Hosts never
+//! touch its internals and never re-enter the adapters they passed
+//! in. This is the load-bearing constraint of the design.
 
+use crate::audio_capture::AudioCapture;
+use crate::audio_devices::{AudioDevices, DeviceId, InputDevice};
 use crate::clock::Clock;
 use crate::telemetry::Telemetry;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Everything the coach needs to run, supplied by its host.
 ///
-/// Host code (`apps/<host>/src/main.rs`) builds this once after wiring
-/// peripheral adapters, then calls [`AppCoach::main`].
+/// Hosts build this once after wiring peripheral adapters, hand it to
+/// [`AppCoach::new`]-style constructors in the adapter crate, and
+/// never touch the contained ports again.
 pub struct AppCoachDeps {
     pub clock: Arc<dyn Clock>,
     pub telemetry: Arc<dyn Telemetry>,
-    /// `CARGO_PKG_VERSION` of the *host* binary. Lets the coach stamp
-    /// boot events with the version the user is actually running,
-    /// rather than the adapter's own version (which is meaningless to
-    /// the warehouse).
+    pub audio_devices: Arc<dyn AudioDevices>,
+    pub audio_capture: Arc<dyn AudioCapture>,
+    /// `CARGO_PKG_VERSION` of the *host* binary. Stamped on lifecycle
+    /// telemetry so warehouse data attributes behaviour to the version
+    /// the user is actually running, not the adapter's own version.
     pub host_version: &'static str,
 }
 
-/// The coach's headless entry point.
+// ---------------------------------------------------------------------
+// Commands (head → coach)
+// ---------------------------------------------------------------------
+
+/// Intents the host sends to the coach. Async by construction: each
+/// command is enqueued and processed by the coach's control plane;
+/// the resulting state change surfaces as a [`CoachEvent`].
 ///
-/// Blocking: returns when the coaching session ends. The host is
-/// responsible for whatever happens after (exit, event loop, ...).
-pub trait AppCoach: Send + Sync {
-    fn main(&self, deps: AppCoachDeps);
+/// Commands in unexpected states (e.g. [`Command::StartSession`] while
+/// already running) are silent no-ops — the coach logs at `Debug`
+/// level via telemetry and discards. Heads do not need to track which
+/// commands are legal in which states.
+pub enum Command {
+    /// Enumerate input devices. The coach replies with
+    /// [`CoachEvent::DevicesListed`].
+    ListDevices,
+
+    /// Open the selected device and start a session.
+    /// `Idle → Starting → Running` on success;
+    /// `Idle → Starting → Error` on failure.
+    StartSession(SessionConfig),
+
+    /// Tear down the current session.
+    /// `Running → Stopping → Idle`.
+    ///
+    /// Issued while `Starting` (before the data plane has acked
+    /// `CaptureStarted`): cancels the in-flight start and transitions
+    /// `Starting → Stopping → Idle` with no spurious `Running` flash.
+    StopSession,
+}
+
+/// What the host wants to capture from.
+pub struct SessionConfig {
+    /// Identifies the device to open. `None` requests the system's
+    /// multimedia-role default input.
+    ///
+    /// Heads pass through a [`DeviceId`] they obtained from a prior
+    /// [`CoachEvent::DevicesListed`] or
+    /// [`CoachEvent::DefaultInputChanged`] — they cannot fabricate one.
+    pub device_id: Option<DeviceId>,
+
+    /// `None` lets the coach pick (today: prefer 48000 if supported,
+    /// else the lowest supported rate).
+    pub sample_rate: Option<u32>,
+
+    /// `None` lets the adapter pick. Smaller values lower IO callback
+    /// latency at the cost of more frequent wakeups; sizes outside the
+    /// device's supported range surface as
+    /// [`CoachEvent::SessionError`] with
+    /// [`SessionErrorKind::UnsupportedConfig`].
+    pub buffer_frames: Option<u32>,
+}
+
+// ---------------------------------------------------------------------
+// Events (coach → head)
+// ---------------------------------------------------------------------
+
+/// Notifications the coach pushes to its outbound queue. Heads drain
+/// with [`AppCoach::poll_events`] on their own cadence (the queue is
+/// bounded — see [`CoachEvent::EventsDropped`]).
+pub enum CoachEvent {
+    /// Reply to [`Command::ListDevices`].
+    DevicesListed { devices: Vec<InputDevice> },
+
+    /// The session state machine moved.
+    SessionStateChanged { new_state: SessionState },
+
+    /// Accompanies an `→ Error` transition with detail. `kind` lets
+    /// heads branch / localize; `reason` is free-form for logs.
+    SessionError {
+        kind: SessionErrorKind,
+        reason: String,
+    },
+
+    /// The OS-default input device changed (hotplug, user pref).
+    /// Unsolicited; the host did not trigger it. Payload is the new
+    /// default id; heads re-issue [`Command::ListDevices`] if they
+    /// need the full updated list.
+    ///
+    /// **v1 note:** no device-listener port exists yet, so the coach
+    /// never emits this in v1. The variant exists so heads can match
+    /// exhaustively today and the Phase-2 emitter is non-breaking.
+    DefaultInputChanged { new_default: Option<DeviceId> },
+
+    /// The outbound queue overflowed and the coach dropped events.
+    /// Surfaced as a single event per drop-burst (not one per dropped
+    /// event). Heads SHOULD drain at ≥10Hz to avoid this.
+    EventsDropped { count: u32 },
+}
+
+/// Where the session is in its lifecycle. Heads render UI off this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Idle,
+    /// `StartSession` accepted; data plane round-trip in flight.
+    Starting,
+    Running,
+    /// `StopSession` accepted; data plane teardown in flight.
+    Stopping,
+    /// Terminal error state. Recoverable only via `StopSession` (→
+    /// `Idle`) followed by a new `StartSession`.
+    Error,
+}
+
+/// Why the session entered [`SessionState::Error`]. Closed set so
+/// heads can match exhaustively; an accompanying `reason: String`
+/// carries adapter-specific detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionErrorKind {
+    /// Device gone / refused open / requested id is stale.
+    DeviceUnavailable,
+    /// Rate / channels / buffer rejected by the device.
+    UnsupportedConfig,
+    /// The audio stream failed mid-session (e.g. device unplugged).
+    MidStreamFailure,
+    Other,
+    // `WorkerPanic` is Phase 2 — there is no worker in v1 to detect.
+}
+
+// ---------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------
+
+/// Outcome of [`AppCoach::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownResult {
+    /// Threads joined, audio stream closed, all clean.
+    Clean,
+    /// Timeout elapsed before the coach finished tearing down. The
+    /// coach forcibly detaches whatever is still running and logs the
+    /// leak via telemetry. Heads should treat this as a degraded exit.
+    TimedOut,
+    /// `shutdown` was called more than once. Idempotent.
+    AlreadyShutDown,
+}
+
+// ---------------------------------------------------------------------
+// Trait
+// ---------------------------------------------------------------------
+
+/// The coach's flat boundary.
+///
+/// **Not `Send`** to match the constraints of the underlying audio
+/// streams ([`CaptureSession`](crate::audio_capture::CaptureSession)
+/// is `!Send` on macOS). Heads construct, use, shut down, and drop on
+/// the same thread.
+pub trait AppCoach {
+    /// Enqueue a command. Non-blocking. Commands in unexpected states
+    /// are silently dropped (logged at `Debug`).
+    fn send_command(&self, cmd: Command);
+
+    /// Drain the outbound queue into `out`. Non-blocking; returns
+    /// immediately with whatever events are pending.
+    fn poll_events(&self, out: &mut Vec<CoachEvent>);
+
+    /// Synchronously tear down, waiting up to `timeout` for clean
+    /// teardown. On timeout the coach detaches whatever is still
+    /// running and returns [`ShutdownResult::TimedOut`]. Subsequent
+    /// calls return [`ShutdownResult::AlreadyShutDown`].
+    ///
+    /// `Drop` calls `shutdown(Duration::ZERO)` as a last-resort
+    /// cleanup if the head forgot to shut down explicitly.
+    fn shutdown(&self, timeout: Duration) -> ShutdownResult;
 }
