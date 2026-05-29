@@ -66,6 +66,7 @@ impl std::fmt::Display for DeviceId {
 ///
 /// A device has one or more [`InputStream`]s — most consumer devices
 /// have exactly one; multi-input interfaces have several.
+#[derive(Clone)]
 pub struct InputDevice {
     /// Stable across reboots / replugs where the platform supports
     /// it. `None` on Android and bare ALSA. Treat as opaque; do not
@@ -87,6 +88,7 @@ pub struct InputDevice {
 ///
 /// On a built-in mic this is "the mic." On a Scarlett 18i20 this is
 /// "Input 1/2" or "ADAT 1-8".
+#[derive(Clone)]
 pub struct InputStream {
     /// Opaque, **session-scoped** identifier. The capture port (future)
     /// will accept this to open the stream. Do not persist; do not

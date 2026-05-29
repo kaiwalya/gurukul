@@ -460,9 +460,6 @@ impl ControlPlane {
 
     /// Build the per-frame callback that runs on cpal's RT thread.
     /// Logs at `[DEBUG]` for parity with today's `capture` subcommand.
-    /// Owns clones of the telemetry sink and the self-sender (for
-    /// reporting mid-stream errors — currently unused here, but the
-    /// channel hop is the model future work will rely on).
     fn build_frame_callback(&self, _channels: u16) -> CaptureCallback {
         let telemetry = Arc::clone(&self.deps.telemetry);
         Box::new(move |frame: CaptureFrame<'_>| {

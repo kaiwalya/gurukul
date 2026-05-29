@@ -1,30 +1,33 @@
 //! coach-cli entry point.
 //!
-//! The host's job is wiring: build peripheral adapters, dispatch on
-//! the subcommand. Real product behaviour lives in `adapter-app-coach`
-//! and the other adapters.
+//! The CLI is a *head*: a thin shell that wires peripheral adapters
+//! into an [`AppCoach`], translates subcommands into [`Command`]s,
+//! drains [`CoachEvent`]s, and prints. Real product behaviour
+//! (state machine, capture lifecycle, telemetry) lives in
+//! `adapter-app-coach`.
+//!
+//! See `docs/SPEC-AppCoach.md` for the boundary contract.
 
 use clap::{Parser, Subcommand};
-use domain_ports::audio_capture::{AudioCapture, CaptureConfig, CaptureFrame};
-use domain_ports::audio_devices::{
-    AudioDevices, DeviceId, InputDevice, SampleRateSupport, Transport,
+use domain_ports::app_coach::{
+    AppCoach, AppCoachDeps, CoachEvent, Command, SessionConfig, SessionState, ShutdownResult,
 };
+use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
 use domain_ports::clock::Clock;
-use domain_ports::telemetry::{Level, Telemetry};
-use domain_ports::{fields, tel_info, tel_warn};
+use domain_ports::telemetry::Telemetry;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "coach-cli", version, about = "gurukul singing-coach CLI")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Option<Subcmd>,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Subcmd {
     /// Run the coach (default when no subcommand is given).
     Run,
     /// Enumerate audio input devices and print a summary.
@@ -43,159 +46,170 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run_coach(),
-        Command::ListDevices => list_devices(),
-        Command::Capture {
+    match cli.command.unwrap_or(Subcmd::Run) {
+        Subcmd::Run => run_coach(),
+        Subcmd::ListDevices => list_devices(),
+        Subcmd::Capture {
             duration_ms,
             persistent_id,
         } => capture(duration_ms, persistent_id),
     }
 }
 
-fn run_coach() {
-    // TODO(PR 19): rewire via AppCoach::send_command + poll_events.
-    // PRs 17-18 land the new boundary + implementation; this host body
-    // is rewritten in PR 19. Until then, keep the trivial boot/log/
-    // shutdown behaviour inline so the workspace stays green.
+/// Default head loop sleep between event drains. 50ms = 20Hz,
+/// comfortably above the spec's 10Hz floor.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn build_coach() -> impl AppCoach {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
-    use domain_ports::telemetry::Event;
-    telemetry.event(&Event::Boot {
-        app_version: env!("CARGO_PKG_VERSION"),
-    });
-    let boot_ms = clock.now_ms();
-    tel_info!(&*telemetry, "gurukul: hello", t_ms = clock.now_ms());
-    telemetry.event(&Event::Shutdown {
-        uptime_ms: clock.now_ms().saturating_sub(boot_ms),
-    });
+    let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
+    let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
+
+    adapter_app_coach::new(AppCoachDeps {
+        clock,
+        telemetry,
+        audio_devices,
+        audio_capture,
+        host_version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn run_coach() {
+    // No subcommand: just boot the coach and immediately shut it down,
+    // so telemetry emits the lifecycle events. The interactive REPL is
+    // a future PR.
+    let coach = build_coach();
+    let _ = coach.shutdown(SHUTDOWN_TIMEOUT);
 }
 
 fn list_devices() {
-    let devices_port = adapter_audio_cpal::new_devices();
-    let devices = devices_port.list_devices();
-    let default_name = devices_port.default_input().map(|s| s.name);
+    let coach = build_coach();
+    coach.send_command(Command::ListDevices);
 
-    if devices.is_empty() {
-        println!("No input devices found.");
-        return;
-    }
-
-    println!("Input devices ({}):", devices.len());
-    for d in &devices {
-        print_device(d, default_name.as_deref());
-    }
-}
-
-fn capture(duration_ms: u64, persistent_id: Option<String>) {
-    let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
-    let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
-
-    let devices_port = adapter_audio_cpal::new_devices();
-    let chosen = match persistent_id.as_ref().map(|s| DeviceId(s.clone())) {
-        Some(pid) => devices_port
-            .list_devices()
-            .into_iter()
-            .find(|d| d.persistent_id.as_ref() == Some(&pid))
-            .and_then(|mut d| d.streams.pop()),
-        None => devices_port.default_input(),
-    };
-    let Some(stream_info) = chosen else {
-        tel_warn!(
-            &*telemetry,
-            "capture: no matching device",
-            persistent_id = persistent_id.clone().unwrap_or_default(),
-        );
-        return;
-    };
-
-    let sample_rate = preferred_sample_rate(&stream_info.sample_rates);
-    let channels = stream_info.channels;
-
-    tel_info!(
-        &*telemetry,
-        "capture: opening input",
-        device = stream_info.name.clone(),
-        sample_rate = sample_rate,
-        channels = channels as u32,
-        duration_ms = duration_ms,
-    );
-
-    let telemetry_for_cb = Arc::clone(&telemetry);
-
-    let capture_port = adapter_audio_cpal::new_capture(Arc::clone(&clock));
-    let cfg = CaptureConfig {
-        sample_rate,
-        channels,
-        buffer_frames: Some(sample_rate / 100),
-    };
-    let session = match capture_port.open(
-        stream_info.handle.clone(),
-        cfg,
-        Box::new(move |frame: CaptureFrame<'_>| {
-            let (min, max, sum_sq) = frame.samples.iter().fold(
-                (f32::INFINITY, f32::NEG_INFINITY, 0.0_f64),
-                |(mn, mx, ss), &s| (mn.min(s), mx.max(s), ss + (s as f64) * (s as f64)),
-            );
-            let vpp = max - min;
-            let mid = (max + min) * 0.5;
-            let rms = if frame.samples.is_empty() {
-                0.0
-            } else {
-                (sum_sq / frame.samples.len() as f64).sqrt() as f32
-            };
-            telemetry_for_cb.log(
-                Level::Debug,
-                "capture frame",
-                &fields! {
-                    t_ms = frame.t_ms,
-                    frames = frame.frames as u64,
-                    vpp = format!("{vpp:.4}"),
-                    mid = format!("{mid:+.4}"),
-                    rms = format!("{rms:.4}"),
-                },
-            );
-        }),
+    let devices = match wait_for(
+        &coach,
+        Duration::from_secs(2),
+        |ev| -> Option<Vec<InputDevice>> {
+            match ev {
+                CoachEvent::DevicesListed { devices } => Some(devices.clone()),
+                _ => None,
+            }
+        },
     ) {
-        Ok(s) => s,
-        Err(e) => {
-            tel_warn!(&*telemetry, "capture: open failed", error = e.to_string());
+        Some(d) => d,
+        None => {
+            eprintln!("list-devices: timed out waiting for DevicesListed");
+            shutdown(&coach);
             return;
         }
     };
 
-    thread::sleep(Duration::from_millis(duration_ms));
-    drop(session);
-
-    tel_info!(&*telemetry, "capture: done");
+    print_device_list(&devices);
+    shutdown(&coach);
 }
 
-/// Pick a sample rate to request from the stream. For ranges we
-/// prefer 48000 if it falls in any range, else the lowest range
-/// minimum we see, else 48000 as a guess for `ProbeOnly`.
-fn preferred_sample_rate(s: &SampleRateSupport) -> u32 {
-    const PREFERRED: u32 = 48_000;
-    match s {
-        SampleRateSupport::List(rates) => {
-            if rates.contains(&PREFERRED) {
-                PREFERRED
-            } else {
-                rates.first().copied().unwrap_or(PREFERRED)
+fn capture(duration_ms: u64, persistent_id: Option<String>) {
+    let coach = build_coach();
+
+    let cfg = SessionConfig {
+        device_id: persistent_id.map(DeviceId),
+        sample_rate: None,
+        buffer_frames: None,
+    };
+    coach.send_command(Command::StartSession(cfg));
+
+    // Wait for Running, or an error.
+    let started = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
+        CoachEvent::SessionStateChanged {
+            new_state: SessionState::Running,
+        } => Some(Ok(())),
+        CoachEvent::SessionError { kind, reason } => Some(Err((*kind, reason.clone()))),
+        _ => None,
+    });
+
+    match started {
+        Some(Ok(())) => {}
+        Some(Err((kind, reason))) => {
+            eprintln!("capture: session error: {kind:?}: {reason}");
+            shutdown(&coach);
+            return;
+        }
+        None => {
+            eprintln!("capture: timed out waiting for Running");
+            shutdown(&coach);
+            return;
+        }
+    }
+
+    // Capture runs in the coach; the head just waits.
+    thread::sleep(Duration::from_millis(duration_ms));
+
+    coach.send_command(Command::StopSession);
+    let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
+        CoachEvent::SessionStateChanged {
+            new_state: SessionState::Idle,
+        } => Some(()),
+        _ => None,
+    });
+
+    shutdown(&coach);
+}
+
+/// Drain events until `pred` returns `Some(T)` or `timeout` elapses.
+///
+/// Events that don't match the predicate are dropped (the CLI head
+/// doesn't need them — it's a one-shot script, not a long-running
+/// state renderer). A future head with a UI would route everything
+/// through a state model instead.
+fn wait_for<T>(
+    coach: &impl AppCoach,
+    timeout: Duration,
+    mut pred: impl FnMut(&CoachEvent) -> Option<T>,
+) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        coach.poll_events(&mut buf);
+        for ev in &buf {
+            if let Some(t) = pred(ev) {
+                return Some(t);
             }
         }
-        SampleRateSupport::Ranges(ranges) => {
-            for (lo, hi) in ranges {
-                if (*lo..=*hi).contains(&PREFERRED) {
-                    return PREFERRED;
-                }
-            }
-            ranges.iter().map(|(lo, _)| *lo).min().unwrap_or(PREFERRED)
+        if Instant::now() >= deadline {
+            return None;
         }
-        SampleRateSupport::ProbeOnly => PREFERRED,
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn print_device(d: &InputDevice, default_name: Option<&str>) {
+fn shutdown(coach: &impl AppCoach) {
+    match coach.shutdown(SHUTDOWN_TIMEOUT) {
+        ShutdownResult::Clean | ShutdownResult::AlreadyShutDown => {}
+        ShutdownResult::TimedOut => {
+            eprintln!("coach-cli: shutdown timed out after {SHUTDOWN_TIMEOUT:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Printing
+// ---------------------------------------------------------------------
+
+fn print_device_list(devices: &[InputDevice]) {
+    if devices.is_empty() {
+        println!("No input devices found.");
+        return;
+    }
+    println!("Input devices ({}):", devices.len());
+    for d in devices {
+        print_device(d);
+    }
+}
+
+fn print_device(d: &InputDevice) {
     println!();
     println!("  {}", d.name);
     println!("    transport:     {}", transport_str(d.transport));
@@ -204,15 +218,14 @@ fn print_device(d: &InputDevice, default_name: Option<&str>) {
         None => println!("    persistent_id: <none>"),
     }
     for s in &d.streams {
-        let is_default = default_name == Some(s.name.as_str());
-        let marker = if is_default { " [default]" } else { "" };
-        println!("    stream: {}{}", s.name, marker);
+        println!("    stream: {}", s.name);
         println!("      channels:     {}", s.channels);
         println!("      sample_rates: {}", sample_rates_str(&s.sample_rates));
     }
 }
 
-fn transport_str(t: Transport) -> &'static str {
+fn transport_str(t: domain_ports::audio_devices::Transport) -> &'static str {
+    use domain_ports::audio_devices::Transport;
     match t {
         Transport::BuiltIn => "built-in",
         Transport::Usb => "usb",
