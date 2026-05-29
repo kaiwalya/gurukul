@@ -10,7 +10,8 @@
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, SessionConfig, SessionState, ShutdownResult,
+    AppCoach, AppCoachDeps, CoachEvent, Command, PitchReading, SessionConfig, SessionState,
+    ShutdownResult,
 };
 use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
 use domain_ports::clock::Clock;
@@ -41,6 +42,13 @@ enum Subcmd {
         /// open. Default: system multimedia-role default input.
         #[arg(long)]
         persistent_id: Option<String>,
+        /// Print the live pitch estimate (note + cents) while
+        /// capturing. The CLI polls `latest_pitch()` at ~20 Hz; the
+        /// data plane publishes at ~85 Hz (hop=512 @ 48k), so most
+        /// polls land on a fresh reading. `--` shown for unvoiced
+        /// frames (silence, breath, noise).
+        #[arg(long)]
+        show_pitch: bool,
     },
 }
 
@@ -52,7 +60,8 @@ fn main() {
         Subcmd::Capture {
             duration_ms,
             persistent_id,
-        } => capture(duration_ms, persistent_id),
+            show_pitch,
+        } => capture(duration_ms, persistent_id, show_pitch),
     }
 }
 
@@ -110,7 +119,7 @@ fn list_devices() {
     shutdown(&coach);
 }
 
-fn capture(duration_ms: u64, persistent_id: Option<String>) {
+fn capture(duration_ms: u64, persistent_id: Option<String>, show_pitch: bool) {
     let coach = build_coach();
 
     let cfg = SessionConfig {
@@ -143,8 +152,11 @@ fn capture(duration_ms: u64, persistent_id: Option<String>) {
         }
     }
 
-    // Capture runs in the coach; the head just waits.
-    thread::sleep(Duration::from_millis(duration_ms));
+    if show_pitch {
+        run_pitch_loop(&coach, Duration::from_millis(duration_ms));
+    } else {
+        thread::sleep(Duration::from_millis(duration_ms));
+    }
 
     coach.send_command(Command::StopSession);
     let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
@@ -155,6 +167,55 @@ fn capture(duration_ms: u64, persistent_id: Option<String>) {
     });
 
     shutdown(&coach);
+}
+
+/// Poll `latest_pitch()` at the head's frame cadence and print one line
+/// per fresh reading. Deduplicates by `t_ms` so the printed rate
+/// matches the publisher rate (~85Hz at 48k/hop=512), not the polling
+/// rate. Unvoiced frames (f0 == 0.0) render as `--`.
+fn run_pitch_loop(coach: &impl AppCoach, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    let mut last_t: u64 = u64::MAX;
+    while Instant::now() < deadline {
+        if let Some(reading) = coach.latest_pitch() {
+            if reading.t_ms != last_t {
+                last_t = reading.t_ms;
+                print_pitch(&reading);
+            }
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn print_pitch(r: &PitchReading) {
+    if r.f0_hz <= 0.0 {
+        println!("[{:>10} ms]  --", r.t_ms);
+        return;
+    }
+    let (note, cents) = note_and_cents(r.f0_hz);
+    println!(
+        "[{:>10} ms]  {:>10.2} Hz  {:>4}  {:+5} cents",
+        r.t_ms, r.f0_hz, note, cents
+    );
+}
+
+/// Convert a frequency in Hz to the nearest equal-temperament note name
+/// plus cents offset, using A4 = 440 Hz. Returns ("A4", 0) for an exact
+/// 440 Hz input.
+fn note_and_cents(f0_hz: f32) -> (String, i32) {
+    const A4_HZ: f32 = 440.0;
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    // Semitones from A4. A4 is index 9 within octave 4.
+    let semis_from_a4 = 12.0 * (f0_hz / A4_HZ).log2();
+    let nearest = semis_from_a4.round() as i32;
+    let cents = ((semis_from_a4 - nearest as f32) * 100.0).round() as i32;
+    // MIDI note number, with A4 = 69.
+    let midi = 69 + nearest;
+    let name_idx = midi.rem_euclid(12) as usize;
+    let octave = midi.div_euclid(12) - 1;
+    (format!("{}{}", NAMES[name_idx], octave), cents)
 }
 
 /// Drain events until `pred` returns `Some(T)` or `timeout` elapses.

@@ -7,10 +7,12 @@
 //! [`AppCoach::send_command`]) and (in Phase 2) internal acks from the
 //! audio callback.
 
+use crate::data_plane::{push_samples, DataPlane, DataPlaneDeps};
 use crate::helpers::{classify_open_error, preferred_sample_rate};
 use crate::outbound::OutboundQueue;
+use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoachDeps, CoachEvent, Command, SessionConfig, SessionErrorKind, SessionState,
+    AppCoachDeps, CoachEvent, Command, PitchReading, SessionConfig, SessionErrorKind, SessionState,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
@@ -38,12 +40,17 @@ pub(crate) struct ControlPlane {
     deps: AppCoachDeps,
     outbound: Arc<Mutex<OutboundQueue>>,
     rx: mpsc::Receiver<Input>,
+    pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
 
     state: SessionState,
     /// Set when a [`SessionConfig`] has been accepted and the cpal
     /// stream is open. `None` in `Idle` / `Error`. Lives on this
     /// thread — `CaptureSession` is `!Send`.
     capture: Option<CaptureSession>,
+    /// Set when a session is running. Owns the worker thread and
+    /// the SPSC ring's worker-side consumer. The producer half lives
+    /// inside the capture callback.
+    data_plane: Option<DataPlane>,
 }
 
 impl ControlPlane {
@@ -51,13 +58,16 @@ impl ControlPlane {
         deps: AppCoachDeps,
         outbound: Arc<Mutex<OutboundQueue>>,
         rx: mpsc::Receiver<Input>,
+        pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
     ) -> Self {
         Self {
             deps,
             outbound,
             rx,
+            pitch_publisher,
             state: SessionState::Idle,
             capture: None,
+            data_plane: None,
         }
     }
 
@@ -81,10 +91,19 @@ impl ControlPlane {
             }
         }
 
-        // Drop the open capture (if any) on this thread.
+        // Drop the open capture (if any) on this thread; this halts
+        // the cpal RT callback so no more samples are pushed into the
+        // ring. Then stop the worker — it sees its consumer go empty
+        // / producer dropped and exits its loop on the next tick.
         if let Some(session) = self.capture.take() {
             drop(session);
         }
+        if let Some(dp) = self.data_plane.take() {
+            dp.stop(&*self.deps.telemetry);
+        }
+        // Clear any stale reading so a head polling after shutdown
+        // sees `None` instead of the last-known f0.
+        self.pitch_publisher.store(Arc::new(None));
         tel_info!(
             &*self.deps.telemetry,
             "app-coach: control plane down",
@@ -143,7 +162,23 @@ impl ControlPlane {
             buffer_frames,
         };
 
-        let callback = self.build_frame_callback(channels);
+        // Spawn the data plane first so its ring producer is in hand
+        // before cpal can fire the callback. If engine build / thread
+        // spawn fails we surface as Other and skip opening the device.
+        let (data_plane, producer, dropped_for_cb) = match DataPlane::start(DataPlaneDeps {
+            sample_rate,
+            pitch_publisher: Arc::clone(&self.pitch_publisher),
+            clock: Arc::clone(&self.deps.clock),
+            telemetry: Arc::clone(&self.deps.telemetry),
+        }) {
+            Ok(t) => t,
+            Err(e) => {
+                self.fail(SessionErrorKind::Other, e.to_string());
+                return;
+            }
+        };
+
+        let callback = self.build_frame_callback(channels, producer, dropped_for_cb);
 
         match self
             .deps
@@ -152,6 +187,7 @@ impl ControlPlane {
         {
             Ok(session) => {
                 self.capture = Some(session);
+                self.data_plane = Some(data_plane);
                 tel_info!(
                     &*self.deps.telemetry,
                     "app-coach: capture started",
@@ -163,6 +199,11 @@ impl ControlPlane {
                 self.transition(SessionState::Running);
             }
             Err(e) => {
+                // Capture refused. The data plane is still spinning
+                // (with no producer left, since `producer` moved into
+                // the callback which we've now dropped). Stop it so
+                // its worker thread joins before we surface the error.
+                data_plane.stop(&*self.deps.telemetry);
                 let (kind, reason) = classify_open_error(e);
                 self.fail(kind, reason);
             }
@@ -179,16 +220,12 @@ impl ControlPlane {
                 // but the spec says Stop-during-Start cancels, so
                 // we model it: if capture was opened, drop it.
                 self.transition(SessionState::Stopping);
-                if let Some(session) = self.capture.take() {
-                    drop(session);
-                }
+                self.teardown_data_path();
                 self.transition(SessionState::Idle);
             }
             SessionState::Error => {
                 // Idempotent cleanup.
-                if let Some(session) = self.capture.take() {
-                    drop(session);
-                }
+                self.teardown_data_path();
                 self.transition(SessionState::Idle);
             }
             SessionState::Idle | SessionState::Stopping => {
@@ -199,6 +236,21 @@ impl ControlPlane {
                 );
             }
         }
+    }
+
+    /// Drop the capture (stops RT callback, drops the ring producer),
+    /// then join the data-plane worker and clear the pitch publisher.
+    /// Ordering matters: capture must die before the worker is asked
+    /// to stop, otherwise the worker may still be draining a final
+    /// burst when we tear down its consumer.
+    fn teardown_data_path(&mut self) {
+        if let Some(session) = self.capture.take() {
+            drop(session);
+        }
+        if let Some(dp) = self.data_plane.take() {
+            dp.stop(&*self.deps.telemetry);
+        }
+        self.pitch_publisher.store(Arc::new(None));
     }
 
     fn fail(&mut self, kind: SessionErrorKind, reason: String) {
@@ -243,30 +295,45 @@ impl ControlPlane {
     }
 
     /// Build the per-frame callback that runs on cpal's RT thread.
-    /// Logs at `[DEBUG]` for parity with today's `capture` subcommand.
-    fn build_frame_callback(&self, _channels: u16) -> CaptureCallback {
-        let telemetry = Arc::clone(&self.deps.telemetry);
+    /// Pushes the (mono) samples into the SPSC ring for the data-plane
+    /// worker to consume. Multi-channel input is downmixed to mono by
+    /// averaging interleaved channels — the engine expects mono.
+    ///
+    /// Realtime-safe: `push_samples` only touches lock-free atomics,
+    /// the downmix is stack-only, the `Vec` capacity is reused across
+    /// callbacks (allocated lazily on the first frame).
+    fn build_frame_callback(
+        &self,
+        channels: u16,
+        mut producer: rtrb::Producer<f32>,
+        samples_dropped: Arc<std::sync::atomic::AtomicU64>,
+    ) -> CaptureCallback {
+        // Pre-sized scratch for downmix. Sized at first callback (cpal
+        // doesn't tell us the actual buffer size up front). Capacity
+        // is reused thereafter so the RT path stays alloc-free in
+        // steady state.
+        let mut mono_scratch: Vec<f32> = Vec::new();
+        let channels = channels.max(1) as usize;
         Box::new(move |frame: CaptureFrame<'_>| {
-            let (min, max, sum_sq) = frame.samples.iter().fold(
-                (f32::INFINITY, f32::NEG_INFINITY, 0.0_f64),
-                |(mn, mx, ss), &s| (mn.min(s), mx.max(s), ss + (s as f64) * (s as f64)),
-            );
-            let vpp = max - min;
-            let mid = (max + min) * 0.5;
-            let rms = if frame.samples.is_empty() {
-                0.0
+            if channels == 1 {
+                push_samples(&mut producer, frame.samples, &samples_dropped);
             } else {
-                (sum_sq / frame.samples.len() as f64).sqrt() as f32
-            };
-            tel_debug!(
-                &*telemetry,
-                "capture frame",
-                t_ms = frame.t_ms,
-                frames = frame.frames as u64,
-                vpp = format!("{vpp:.4}"),
-                mid = format!("{mid:+.4}"),
-                rms = format!("{rms:.4}"),
-            );
+                let frames = frame.frames;
+                if mono_scratch.capacity() < frames {
+                    mono_scratch.reserve(frames - mono_scratch.capacity());
+                }
+                mono_scratch.clear();
+                let inv = 1.0_f32 / channels as f32;
+                for f in 0..frames {
+                    let base = f * channels;
+                    let mut sum = 0.0_f32;
+                    for c in 0..channels {
+                        sum += frame.samples[base + c];
+                    }
+                    mono_scratch.push(sum * inv);
+                }
+                push_samples(&mut producer, &mono_scratch, &samples_dropped);
+            }
         })
     }
 }

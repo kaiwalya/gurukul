@@ -1,10 +1,8 @@
 //! adapter-app-coach: the canonical [`AppCoach`] implementation.
 //!
-//! # Architecture (v1)
+//! # Architecture
 //!
-//! The implementation follows the two-plane shape from
-//! `docs/SPEC-AppCoach.md` §7, with only the control plane realised in
-//! v1 (no pitch worker, no ring, no `ArcSwap` snapshot).
+//! Implements the two-plane shape from `docs/SPEC-AppCoach.md` §7.
 //!
 //! - **Control plane**: a single owned thread that drains an MPSC of
 //!   [`Input`](control_plane::Input) values. Every session-state
@@ -12,13 +10,11 @@
 //!   ordering question. The [`Input`](control_plane::Input) enum
 //!   unifies head commands (delivered via [`AppCoach::send_command`])
 //!   and (in Phase 2) internal acks from the audio callback.
-//! - **Data plane** in v1 is just the open
-//!   [`CaptureSession`](domain_ports::audio_capture::CaptureSession),
-//!   held by the control-plane thread (it's `!Send` on macOS, so it
-//!   cannot live anywhere else). The cpal callback runs on its own
-//!   RT thread but only writes a `[DEBUG]` log line per frame for
-//!   parity with today's `coach-cli capture` subcommand. Phase 2
-//!   replaces the log with a ring write + pitch worker.
+//! - **Data plane**: an SPSC ring fed by the cpal RT callback,
+//!   drained by a worker thread that runs the dsp engine (PitchYin
+//!   from [`pitch_world`]) and publishes the latest f0 estimate into
+//!   an `ArcSwap<Option<PitchReading>>`. Heads sample with
+//!   [`AppCoach::latest_pitch`].
 //!
 //! # Outbound events
 //!
@@ -40,6 +36,10 @@
 //!
 //! - [`control_plane`] — the thread, the [`Input`](control_plane::Input)
 //!   enum, and the session state machine.
+//! - [`data_plane`] — the worker thread, SPSC ring, and ArcSwap
+//!   publisher.
+//! - [`pitch_world`] — builds the dsp engine from the embedded
+//!   `coach.json` world.
 //! - [`outbound`] — the bounded outbound queue.
 //! - [`shutdown`] — `join_with_timeout` helper.
 //! - [`helpers`] — capture-error classification, sample-rate picker.
@@ -48,14 +48,17 @@
 //!   end-to-end boundary.
 
 mod control_plane;
+mod data_plane;
 mod helpers;
 mod outbound;
+mod pitch_world;
 mod shutdown;
 
 use control_plane::{ControlPlane, Input};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
 
+use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
     AppCoach, AppCoachDeps, CoachEvent, Command, PitchReading, ShutdownResult,
 };
@@ -75,17 +78,26 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     let outbound = Arc::new(Mutex::new(OutboundQueue::new(OUTBOUND_QUEUE_CAP)));
     let (tx_cmd, rx_cmd) = mpsc::channel::<Input>();
     let outbound_for_thread = Arc::clone(&outbound);
+    let pitch_publisher: Arc<ArcSwap<Option<PitchReading>>> = Arc::new(ArcSwap::from_pointee(None));
+    let pitch_publisher_for_thread = Arc::clone(&pitch_publisher);
 
     let control_thread = thread::Builder::new()
         .name("app-coach-control".into())
         .spawn(move || {
-            ControlPlane::new(deps, outbound_for_thread, rx_cmd).run();
+            ControlPlane::new(
+                deps,
+                outbound_for_thread,
+                rx_cmd,
+                pitch_publisher_for_thread,
+            )
+            .run();
         })
         .expect("spawn control-plane thread");
 
     CoachImpl {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
+        pitch_publisher,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     }
@@ -101,6 +113,11 @@ struct CoachImpl {
     /// makes any late `send_command` a no-op (the receiver is gone).
     tx_cmd: Mutex<Option<Sender<Input>>>,
     outbound: Arc<Mutex<OutboundQueue>>,
+    /// Lock-free snapshot of the latest pitch reading. The data plane
+    /// publishes; heads read via [`latest_pitch`]. `None` before the
+    /// first reading lands (no session running, first window still
+    /// filling, etc.).
+    pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -143,10 +160,7 @@ impl AppCoach for CoachImpl {
     }
 
     fn latest_pitch(&self) -> Option<PitchReading> {
-        // v1: the data plane lands in PR 23. The boundary exists so
-        // heads can wire up the call site now; the value is always
-        // `None` until the worker thread + ArcSwap publisher land.
-        None
+        **self.pitch_publisher.load()
     }
 }
 

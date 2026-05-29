@@ -5,6 +5,11 @@ edition = "2021"
 
 [dependencies]
 domain-ports = { path = "../../domain-ports" }
+engine = { path = "../../dsp/engine" }
+node-pitch-yin = { path = "../../dsp/node-pitch-yin" }
+serde_json = { workspace = true }
+arc-swap = "1.7"
+rtrb = "0.3"
 
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
