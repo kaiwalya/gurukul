@@ -870,4 +870,221 @@ mod tests {
             ShutdownResult::Clean
         );
     }
+
+    #[test]
+    fn stale_device_id_fails_with_device_unavailable() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        coach.send_command(Command::StartSession(SessionConfig {
+            device_id: Some(DeviceId("does-not-exist".into())),
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+        });
+
+        let (kind, _reason) = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::SessionError { kind, reason } => Some((*kind, reason.clone())),
+                _ => None,
+            })
+            .expect("SessionError");
+        assert_eq!(kind, SessionErrorKind::DeviceUnavailable);
+        // Capture must not have been opened for a stale id.
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn stop_while_idle_is_silent_no_op() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        coach.send_command(Command::StopSession);
+        // Give the control plane a beat to (not) emit anything.
+        thread::sleep(Duration::from_millis(50));
+
+        let mut buf = Vec::new();
+        coach.poll_events(&mut buf);
+        let saw_state_change = buf
+            .iter()
+            .any(|e| matches!(e, CoachEvent::SessionStateChanged { .. }));
+        assert!(
+            !saw_state_change,
+            "Stop while Idle must not emit a state change"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn start_stop_start_round_trip_resets_cleanly() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Cycle 1: Start → Running.
+        coach.send_command(Command::StartSession(SessionConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        // Stop → Idle.
+        coach.send_command(Command::StopSession);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Idle
+                    }
+                )
+            })
+        });
+
+        // Cycle 2: Start again — must reopen capture and reach Running.
+        coach.send_command(Command::StartSession(SessionConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let after = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+        let states: Vec<SessionState> = after
+            .iter()
+            .filter_map(|e| match e {
+                CoachEvent::SessionStateChanged { new_state } => Some(*new_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![SessionState::Starting, SessionState::Running],
+            "second Start must transition Idle → Starting → Running"
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "capture must be reopened on the second Start"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn events_dropped_surfaces_when_head_never_polls() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Cheap event source: ListDevices is one event per command.
+        // Send more than the queue capacity so we're guaranteed to
+        // overflow even if a few get drained by background work.
+        let burst = OUTBOUND_QUEUE_CAP + 16;
+        for _ in 0..burst {
+            coach.send_command(Command::ListDevices);
+        }
+
+        // Wait for the queue to fill and the control plane to settle.
+        // We can't observe queue length directly; poll for an
+        // EventsDropped marker, which only appears on overflow.
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::EventsDropped { .. }))
+        });
+
+        let dropped = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::EventsDropped { count } => Some(*count),
+                _ => None,
+            })
+            .expect("EventsDropped should be emitted on overflow");
+        assert!(
+            dropped >= 16,
+            "expected at least 16 drops (sent {burst}, cap {OUTBOUND_QUEUE_CAP}), got {dropped}"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn zero_timeout_shutdown_respects_contract() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Reach Running so there's actual state to tear down.
+        coach.send_command(Command::StartSession(SessionConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+
+        // shutdown(ZERO) is inherently a race between Quit landing
+        // and the control plane returning. Both outcomes are
+        // contractually valid; what's NOT valid is panicking or
+        // returning AlreadyShutDown on the first call.
+        let first = coach.shutdown(Duration::ZERO);
+        assert!(
+            matches!(first, ShutdownResult::Clean | ShutdownResult::TimedOut),
+            "first shutdown(ZERO) must be Clean or TimedOut, got {first:?}"
+        );
+
+        // Subsequent shutdown is always AlreadyShutDown, regardless
+        // of whether the thread had already finished.
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::AlreadyShutDown
+        );
+    }
 }
