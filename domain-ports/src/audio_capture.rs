@@ -46,6 +46,13 @@ use crate::audio_devices::StreamHandle;
 pub struct CaptureConfig {
     pub sample_rate: u32,
     pub channels: u16,
+    /// Requested IO buffer size in frames. `None` means "let the
+    /// adapter / driver pick" (cpal's `BufferSize::Default`). A
+    /// smaller value lowers callback latency at the cost of more
+    /// frequent wakeups; the device may reject sizes outside its
+    /// supported range, surfacing as
+    /// [`CaptureError::UnsupportedConfig`].
+    pub buffer_frames: Option<u32>,
 }
 
 /// One callback invocation worth of PCM samples.

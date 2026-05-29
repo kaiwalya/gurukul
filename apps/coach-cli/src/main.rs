@@ -11,7 +11,7 @@ use domain_ports::audio_devices::{AudioDevices, InputDevice, SampleRateSupport, 
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::{Level, Telemetry};
 use domain_ports::{fields, tel_info, tel_warn};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -28,14 +28,11 @@ enum Command {
     Run,
     /// Enumerate audio input devices and print a summary.
     ListDevices,
-    /// Open an input device and log per-window stats.
+    /// Open an input device and log per-callback stats.
     Capture {
         /// Duration to capture, in milliseconds.
         #[arg(long, default_value_t = 3000)]
         duration_ms: u64,
-        /// Stats window in milliseconds.
-        #[arg(long, default_value_t = 100)]
-        window_ms: u64,
         /// Persistent id (from `list-devices`) of the device to
         /// open. Default: system multimedia-role default input.
         #[arg(long)]
@@ -50,9 +47,8 @@ fn main() {
         Command::ListDevices => list_devices(),
         Command::Capture {
             duration_ms,
-            window_ms,
             persistent_id,
-        } => capture(duration_ms, window_ms, persistent_id),
+        } => capture(duration_ms, persistent_id),
     }
 }
 
@@ -83,7 +79,7 @@ fn list_devices() {
     }
 }
 
-fn capture(duration_ms: u64, window_ms: u64, persistent_id: Option<String>) {
+fn capture(duration_ms: u64, persistent_id: Option<String>) {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
 
@@ -115,23 +111,42 @@ fn capture(duration_ms: u64, window_ms: u64, persistent_id: Option<String>) {
         sample_rate = sample_rate,
         channels = channels as u32,
         duration_ms = duration_ms,
-        window_ms = window_ms,
     );
 
-    let window = WindowAggregator::new(window_ms, sample_rate, channels, Arc::clone(&telemetry));
-    let window = Arc::new(Mutex::new(window));
-    let window_for_cb = Arc::clone(&window);
+    let telemetry_for_cb = Arc::clone(&telemetry);
 
     let capture_port = adapter_audio_cpal::new_capture(Arc::clone(&clock));
     let cfg = CaptureConfig {
         sample_rate,
         channels,
+        buffer_frames: Some(sample_rate / 100),
     };
     let session = match capture_port.open(
         stream_info.handle.clone(),
         cfg,
         Box::new(move |frame: CaptureFrame<'_>| {
-            window_for_cb.lock().unwrap().push(&frame);
+            let (min, max, sum_sq) = frame.samples.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY, 0.0_f64),
+                |(mn, mx, ss), &s| (mn.min(s), mx.max(s), ss + (s as f64) * (s as f64)),
+            );
+            let vpp = max - min;
+            let mid = (max + min) * 0.5;
+            let rms = if frame.samples.is_empty() {
+                0.0
+            } else {
+                (sum_sq / frame.samples.len() as f64).sqrt() as f32
+            };
+            telemetry_for_cb.log(
+                Level::Debug,
+                "capture frame",
+                &fields! {
+                    t_ms = frame.t_ms,
+                    frames = frame.frames as u64,
+                    vpp = format!("{vpp:.4}"),
+                    mid = format!("{mid:+.4}"),
+                    rms = format!("{rms:.4}"),
+                },
+            );
         }),
     ) {
         Ok(s) => s,
@@ -144,8 +159,6 @@ fn capture(duration_ms: u64, window_ms: u64, persistent_id: Option<String>) {
     thread::sleep(Duration::from_millis(duration_ms));
     drop(session);
 
-    // Flush whatever is left in the current window.
-    window.lock().unwrap().flush();
     tel_info!(&*telemetry, "capture: done");
 }
 
@@ -171,95 +184,6 @@ fn preferred_sample_rate(s: &SampleRateSupport) -> u32 {
             ranges.iter().map(|(lo, _)| *lo).min().unwrap_or(PREFERRED)
         }
         SampleRateSupport::ProbeOnly => PREFERRED,
-    }
-}
-
-/// Accumulate stats across `window_ms` of audio, emit one log line
-/// per closed window.
-struct WindowAggregator {
-    samples_per_window: usize,
-    channels: u16,
-    telemetry: Arc<dyn Telemetry>,
-    accum: usize,
-    min: f32,
-    max: f32,
-    sum_sq: f64,
-    count: usize,
-    window_index: u64,
-}
-
-impl WindowAggregator {
-    fn new(window_ms: u64, sample_rate: u32, channels: u16, telemetry: Arc<dyn Telemetry>) -> Self {
-        let samples_per_window =
-            ((window_ms * sample_rate as u64) / 1000) as usize * channels.max(1) as usize;
-        Self {
-            samples_per_window,
-            channels,
-            telemetry,
-            accum: 0,
-            min: f32::INFINITY,
-            max: f32::NEG_INFINITY,
-            sum_sq: 0.0,
-            count: 0,
-            window_index: 0,
-        }
-    }
-
-    fn push(&mut self, frame: &CaptureFrame<'_>) {
-        for &s in frame.samples {
-            if s < self.min {
-                self.min = s;
-            }
-            if s > self.max {
-                self.max = s;
-            }
-            self.sum_sq += (s as f64) * (s as f64);
-            self.count += 1;
-            self.accum += 1;
-            if self.accum >= self.samples_per_window {
-                self.emit(frame.t_ms);
-                self.reset();
-            }
-        }
-    }
-
-    fn flush(&mut self) {
-        if self.count > 0 {
-            // Use 0 t_ms — we don't have a clock here; the caller
-            // already logged "capture: done".
-            self.emit(0);
-            self.reset();
-        }
-    }
-
-    fn emit(&mut self, t_ms: u64) {
-        let rms = if self.count > 0 {
-            (self.sum_sq / self.count as f64).sqrt() as f32
-        } else {
-            0.0
-        };
-        self.telemetry.log(
-            Level::Info,
-            "capture window",
-            &fields! {
-                window = self.window_index,
-                t_ms = t_ms,
-                min = self.min as f64,
-                max = self.max as f64,
-                rms = rms as f64,
-                samples = self.count as u64,
-                channels = self.channels as u32,
-            },
-        );
-        self.window_index += 1;
-    }
-
-    fn reset(&mut self) {
-        self.accum = 0;
-        self.min = f32::INFINITY;
-        self.max = f32::NEG_INFINITY;
-        self.sum_sq = 0.0;
-        self.count = 0;
     }
 }
 
