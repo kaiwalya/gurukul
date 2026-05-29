@@ -48,6 +48,20 @@
 use std::any::Any;
 use std::sync::Arc;
 
+/// Stable identifier for a device across reboots / replugs.
+///
+/// Newtype around `String` so callers can't fabricate ids — they pass
+/// through values they got from a prior [`AudioDevices::list_devices`]
+/// call. Treat the inner string as opaque; do not parse it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeviceId(pub String);
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A physical audio device (built-in mic, USB interface, etc.).
 ///
 /// A device has one or more [`InputStream`]s — most consumer devices
@@ -56,7 +70,7 @@ pub struct InputDevice {
     /// Stable across reboots / replugs where the platform supports
     /// it. `None` on Android and bare ALSA. Treat as opaque; do not
     /// parse.
-    pub persistent_id: Option<String>,
+    pub persistent_id: Option<DeviceId>,
 
     /// Human label for the physical device. Not unique — two AirPods
     /// of the same model present identical names.

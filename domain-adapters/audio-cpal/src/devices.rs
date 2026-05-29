@@ -3,7 +3,7 @@
 use crate::CpalStreamHandle;
 use cpal::traits::{DeviceTrait, HostTrait};
 use domain_ports::audio_devices::{
-    AudioDevices, InputDevice, InputStream, SampleRateSupport, StreamHandle, Transport,
+    AudioDevices, DeviceId, InputDevice, InputStream, SampleRateSupport, StreamHandle, Transport,
 };
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ fn device_to_port(device: cpal::Device) -> Option<InputDevice> {
         .as_ref()
         .map(|d| d.name().to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
-    let persistent_id = device.id().ok().map(|id| id.to_string());
+    let persistent_id = device.id().ok().map(|id| DeviceId(id.to_string()));
 
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     let mut channels: u16 = 0;

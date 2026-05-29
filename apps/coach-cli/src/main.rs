@@ -7,7 +7,9 @@
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{AppCoach, AppCoachDeps};
 use domain_ports::audio_capture::{AudioCapture, CaptureConfig, CaptureFrame};
-use domain_ports::audio_devices::{AudioDevices, InputDevice, SampleRateSupport, Transport};
+use domain_ports::audio_devices::{
+    AudioDevices, DeviceId, InputDevice, SampleRateSupport, Transport,
+};
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::{Level, Telemetry};
 use domain_ports::{fields, tel_info, tel_warn};
@@ -84,11 +86,11 @@ fn capture(duration_ms: u64, persistent_id: Option<String>) {
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
 
     let devices_port = adapter_audio_cpal::new_devices();
-    let chosen = match &persistent_id {
+    let chosen = match persistent_id.as_ref().map(|s| DeviceId(s.clone())) {
         Some(pid) => devices_port
             .list_devices()
             .into_iter()
-            .find(|d| d.persistent_id.as_ref() == Some(pid))
+            .find(|d| d.persistent_id.as_ref() == Some(&pid))
             .and_then(|mut d| d.streams.pop()),
         None => devices_port.default_input(),
     };
@@ -191,10 +193,10 @@ fn print_device(d: &InputDevice, default_name: Option<&str>) {
     println!();
     println!("  {}", d.name);
     println!("    transport:     {}", transport_str(d.transport));
-    println!(
-        "    persistent_id: {}",
-        d.persistent_id.as_deref().unwrap_or("<none>")
-    );
+    match &d.persistent_id {
+        Some(id) => println!("    persistent_id: {id}"),
+        None => println!("    persistent_id: <none>"),
+    }
     for s in &d.streams {
         let is_default = default_name == Some(s.name.as_str());
         let marker = if is_default { " [default]" } else { "" };
