@@ -173,6 +173,36 @@ pub enum SessionErrorKind {
 }
 
 // ---------------------------------------------------------------------
+// Pitch snapshot (Phase 2)
+// ---------------------------------------------------------------------
+
+/// Latest pitch estimate from the data plane.
+///
+/// Heads read this via [`AppCoach::latest_pitch`] on their own cadence
+/// (UI frame rate, log timer, etc.). The data plane publishes a new
+/// reading every `hop` samples worth of audio — typically ~85Hz at
+/// 48kHz with a hop of 512 — so heads polling at 60Hz will see fresh
+/// values most ticks and an occasional repeat.
+///
+/// Voicedness is encoded as [`f0_hz == 0.0`](Self::f0_hz): a voiced
+/// frame reports a positive Hz value; an unvoiced frame reports
+/// `0.0`. This matches the YIN node's sentinel and keeps the read
+/// path branch-free.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PitchReading {
+    /// Estimated fundamental frequency, in Hz. `0.0` means unvoiced
+    /// (silence, breath, noise — not a frequency the detector
+    /// trusts).
+    pub f0_hz: f32,
+
+    /// Wall-clock milliseconds (from the coach's [`Clock`]) at which
+    /// this reading was published. Heads use this to detect staleness
+    /// — if `t_ms` hasn't advanced between two polls, the data plane
+    /// is stalled.
+    pub t_ms: u64,
+}
+
+// ---------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------
 
@@ -216,4 +246,21 @@ pub trait AppCoach {
     /// `Drop` calls `shutdown(Duration::ZERO)` as a last-resort
     /// cleanup if the head forgot to shut down explicitly.
     fn shutdown(&self, timeout: Duration) -> ShutdownResult;
+
+    /// Snapshot the latest pitch estimate from the data plane.
+    ///
+    /// Returns `None` before the data plane has published any
+    /// reading (no session running, or session just started and the
+    /// first window hasn't accumulated yet). Otherwise returns the
+    /// most recent [`PitchReading`].
+    ///
+    /// Non-blocking, lock-free (the implementation uses an
+    /// `ArcSwap`-style snapshot). Heads should poll this at their UI
+    /// cadence — there is no event for pitch updates because the
+    /// rate (~85Hz) would saturate the bounded event queue.
+    ///
+    /// **v1 returns `None` always** — the data plane lands in a
+    /// subsequent PR. The method exists now so heads can match the
+    /// final shape without further trait churn.
+    fn latest_pitch(&self) -> Option<PitchReading>;
 }

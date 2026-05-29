@@ -56,7 +56,9 @@ use control_plane::{ControlPlane, Input};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
 
-use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, Command, ShutdownResult};
+use domain_ports::app_coach::{
+    AppCoach, AppCoachDeps, CoachEvent, Command, PitchReading, ShutdownResult,
+};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -138,6 +140,13 @@ impl AppCoach for CoachImpl {
             Some(h) => join_with_timeout(h, timeout),
             None => ShutdownResult::Clean,
         }
+    }
+
+    fn latest_pitch(&self) -> Option<PitchReading> {
+        // v1: the data plane lands in PR 23. The boundary exists so
+        // heads can wire up the call site now; the value is always
+        // `None` until the worker thread + ArcSwap publisher land.
+        None
     }
 }
 

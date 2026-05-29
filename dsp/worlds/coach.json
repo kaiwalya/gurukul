@@ -1,0 +1,26 @@
+{
+  "$schema": "../schema/world.schema.json",
+  "in_ports": [
+    { "id": "audio_in", "description": "Mono mic input written by the coach's data plane." }
+  ],
+  "out_ports": [
+    { "id": "f0_hz", "description": "Latest YIN f0 estimate in Hz; 0.0 = unvoiced (sample-and-held across the hop)." }
+  ],
+  "nodes": [
+    {
+      "id": "pitch",
+      "type": "PitchYin",
+      "params": {
+        "window": 2048,
+        "hop": 512,
+        "fmin_hz": 50,
+        "fmax_hz": 2000,
+        "threshold": 0.1
+      }
+    }
+  ],
+  "connections": [
+    { "from": "audio_in", "to": "pitch.audio_in" },
+    { "from": "pitch.f0", "to": "f0_hz" }
+  ]
+}
