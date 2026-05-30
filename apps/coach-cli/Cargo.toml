@@ -11,7 +11,10 @@ path = "src/main.rs"
 domain-ports = { path = "../../domain-ports" }
 adapter-clock-std = { path = "../../domain-adapters/clock-std" }
 adapter-telemetry-std = { path = "../../domain-adapters/telemetry-std" }
+adapter-telemetry-tui = { path = "../../domain-adapters/telemetry-tui" }
 adapter-app-coach = { path = "../../domain-adapters/app-coach" }
 adapter-audio-cpal = { path = "../../domain-adapters/audio-cpal" }
 clap = { workspace = true }
 ctrlc = "3.4"
+ratatui = { workspace = true }
+crossterm = { workspace = true }

@@ -8,6 +8,8 @@
 //!
 //! See `docs/SPEC-AppCoach.md` for the boundary contract.
 
+mod tui;
+
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
     AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionState,
@@ -31,16 +33,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Subcmd {
-    /// Run the coach (default when no subcommand is given).
-    Run,
-    /// Enumerate audio input devices and print a summary.
-    ListDevices,
-    /// Open the mic and print the live pitch — sing, hum, whistle.
-    /// One line per fresh f0 estimate (~85 Hz at 48k/hop=512); `--`
-    /// shown for unvoiced frames (silence, breath, noise).
-    Freestyle {
+    /// Open the mic and run the coach pipeline. Default when no
+    /// subcommand is given. In an interactive terminal this brings up
+    /// the TUI shell (`~` toggles a console pane showing live coach
+    /// logs; `q` / `Esc` / Ctrl-C exits). When stdout is piped or
+    /// redirected — or `--no-tui` is passed — it streams one line per
+    /// fresh f0 estimate (~85 Hz at 48k/hop=512); `--` shown for
+    /// unvoiced frames (silence, breath, noise).
+    Run {
+        /// Force the line-streaming path even in an interactive
+        /// terminal. Useful when piping into `less -R` or grepping
+        /// live output in a real TTY.
+        #[arg(long)]
+        no_tui: bool,
         /// Duration of the session, in milliseconds. Omit to run until
-        /// Ctrl-C.
+        /// Ctrl-C. Honoured in both TUI and line-streaming modes.
         #[arg(long)]
         duration_ms: Option<u64>,
         /// Persistent id (from `list-devices`) of the device to
@@ -48,17 +55,24 @@ enum Subcmd {
         #[arg(long)]
         persistent_id: Option<String>,
     },
+    /// Enumerate audio input devices and print a summary.
+    ListDevices,
 }
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Subcmd::Run) {
-        Subcmd::Run => run_coach(),
-        Subcmd::ListDevices => list_devices(),
-        Subcmd::Freestyle {
+    let cmd = cli.command.unwrap_or(Subcmd::Run {
+        no_tui: false,
+        duration_ms: None,
+        persistent_id: None,
+    });
+    match cmd {
+        Subcmd::Run {
+            no_tui,
             duration_ms,
             persistent_id,
-        } => freestyle(duration_ms, persistent_id),
+        } => run(no_tui, duration_ms, persistent_id),
+        Subcmd::ListDevices => list_devices(),
     }
 }
 
@@ -67,6 +81,10 @@ fn main() {
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Build the coach with the stderr telemetry adapter — used by
+/// short-lived non-TUI commands (`list-devices`, plain mode) where
+/// stderr is fair game. The TUI path builds the coach inline so it
+/// can also hold the [`LogBuffer`] handle.
 fn build_coach() -> impl AppCoach {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
@@ -82,12 +100,110 @@ fn build_coach() -> impl AppCoach {
     })
 }
 
-fn run_coach() {
-    // No subcommand: just boot the coach and immediately shut it down,
-    // so telemetry emits the lifecycle events. The interactive REPL is
-    // a future PR.
-    let coach = build_coach();
+/// Pick the head based on whether stdout is a real terminal. Piped or
+/// redirected output gets the line-streaming path; an interactive TTY
+/// gets the TUI shell. `--no-tui` forces the plain path even in a TTY
+/// — useful for `coach-cli | less -R` and the like.
+fn run(no_tui: bool, duration_ms: Option<u64>, persistent_id: Option<String>) {
+    let use_tui = !no_tui && std::io::stdout().is_terminal();
+    if use_tui {
+        run_tui(duration_ms, persistent_id);
+    } else {
+        run_plain(duration_ms, persistent_id);
+    }
+}
+
+fn run_tui(duration_ms: Option<u64>, persistent_id: Option<String>) {
+    // The TUI owns stdout via the alternate screen — anything that
+    // bypasses Telemetry (cpal warnings, panics) will be invisible
+    // until we leave. Acceptable v1 tradeoff. duration_ms is wired
+    // through so a `--duration-ms N` invocation auto-exits even in
+    // the shell; without it the user quits via q/Esc/Ctrl-C.
+    let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
+    let (tui_telemetry, log_buffer) = adapter_telemetry_tui::new(Arc::clone(&clock), 2048);
+    let telemetry: Arc<dyn Telemetry> = Arc::new(tui_telemetry);
+    let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
+    let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
+
+    let coach = adapter_app_coach::new(AppCoachDeps {
+        clock,
+        telemetry,
+        audio_devices,
+        audio_capture,
+        host_version: env!("CARGO_PKG_VERSION"),
+    });
+
+    coach.send_command(Command::StartSession(SessionConfig {
+        device_id: persistent_id.map(DeviceId),
+        sample_rate: None,
+        buffer_frames: None,
+    }));
+
+    let deadline = duration_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    if let Err(e) = tui::run(log_buffer, deadline) {
+        eprintln!("coach-cli: tui error: {e}");
+    }
+
+    coach.send_command(Command::StopSession);
     let _ = coach.shutdown(SHUTDOWN_TIMEOUT);
+}
+
+fn run_plain(duration_ms: Option<u64>, persistent_id: Option<String>) {
+    // Install a Ctrl-C handler before we open the mic. The handler
+    // flips an atomic that the pitch loop polls — this keeps shutdown
+    // graceful (the loop falls out, we StopSession, then shutdown the
+    // coach) instead of leaving an open cpal stream when the process
+    // exits.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_for_handler = Arc::clone(&interrupted);
+    if let Err(e) = ctrlc::set_handler(move || {
+        interrupted_for_handler.store(true, Ordering::Release);
+    }) {
+        eprintln!("coach-cli: failed to install Ctrl-C handler: {e}");
+    }
+
+    let coach = build_coach();
+
+    let cfg = SessionConfig {
+        device_id: persistent_id.map(DeviceId),
+        sample_rate: None,
+        buffer_frames: None,
+    };
+    coach.send_command(Command::StartSession(cfg));
+
+    let started = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
+        CoachEvent::SessionStateChanged {
+            new_state: SessionState::Running,
+        } => Some(Ok(())),
+        CoachEvent::SessionError { kind, reason } => Some(Err((*kind, reason.clone()))),
+        _ => None,
+    });
+
+    match started {
+        Some(Ok(())) => {}
+        Some(Err((kind, reason))) => {
+            eprintln!("coach-cli: session error: {kind:?}: {reason}");
+            shutdown(&coach);
+            return;
+        }
+        None => {
+            eprintln!("coach-cli: timed out waiting for Running");
+            shutdown(&coach);
+            return;
+        }
+    }
+
+    run_pitch_loop(&coach, duration_ms.map(Duration::from_millis), &interrupted);
+
+    coach.send_command(Command::StopSession);
+    let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
+        CoachEvent::SessionStateChanged {
+            new_state: SessionState::Idle,
+        } => Some(()),
+        _ => None,
+    });
+
+    shutdown(&coach);
 }
 
 fn list_devices() {
@@ -113,65 +229,6 @@ fn list_devices() {
     };
 
     print_device_list(&devices);
-    shutdown(&coach);
-}
-
-fn freestyle(duration_ms: Option<u64>, persistent_id: Option<String>) {
-    // Install a Ctrl-C handler before we open the mic. The handler
-    // flips an atomic that the pitch loop polls — this keeps shutdown
-    // graceful (the loop falls out, we StopSession, then shutdown the
-    // coach) instead of leaving an open cpal stream when the process
-    // exits.
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_for_handler = Arc::clone(&interrupted);
-    if let Err(e) = ctrlc::set_handler(move || {
-        interrupted_for_handler.store(true, Ordering::Release);
-    }) {
-        eprintln!("freestyle: failed to install Ctrl-C handler: {e}");
-    }
-
-    let coach = build_coach();
-
-    let cfg = SessionConfig {
-        device_id: persistent_id.map(DeviceId),
-        sample_rate: None,
-        buffer_frames: None,
-    };
-    coach.send_command(Command::StartSession(cfg));
-
-    // Wait for Running, or an error.
-    let started = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
-        CoachEvent::SessionStateChanged {
-            new_state: SessionState::Running,
-        } => Some(Ok(())),
-        CoachEvent::SessionError { kind, reason } => Some(Err((*kind, reason.clone()))),
-        _ => None,
-    });
-
-    match started {
-        Some(Ok(())) => {}
-        Some(Err((kind, reason))) => {
-            eprintln!("freestyle: session error: {kind:?}: {reason}");
-            shutdown(&coach);
-            return;
-        }
-        None => {
-            eprintln!("freestyle: timed out waiting for Running");
-            shutdown(&coach);
-            return;
-        }
-    }
-
-    run_pitch_loop(&coach, duration_ms.map(Duration::from_millis), &interrupted);
-
-    coach.send_command(Command::StopSession);
-    let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
-        CoachEvent::SessionStateChanged {
-            new_state: SessionState::Idle,
-        } => Some(()),
-        _ => None,
-    });
-
     shutdown(&coach);
 }
 

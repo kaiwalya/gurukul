@@ -1,0 +1,10 @@
+[package]
+name = "adapter-telemetry-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain-ports = { path = "../../domain-ports" }
+
+[dev-dependencies]
+domain-ports = { path = "../../domain-ports", features = ["test-util"] }
