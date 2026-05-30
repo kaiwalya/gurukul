@@ -16,6 +16,7 @@ use domain_ports::app_coach::{
 use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -166,27 +167,50 @@ fn freestyle(duration_ms: u64, persistent_id: Option<String>) {
 fn run_pitch_loop(coach: &impl AppCoach, duration: Duration) {
     let deadline = Instant::now() + duration;
     let mut last_t: u64 = u64::MAX;
+    // TTY check is captured once so colour stays consistent across the
+    // whole session — and pipes/redirects stay clean.
+    let use_color = std::io::stdout().is_terminal();
     while Instant::now() < deadline {
         if let Some(reading) = coach.latest_pitch() {
             if reading.t_ms != last_t {
                 last_t = reading.t_ms;
-                print_pitch(&reading);
+                print_pitch(&reading, use_color);
             }
         }
         thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn print_pitch(r: &PitchReading) {
+fn print_pitch(r: &PitchReading, use_color: bool) {
     if r.f0_hz <= 0.0 {
         println!("[{:>10} ms]  --", r.t_ms);
         return;
     }
     let (note, cents) = note_and_cents(r.f0_hz);
+    let cents_str = format!("{cents:+5}");
+    let painted = if use_color {
+        paint_cents(&cents_str, cents)
+    } else {
+        cents_str
+    };
     println!(
-        "[{:>10} ms]  {:>10.2} Hz  {:>4}  {:+5} cents",
-        r.t_ms, r.f0_hz, note, cents
+        "[{:>10} ms]  {:>10.2} Hz  {:>4}  {} cents",
+        r.t_ms, r.f0_hz, note, painted
     );
+}
+
+/// ANSI-colour the cents column by tuning band. Matches the mac app's
+/// thresholds: ≤5 = green (in tune), ≤20 = default (close enough),
+/// >20 = yellow (sharp/flat enough to act on).
+fn paint_cents(s: &str, cents: i32) -> String {
+    let mag = cents.unsigned_abs();
+    if mag <= 5 {
+        format!("\x1b[32m{s}\x1b[0m")
+    } else if mag <= 20 {
+        s.to_string()
+    } else {
+        format!("\x1b[33m{s}\x1b[0m")
+    }
 }
 
 /// Convert a frequency in Hz to the nearest equal-temperament note name
