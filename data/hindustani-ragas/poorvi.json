@@ -1,0 +1,34 @@
+{
+  "name": "Poorvi",
+  "count": 2,
+  "swaras": [
+    0,
+    1,
+    4,
+    5,
+    6,
+    7,
+    8,
+    11
+  ],
+  "aroha": [
+    0,
+    1,
+    4,
+    6,
+    7,
+    8,
+    11,
+    12
+  ],
+  "avroh": null,
+  "vadi": 4,
+  "samvadi": 11,
+  "thaat": "Poorvi",
+  "time": [
+    [
+      15,
+      18
+    ]
+  ]
+}

@@ -1,0 +1,10 @@
+# Only the curated raga dataset is committed from this folder.
+# The pipeline scripts and all intermediate/source data stay local.
+
+# Ignore everything by default...
+*
+
+# ...except the dataset and this file.
+!.gitignore
+!hindustani-ragas/
+!hindustani-ragas/*.json

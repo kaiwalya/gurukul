@@ -1,0 +1,33 @@
+{
+  "name": "Bihag",
+  "count": 2,
+  "swaras": [
+    0,
+    2,
+    4,
+    5,
+    6,
+    7,
+    9,
+    11
+  ],
+  "aroha": [
+    -1,
+    0,
+    4,
+    5,
+    7,
+    11,
+    12
+  ],
+  "avroh": null,
+  "vadi": 4,
+  "samvadi": 11,
+  "thaat": "Bilawal",
+  "time": [
+    [
+      21,
+      24
+    ]
+  ]
+}

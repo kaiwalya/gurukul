@@ -1,0 +1,30 @@
+{
+  "name": "Sarang",
+  "count": 2,
+  "swaras": [
+    0,
+    2,
+    5,
+    7,
+    10,
+    11
+  ],
+  "aroha": [
+    0,
+    2,
+    5,
+    7,
+    11,
+    12
+  ],
+  "avroh": null,
+  "vadi": 2,
+  "samvadi": 7,
+  "thaat": "Kafi",
+  "time": [
+    [
+      12,
+      15
+    ]
+  ]
+}

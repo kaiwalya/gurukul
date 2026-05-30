@@ -1,0 +1,33 @@
+{
+  "name": "Alhaiya Bilawal",
+  "count": 2,
+  "swaras": [
+    0,
+    2,
+    4,
+    5,
+    7,
+    9,
+    10,
+    11
+  ],
+  "aroha": [
+    0,
+    2,
+    4,
+    7,
+    9,
+    11,
+    12
+  ],
+  "avroh": null,
+  "vadi": 9,
+  "samvadi": 4,
+  "thaat": "Bilawal",
+  "time": [
+    [
+      6,
+      9
+    ]
+  ]
+}

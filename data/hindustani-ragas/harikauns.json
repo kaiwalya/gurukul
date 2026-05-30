@@ -1,0 +1,36 @@
+{
+  "name": "Harikauns",
+  "count": 2,
+  "swaras": [
+    0,
+    3,
+    6,
+    9,
+    10
+  ],
+  "aroha": [
+    0,
+    3,
+    6,
+    9,
+    10,
+    12
+  ],
+  "avroh": [
+    12,
+    10,
+    9,
+    6,
+    3,
+    0
+  ],
+  "vadi": null,
+  "samvadi": null,
+  "thaat": null,
+  "time": [
+    [
+      21,
+      24
+    ]
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "Nat Bhairav",
+  "count": 2,
+  "swaras": [
+    0,
+    2,
+    4,
+    5,
+    7,
+    8,
+    11
+  ],
+  "aroha": null,
+  "avroh": [
+    12,
+    11,
+    8,
+    7,
+    5,
+    4,
+    2,
+    0
+  ],
+  "vadi": 5,
+  "samvadi": 0,
+  "thaat": "Bhairav",
+  "time": [
+    [
+      6,
+      9
+    ]
+  ]
+}

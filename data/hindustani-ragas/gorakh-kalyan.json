@@ -1,0 +1,28 @@
+{
+  "name": "Gorakh Kalyan",
+  "count": 3,
+  "swaras": [
+    0,
+    2,
+    5,
+    9,
+    10
+  ],
+  "aroha": [
+    0,
+    2,
+    5,
+    9,
+    12
+  ],
+  "avroh": null,
+  "vadi": null,
+  "samvadi": 0,
+  "thaat": "Khamaj",
+  "time": [
+    [
+      21,
+      24
+    ]
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "Puriya Dhanashree",
+  "count": 2,
+  "swaras": [
+    0,
+    1,
+    4,
+    6,
+    7,
+    8,
+    11
+  ],
+  "aroha": null,
+  "avroh": [
+    13,
+    11,
+    8,
+    7,
+    6,
+    4,
+    6,
+    1,
+    4,
+    1,
+    0
+  ],
+  "vadi": 7,
+  "samvadi": 1,
+  "thaat": "Poorvi",
+  "time": [
+    [
+      15,
+      18
+    ]
+  ]
+}

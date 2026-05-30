@@ -1,0 +1,33 @@
+{
+  "name": "Puriya Kalyan",
+  "count": 2,
+  "swaras": [
+    0,
+    1,
+    4,
+    6,
+    7,
+    9,
+    11
+  ],
+  "aroha": null,
+  "avroh": [
+    12,
+    11,
+    9,
+    7,
+    6,
+    4,
+    1,
+    0
+  ],
+  "vadi": 7,
+  "samvadi": 0,
+  "thaat": "Marwa",
+  "time": [
+    [
+      15,
+      18
+    ]
+  ]
+}
