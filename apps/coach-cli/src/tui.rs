@@ -256,25 +256,102 @@ fn draw_main(f: &mut Frame, area: Rect, state: &State) {
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
-    // Split inner: a 5-row readout band on top (4 rows of big glyphs
-    // + 1 row of Hz under), chart fills the middle, 1-row hint at the
-    // bottom. Readout dominates — the chart is supporting evidence per
-    // the design review.
+    // Split inner with responsive constraints:
+    //  - readout band: 5 rows normally; collapses to 1-row plain text
+    //    when the terminal is too short (height < 20) to fit the
+    //    BigText glyphs comfortably alongside chart + diag + hint.
+    //  - chart: fills whatever's left.
+    //  - diag (breath + vibrato): dropped entirely on narrow
+    //    terminals (width < 80) where it would overflow or crowd the
+    //    chart. Hint stays — it's the only quit affordance.
+    let compact_readout = inner.height < 20;
+    let show_diag = inner.width >= 80;
+    let readout_rows = if compact_readout { 1 } else { 5 };
+
+    let mut constraints: Vec<Constraint> =
+        vec![Constraint::Length(readout_rows), Constraint::Min(0)];
+    if show_diag {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1));
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(inner);
+
     let readout_area = layout[0];
     let chart_area = layout[1];
-    let hint_area = layout[2];
+    let (diag_area, hint_area) = if show_diag {
+        (Some(layout[2]), layout[3])
+    } else {
+        (None, layout[2])
+    };
 
-    draw_readout(f, readout_area, state);
+    if compact_readout {
+        draw_readout_compact(f, readout_area, state);
+    } else {
+        draw_readout(f, readout_area, state);
+    }
     draw_chart(f, chart_area, state);
+    if let Some(a) = diag_area {
+        draw_diag(f, a, state);
+    }
     draw_hint(f, hint_area);
+}
+
+/// Compact 1-row readout for short terminals. Same data and tinting
+/// as the BigText variant but in plain centred text — `A4 +003  440.27 Hz`.
+fn draw_readout_compact(f: &mut Frame, area: Rect, state: &State) {
+    let latest_voiced = state.features.iter().rev().find(|s| s.f0_hz > 0.0).copied();
+    let line = match latest_voiced {
+        Some(s) => {
+            let (note, cents) = note_and_cents(s.f0_hz);
+            let sign = if cents >= 0 { '+' } else { '-' };
+            let style = cents_style(cents);
+            Line::from(vec![
+                Span::styled(
+                    format!("{note:<3} {sign}{:03}", cents.unsigned_abs()),
+                    style,
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:.2} Hz", s.f0_hz),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "-- sing to begin",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    let para = Paragraph::new(line).alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, area);
+}
+
+/// Secondary diagnostic strip: breath and vibrato, right-aligned in a
+/// muted colour. Sits between the chart and the hint. Drawn from the
+/// freshest snapshot (not just the latest voiced one — breath is a
+/// noise/voicing indicator that's interesting even when f0 is 0).
+/// Empty until the data plane produces anything.
+fn draw_diag(f: &mut Frame, area: Rect, state: &State) {
+    let Some(s) = state.features.back() else {
+        return;
+    };
+    let breath = format!("br {:.2}", s.breath);
+    let vib = if s.vibrato_rate > 0.0 {
+        format!("vib {:.1}Hz/{:.2}st", s.vibrato_rate, s.vibrato_depth)
+    } else {
+        "vib --".to_string()
+    };
+    let line = Line::from(vec![
+        Span::styled(breath, Style::default().fg(Color::DarkGray)),
+        Span::raw("   "),
+        Span::styled(vib, Style::default().fg(Color::DarkGray)),
+    ]);
+    let para = Paragraph::new(line).alignment(ratatui::layout::Alignment::Right);
+    f.render_widget(para, area);
 }
 
 /// Big block-character readout: `<NOTE> <±cents>` rendered with
@@ -388,22 +465,38 @@ fn draw_chart(f: &mut Frame, area: Rect, state: &State) {
         }
     };
 
-    // Build voiced segments (each a contiguous run of voiced frames).
-    // ratatui's Dataset::data takes a borrowed slice, so the Vec<Vec>
-    // must live until f.render_widget returns — both Vecs live in
-    // this stack frame.
-    let segments = build_voiced_segments(&state.features, now_ms);
+    // Build voiced segments split by tuning band — each sub-segment is
+    // a contiguous run of voiced frames that share the same band
+    // (green/default/yellow). Adjacent sub-segments share their
+    // boundary point so the line stays visually continuous across
+    // band transitions. ratatui's Dataset::data takes a borrowed
+    // slice, so the Vec<(Band, Vec<…>)> must outlive the render call.
+    let segments = build_voiced_segments_by_band(&state.features, now_ms);
 
-    let datasets: Vec<Dataset> = segments
+    // Onset ticks: tiny dots pinned to the chart's lower edge, one per
+    // onset-flagged frame in the window. Same x-coordinate system as
+    // the trace so they slide left with time naturally.
+    let onset_points = build_onset_ticks(&state.features, now_ms, state.y_lo);
+
+    let mut datasets: Vec<Dataset> = segments
         .iter()
-        .map(|seg| {
+        .map(|(band, seg)| {
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Cyan))
+                .style(Style::default().fg(band.color()))
                 .data(seg)
         })
         .collect();
+    if !onset_points.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(Color::DarkGray))
+                .data(&onset_points),
+        );
+    }
 
     let y_labels = octave_labels(state.y_lo, state.y_hi);
     let x_labels = vec![
@@ -463,36 +556,118 @@ fn render_empty_chart(f: &mut Frame, area: Rect, state: &State) {
     f.render_widget(chart, area);
 }
 
-/// Split the ring into contiguous voiced segments, each translated
-/// into chart coordinates `(seconds_ago, semitones)`. Unvoiced frames
-/// terminate the current segment; the next voiced frame starts a new
-/// one — this is what produces a visual "gap" in the trace.
-fn build_voiced_segments(
+/// Tuning band for a single voiced frame, derived from its distance to
+/// the nearest semitone in cents. Mirrors the readout's tint logic so
+/// the chart agrees with the big-text verdict at a glance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Band {
+    InTune,   // |cents| ≤ 5
+    Close,    // 5 < |cents| ≤ 20
+    OffPitch, // |cents| > 20
+}
+
+impl Band {
+    fn color(self) -> Color {
+        match self {
+            Band::InTune => Color::Green,
+            Band::Close => Color::Cyan,
+            Band::OffPitch => Color::Yellow,
+        }
+    }
+}
+
+/// Compute the band for a voiced f0. Caller must guard against
+/// `f0_hz <= 0.0` (unvoiced) — this function assumes voiced input.
+fn band_for(f0_hz: f32) -> Band {
+    let semis = 12.0 * (f0_hz / A4_HZ).log2();
+    let cents = ((semis - semis.round()) * 100.0).abs();
+    if cents <= 5.0 {
+        Band::InTune
+    } else if cents <= 20.0 {
+        Band::Close
+    } else {
+        Band::OffPitch
+    }
+}
+
+/// Split the ring into contiguous voiced sub-segments, each tagged
+/// with its tuning band and translated into chart coordinates
+/// `(seconds_ago, semitones)`. Unvoiced frames terminate the current
+/// sub-segment (producing the visual gap). A band change *within* a
+/// voiced run also starts a new sub-segment, but the boundary point
+/// is shared with the previous sub-segment so the line stays visually
+/// continuous across the colour change.
+fn build_voiced_segments_by_band(
     features: &VecDeque<FeatureSnapshot>,
     now_ms: u64,
-) -> Vec<Vec<(f64, f64)>> {
-    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut current: Vec<(f64, f64)> = Vec::new();
+) -> Vec<(Band, Vec<(f64, f64)>)> {
+    let mut segments: Vec<(Band, Vec<(f64, f64)>)> = Vec::new();
+    let min_x = -(CHART_WINDOW_MS as f64) / 1000.0;
+    let mut current: Option<(Band, Vec<(f64, f64)>)> = None;
+
     for s in features {
         if s.f0_hz <= 0.0 {
-            if !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
+            if let Some(seg) = current.take() {
+                segments.push(seg);
             }
             continue;
         }
         let x = -((now_ms.saturating_sub(s.t_ms)) as f64) / 1000.0;
-        // Drop points older than the visible window — keeps the chart
-        // bounds honest even though ratatui would clip anyway.
-        if x < -(CHART_WINDOW_MS as f64) / 1000.0 {
+        if x < min_x {
             continue;
         }
         let y = hz_to_semitones(s.f0_hz) as f64;
-        current.push((x, y));
+        let b = band_for(s.f0_hz);
+
+        match current.as_mut() {
+            None => {
+                current = Some((b, vec![(x, y)]));
+            }
+            Some((cur_band, pts)) if *cur_band == b => {
+                pts.push((x, y));
+            }
+            Some(_) => {
+                // Band changed mid-run. Push the previous sub-segment
+                // and start a new one — but include this boundary
+                // point in both so the visible line is continuous
+                // across the colour change.
+                if let Some((prev_band, mut prev_pts)) = current.take() {
+                    prev_pts.push((x, y));
+                    segments.push((prev_band, prev_pts));
+                }
+                current = Some((b, vec![(x, y)]));
+            }
+        }
     }
-    if !current.is_empty() {
-        segments.push(current);
+    if let Some(seg) = current {
+        segments.push(seg);
     }
     segments
+}
+
+/// Collect chart-coordinate points for every onset-flagged frame in
+/// the visible window, pinned to the bottom of the chart so they read
+/// as a row of tick marks under the trace. `y_lo` is the current
+/// chart bottom (semitones from A4).
+fn build_onset_ticks(
+    features: &VecDeque<FeatureSnapshot>,
+    now_ms: u64,
+    y_lo: f32,
+) -> Vec<(f64, f64)> {
+    let min_x = -(CHART_WINDOW_MS as f64) / 1000.0;
+    let y = y_lo as f64;
+    features
+        .iter()
+        .filter(|s| s.onset > 0.0)
+        .filter_map(|s| {
+            let x = -((now_ms.saturating_sub(s.t_ms)) as f64) / 1000.0;
+            if x < min_x {
+                None
+            } else {
+                Some((x, y))
+            }
+        })
+        .collect()
 }
 
 /// Generate Y-axis labels at each octave boundary inside the current
