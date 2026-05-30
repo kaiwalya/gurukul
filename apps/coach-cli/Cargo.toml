@@ -18,3 +18,4 @@ clap = { workspace = true }
 ctrlc = "3.4"
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+tui-big-text = "0.7"

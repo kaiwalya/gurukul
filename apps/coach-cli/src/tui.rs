@@ -35,6 +35,7 @@ use ratatui::{Frame, Terminal};
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
+use tui_big_text::{BigText, PixelSize};
 
 /// Poll cadence for crossterm input. 16ms ≈ 60Hz — a comfortable
 /// frame budget; the log pane redraws on every tick, so the lag
@@ -68,11 +69,7 @@ const Y_HYSTERESIS: f32 = 0.20;
 
 /// Run the shell until the user quits, or `deadline` elapses.
 /// `deadline = None` means run until the user quits.
-pub fn run(
-    coach: &impl AppCoach,
-    logs: LogBuffer,
-    deadline: Option<Instant>,
-) -> io::Result<()> {
+pub fn run(coach: &impl AppCoach, logs: LogBuffer, deadline: Option<Instant>) -> io::Result<()> {
     let mut terminal = setup()?;
     let mut state = State::default();
 
@@ -259,18 +256,111 @@ fn draw_main(f: &mut Frame, area: Rect, state: &State) {
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
-    // Split inner: chart fills the rest, footer hint takes the bottom
-    // row. One-row hint is the seated-posture compromise — the chart
-    // gets the real estate, the hint stays visible.
+    // Split inner: a 5-row readout band on top (4 rows of big glyphs
+    // + 1 row of Hz under), chart fills the middle, 1-row hint at the
+    // bottom. Readout dominates — the chart is supporting evidence per
+    // the design review.
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
-    let chart_area = layout[0];
-    let hint_area = layout[1];
+    let readout_area = layout[0];
+    let chart_area = layout[1];
+    let hint_area = layout[2];
 
+    draw_readout(f, readout_area, state);
     draw_chart(f, chart_area, state);
     draw_hint(f, hint_area);
+}
+
+/// Big block-character readout: `<NOTE> <±cents>` rendered with
+/// `tui-big-text` (font8x8 glyphs at quadrant resolution — 4 cells per
+/// glyph) on rows 0-3, with the f0 in Hz on row 4. Tinted by cents
+/// band — green ≤5, default ≤20, yellow otherwise. Falls back to a
+/// `--` placeholder and a "sing to begin" hint when no voiced frame
+/// is available yet.
+fn draw_readout(f: &mut Frame, area: Rect, state: &State) {
+    let latest_voiced = state.features.iter().rev().find(|s| s.f0_hz > 0.0).copied();
+
+    let (text, hz_text, style) = match latest_voiced {
+        Some(s) => {
+            let (note, cents) = note_and_cents(s.f0_hz);
+            // Pad both halves so the block has identical character
+            // width every frame: 3-char note slot (covers `C#4` and
+            // pads `A4 `), space, sign + 3-digit zero-padded cents.
+            // Without this the centred BigText jitters left/right as
+            // `+3` → `+12` → `-100` change width.
+            let sign = if cents >= 0 { '+' } else { '-' };
+            let text = format!("{note:<3} {sign}{:03}", cents.unsigned_abs());
+            let hz_text = format!("{:.2} Hz", s.f0_hz);
+            let style = cents_style(cents);
+            (text, hz_text, style)
+        }
+        None => (
+            "--".to_string(),
+            "sing to begin".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+
+    // Split the readout band: 4 rows of big glyphs (centred via the
+    // BigText builder) + 1 row of Hz (centred Paragraph).
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Length(1)])
+        .split(area);
+
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(style)
+        .centered()
+        .lines(vec![Line::from(text)])
+        .build();
+    f.render_widget(big, layout[0]);
+
+    let hz_para = Paragraph::new(Line::from(Span::styled(
+        hz_text,
+        Style::default().fg(Color::DarkGray),
+    )))
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(hz_para, layout[1]);
+}
+
+/// Tint for the cents band, mirroring the line-mode `paint_cents`:
+/// ≤5 green, ≤20 default, >20 yellow.
+fn cents_style(cents: i32) -> Style {
+    let mag = cents.unsigned_abs();
+    if mag <= 5 {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if mag <= 20 {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Equal-temperament note + cents from f0, A4=440. Mirrors the helper
+/// in `main.rs` — kept duplicated here to avoid leaking it into a
+/// shared module just for two callers.
+fn note_and_cents(f0_hz: f32) -> (String, i32) {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let semis_from_a4 = 12.0 * (f0_hz / A4_HZ).log2();
+    let nearest = semis_from_a4.round() as i32;
+    let cents = ((semis_from_a4 - nearest as f32) * 100.0).round() as i32;
+    let midi = 69 + nearest;
+    let name_idx = midi.rem_euclid(12) as usize;
+    let octave = midi.div_euclid(12) - 1;
+    (format!("{}{}", NAMES[name_idx], octave), cents)
 }
 
 fn draw_hint(f: &mut Frame, area: Rect) {
