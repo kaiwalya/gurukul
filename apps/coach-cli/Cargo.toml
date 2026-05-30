@@ -14,3 +14,4 @@ adapter-telemetry-std = { path = "../../domain-adapters/telemetry-std" }
 adapter-app-coach = { path = "../../domain-adapters/app-coach" }
 adapter-audio-cpal = { path = "../../domain-adapters/audio-cpal" }
 clap = { workspace = true }
+ctrlc = "3.4"

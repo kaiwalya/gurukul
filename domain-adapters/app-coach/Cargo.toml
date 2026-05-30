@@ -7,6 +7,9 @@ edition = "2021"
 domain-ports = { path = "../../domain-ports" }
 engine = { path = "../../dsp/engine" }
 node-pitch-yin = { path = "../../dsp/node-pitch-yin" }
+node-onset = { path = "../../dsp/node-onset" }
+node-breath = { path = "../../dsp/node-breath" }
+node-vibrato = { path = "../../dsp/node-vibrato" }
 serde_json = { workspace = true }
 arc-swap = "1.7"
 rtrb = "0.3"

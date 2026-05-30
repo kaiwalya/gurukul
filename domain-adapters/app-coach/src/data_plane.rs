@@ -3,8 +3,8 @@
 //! Lives entirely behind the control plane — the control plane spawns
 //! a [`DataPlane`] in `do_start_session` and tears it down in
 //! `do_stop_session`. Heads never touch it directly; they read the
-//! latest pitch reading via [`AppCoach::latest_pitch`], which under
-//! the hood is just `pitch_publisher.load()`.
+//! latest feature snapshot via [`AppCoach::latest_features`], which
+//! under the hood is just `feature_publisher.load()`.
 //!
 //! # Wiring
 //!
@@ -13,12 +13,12 @@
 //!   │                                    │
 //!   │ samples ─► rtrb::Producer ─► rtrb::Consumer
 //!   ↓                                    │
-//!                                        │ engine.in_port(audio_in).copy_from(...)
+//!                                        │ engine.in_port(mic).copy_from(...)
 //!                                        │ engine.process_block(BLOCK_FRAMES)
-//!                                        │ f0 = engine.out_port(f0_hz)[0]
-//!                                        │ if f0 > 0: publisher.store(Some(reading))
+//!                                        │ read pitch/onset/breath/vibrato out-ports
+//!                                        │ publisher.store(Some(snapshot))
 //!                                        ▼
-//!                                   head: coach.latest_pitch()
+//!                                   head: coach.latest_features()
 //! ```
 //!
 //! # Block-size discipline
@@ -38,7 +38,7 @@
 
 use crate::pitch_world::build_pitch_engine;
 use arc_swap::ArcSwap;
-use domain_ports::app_coach::PitchReading;
+use domain_ports::app_coach::FeatureSnapshot;
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
 use domain_ports::{tel_info, tel_warn};
@@ -85,7 +85,7 @@ impl DataPlane {
         // The `World` itself is just data and crosses the boundary.
         let quit = Arc::new(AtomicBool::new(false));
         let samples_dropped = Arc::new(AtomicU64::new(0));
-        let pitch_publisher = Arc::clone(&deps.pitch_publisher);
+        let feature_publisher = Arc::clone(&deps.feature_publisher);
         let clock = Arc::clone(&deps.clock);
         let telemetry = Arc::clone(&deps.telemetry);
         let quit_for_thread = Arc::clone(&quit);
@@ -99,7 +99,7 @@ impl DataPlane {
                     consumer,
                     sample_rate,
                     quit: quit_for_thread,
-                    pitch_publisher,
+                    feature_publisher,
                     clock,
                     telemetry,
                 });
@@ -140,7 +140,7 @@ impl DataPlane {
 
 pub(crate) struct DataPlaneDeps {
     pub(crate) sample_rate: u32,
-    pub(crate) pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
+    pub(crate) feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
 }
@@ -167,7 +167,7 @@ struct WorkerArgs {
     consumer: Consumer<f32>,
     sample_rate: u32,
     quit: Arc<AtomicBool>,
-    pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
+    feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     clock: Arc<dyn Clock>,
     telemetry: Arc<dyn Telemetry>,
 }
@@ -177,7 +177,7 @@ fn run_worker(args: WorkerArgs) {
         mut consumer,
         sample_rate,
         quit,
-        pitch_publisher,
+        feature_publisher,
         clock,
         telemetry,
     } = args;
@@ -199,12 +199,12 @@ fn run_worker(args: WorkerArgs) {
         }
     };
 
-    let (audio_in, f0_out) = match resolve_ports(&engine) {
-        Ok(pair) => pair,
+    let ports = match resolve_ports(&engine) {
+        Ok(p) => p,
         Err(e) => {
             tel_warn!(
                 &*telemetry,
-                "data-plane: boundary ports missing from coach.json; pitch will be unavailable",
+                "data-plane: boundary ports missing from coach.json; features will be unavailable",
                 error = e,
             );
             return;
@@ -249,32 +249,63 @@ fn run_worker(args: WorkerArgs) {
         }
 
         // Feed the engine.
-        engine.in_port(audio_in).copy_from_slice(&block);
+        engine.in_port(ports.mic).copy_from_slice(&block);
         engine.process_block(BLOCK_FRAMES);
 
-        // Read f0; publish if voiced.
-        let f0 = engine.out_port(f0_out)[0];
-        let reading = PitchReading {
-            f0_hz: f0,
-            t_ms: clock.now_ms(),
-        };
+        // Read every feature for this hop and publish as one snapshot.
         // Always publish — heads can tell voiced from unvoiced via
         // the f0_hz == 0.0 sentinel. Publishing unvoiced too lets
         // heads detect "alive but silent" vs "stalled".
-        pitch_publisher.store(Arc::new(Some(reading)));
+        let snapshot = FeatureSnapshot {
+            f0_hz: engine.out_port(ports.pitch)[0],
+            onset: engine.out_port(ports.onset)[0],
+            breath: engine.out_port(ports.breath)[0],
+            vibrato_rate: engine.out_port(ports.vibrato_rate)[0],
+            vibrato_depth: engine.out_port(ports.vibrato_depth)[0],
+            t_ms: clock.now_ms(),
+        };
+        feature_publisher.store(Arc::new(Some(snapshot)));
     }
 
     tel_info!(&*telemetry, "data-plane: worker down");
 }
 
-fn resolve_ports(engine: &Engine) -> Result<(InPortHandle, OutPortHandle), String> {
-    let in_h = engine
-        .resolve_in_port("audio_in")
-        .map_err(|e| format!("audio_in: {e:?}"))?;
-    let out_h = engine
-        .resolve_out_port("f0_hz")
-        .map_err(|e| format!("f0_hz: {e:?}"))?;
-    Ok((in_h, out_h))
+struct ResolvedPorts {
+    mic: InPortHandle,
+    pitch: OutPortHandle,
+    onset: OutPortHandle,
+    breath: OutPortHandle,
+    vibrato_rate: OutPortHandle,
+    vibrato_depth: OutPortHandle,
+}
+
+fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
+    let mic = engine
+        .resolve_in_port("mic")
+        .map_err(|e| format!("mic: {e:?}"))?;
+    let pitch = engine
+        .resolve_out_port("pitch")
+        .map_err(|e| format!("pitch: {e:?}"))?;
+    let onset = engine
+        .resolve_out_port("onset")
+        .map_err(|e| format!("onset: {e:?}"))?;
+    let breath = engine
+        .resolve_out_port("breath")
+        .map_err(|e| format!("breath: {e:?}"))?;
+    let vibrato_rate = engine
+        .resolve_out_port("vibrato_rate")
+        .map_err(|e| format!("vibrato_rate: {e:?}"))?;
+    let vibrato_depth = engine
+        .resolve_out_port("vibrato_depth")
+        .map_err(|e| format!("vibrato_depth: {e:?}"))?;
+    Ok(ResolvedPorts {
+        mic,
+        pitch,
+        onset,
+        breath,
+        vibrato_rate,
+        vibrato_depth,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -319,12 +350,12 @@ mod tests {
 
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
-        let pitch_publisher: Arc<ArcSwap<Option<PitchReading>>> =
+        let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
             Arc::new(ArcSwap::from_pointee(None));
 
         let (data_plane, mut producer, dropped) = DataPlane::start(DataPlaneDeps {
             sample_rate: SR,
-            pitch_publisher: Arc::clone(&pitch_publisher),
+            feature_publisher: Arc::clone(&feature_publisher),
             clock,
             telemetry: Arc::clone(&telemetry),
         })
@@ -366,10 +397,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut last_f0: f32 = 0.0;
         let f0 = loop {
-            if let Some(reading) = **pitch_publisher.load() {
-                last_f0 = reading.f0_hz;
-                if reading.f0_hz > 0.0 && (reading.f0_hz - F0).abs() < 1.0 {
-                    break reading.f0_hz;
+            if let Some(snapshot) = **feature_publisher.load() {
+                last_f0 = snapshot.f0_hz;
+                if snapshot.f0_hz > 0.0 && (snapshot.f0_hz - F0).abs() < 1.0 {
+                    break snapshot.f0_hz;
                 }
             }
             if Instant::now() > deadline {

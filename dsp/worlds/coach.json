@@ -1,26 +1,50 @@
 {
   "$schema": "../schema/world.schema.json",
+  "world_version": 1,
   "in_ports": [
-    { "id": "audio_in", "description": "Mono mic input written by the coach's data plane." }
+    { "id": "mic" }
   ],
   "out_ports": [
-    { "id": "f0_hz", "description": "Latest YIN f0 estimate in Hz; 0.0 = unvoiced (sample-and-held across the hop)." }
+    { "id": "pitch" },
+    { "id": "onset" },
+    { "id": "breath" },
+    { "id": "vibrato_rate" },
+    { "id": "vibrato_depth" }
   ],
   "nodes": [
     {
-      "id": "pitch",
+      "id": "pitch_yin",
       "type": "PitchYin",
       "params": {
         "window": 2048,
         "hop": 512,
-        "fmin_hz": 50,
-        "fmax_hz": 2000,
-        "threshold": 0.1
+        "fmin_hz": 70.0,
+        "fmax_hz": 1000.0,
+        "threshold": 0.15
       }
+    },
+    {
+      "id": "onset_det",
+      "type": "Onset"
+    },
+    {
+      "id": "breath_det",
+      "type": "Breath"
+    },
+    {
+      "id": "vibrato_det",
+      "type": "Vibrato"
     }
   ],
   "connections": [
-    { "from": "audio_in", "to": "pitch.audio_in" },
-    { "from": "pitch.f0", "to": "f0_hz" }
+    { "from": "mic",                "to": "pitch_yin.audio_in" },
+    { "from": "mic",                "to": "onset_det.audio_in" },
+    { "from": "mic",                "to": "breath_det.audio_in" },
+    { "from": "pitch_yin.f0",       "to": "vibrato_det.f0" },
+    { "from": "pitch_yin.f0",       "to": "pitch" },
+    { "from": "onset_det.onset",    "to": "onset" },
+    { "from": "breath_det.breath",  "to": "breath" },
+    { "from": "vibrato_det.rate",   "to": "vibrato_rate" },
+    { "from": "vibrato_det.depth",  "to": "vibrato_depth" }
   ]
 }

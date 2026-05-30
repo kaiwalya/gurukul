@@ -10,13 +10,14 @@
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, PitchReading, SessionConfig, SessionState,
+    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionState,
     ShutdownResult,
 };
 use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,9 +39,10 @@ enum Subcmd {
     /// One line per fresh f0 estimate (~85 Hz at 48k/hop=512); `--`
     /// shown for unvoiced frames (silence, breath, noise).
     Freestyle {
-        /// Duration of the session, in milliseconds.
-        #[arg(long, default_value_t = 3000)]
-        duration_ms: u64,
+        /// Duration of the session, in milliseconds. Omit to run until
+        /// Ctrl-C.
+        #[arg(long)]
+        duration_ms: Option<u64>,
         /// Persistent id (from `list-devices`) of the device to
         /// open. Default: system multimedia-role default input.
         #[arg(long)]
@@ -114,7 +116,20 @@ fn list_devices() {
     shutdown(&coach);
 }
 
-fn freestyle(duration_ms: u64, persistent_id: Option<String>) {
+fn freestyle(duration_ms: Option<u64>, persistent_id: Option<String>) {
+    // Install a Ctrl-C handler before we open the mic. The handler
+    // flips an atomic that the pitch loop polls — this keeps shutdown
+    // graceful (the loop falls out, we StopSession, then shutdown the
+    // coach) instead of leaving an open cpal stream when the process
+    // exits.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_for_handler = Arc::clone(&interrupted);
+    if let Err(e) = ctrlc::set_handler(move || {
+        interrupted_for_handler.store(true, Ordering::Release);
+    }) {
+        eprintln!("freestyle: failed to install Ctrl-C handler: {e}");
+    }
+
     let coach = build_coach();
 
     let cfg = SessionConfig {
@@ -147,7 +162,7 @@ fn freestyle(duration_ms: u64, persistent_id: Option<String>) {
         }
     }
 
-    run_pitch_loop(&coach, Duration::from_millis(duration_ms));
+    run_pitch_loop(&coach, duration_ms.map(Duration::from_millis), &interrupted);
 
     coach.send_command(Command::StopSession);
     let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
@@ -160,33 +175,56 @@ fn freestyle(duration_ms: u64, persistent_id: Option<String>) {
     shutdown(&coach);
 }
 
-/// Poll `latest_pitch()` at the head's frame cadence and print one line
-/// per fresh reading. Deduplicates by `t_ms` so the printed rate
+/// Poll `latest_features()` at the head's frame cadence and print one
+/// line per fresh snapshot. Deduplicates by `t_ms` so the printed rate
 /// matches the publisher rate (~85Hz at 48k/hop=512), not the polling
 /// rate. Unvoiced frames (f0 == 0.0) render as `--`.
-fn run_pitch_loop(coach: &impl AppCoach, duration: Duration) {
-    let deadline = Instant::now() + duration;
+///
+/// `duration = None` runs until `interrupted` flips (Ctrl-C).
+fn run_pitch_loop(coach: &impl AppCoach, duration: Option<Duration>, interrupted: &AtomicBool) {
+    let deadline = duration.map(|d| Instant::now() + d);
     let mut last_t: u64 = u64::MAX;
     // TTY check is captured once so colour stays consistent across the
     // whole session — and pipes/redirects stay clean.
     let use_color = std::io::stdout().is_terminal();
-    while Instant::now() < deadline {
-        if let Some(reading) = coach.latest_pitch() {
-            if reading.t_ms != last_t {
-                last_t = reading.t_ms;
-                print_pitch(&reading, use_color);
+    loop {
+        if interrupted.load(Ordering::Acquire) {
+            break;
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                break;
+            }
+        }
+        if let Some(snap) = coach.latest_features() {
+            if snap.t_ms != last_t {
+                last_t = snap.t_ms;
+                print_features(&snap, use_color);
             }
         }
         thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn print_pitch(r: &PitchReading, use_color: bool) {
-    if r.f0_hz <= 0.0 {
-        println!("[{:>10} ms]  --", r.t_ms);
+fn print_features(s: &FeatureSnapshot, use_color: bool) {
+    // Onset/breath/vibrato render unconditionally — they have their own
+    // 0.0-when-inactive convention and aren't gated on voicedness.
+    let onset_marker = if s.onset > 0.0 { "•" } else { " " };
+    let breath_str = format!("br {:.2}", s.breath);
+    let vib_str = if s.vibrato_rate > 0.0 {
+        format!("vib {:.1}Hz/{:.2}st", s.vibrato_rate, s.vibrato_depth)
+    } else {
+        "vib --".to_string()
+    };
+
+    if s.f0_hz <= 0.0 {
+        println!(
+            "[{:>10} ms]  {}  --                       {}  {}",
+            s.t_ms, onset_marker, breath_str, vib_str
+        );
         return;
     }
-    let (note, cents) = note_and_cents(r.f0_hz);
+    let (note, cents) = note_and_cents(s.f0_hz);
     let cents_str = format!("{cents:+5}");
     let painted = if use_color {
         paint_cents(&cents_str, cents)
@@ -194,8 +232,8 @@ fn print_pitch(r: &PitchReading, use_color: bool) {
         cents_str
     };
     println!(
-        "[{:>10} ms]  {:>10.2} Hz  {:>4}  {} cents",
-        r.t_ms, r.f0_hz, note, painted
+        "[{:>10} ms]  {}  {:>10.2} Hz  {:>4}  {} cents  {}  {}",
+        s.t_ms, onset_marker, s.f0_hz, note, painted, breath_str, vib_str
     );
 }
 

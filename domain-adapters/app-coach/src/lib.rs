@@ -11,10 +11,11 @@
 //!   unifies head commands (delivered via [`AppCoach::send_command`])
 //!   and (in Phase 2) internal acks from the audio callback.
 //! - **Data plane**: an SPSC ring fed by the cpal RT callback,
-//!   drained by a worker thread that runs the dsp engine (PitchYin
-//!   from [`pitch_world`]) and publishes the latest f0 estimate into
-//!   an `ArcSwap<Option<PitchReading>>`. Heads sample with
-//!   [`AppCoach::latest_pitch`].
+//!   drained by a worker thread that runs the dsp engine (PitchYin +
+//!   Onset + Breath + Vibrato from [`pitch_world`]) and publishes the
+//!   latest per-hop feature snapshot into an
+//!   `ArcSwap<Option<FeatureSnapshot>>`. Heads sample with
+//!   [`AppCoach::latest_features`].
 //!
 //! # Outbound events
 //!
@@ -60,7 +61,7 @@ use shutdown::join_with_timeout;
 
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, PitchReading, ShutdownResult,
+    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, ShutdownResult,
 };
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -78,8 +79,9 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     let outbound = Arc::new(Mutex::new(OutboundQueue::new(OUTBOUND_QUEUE_CAP)));
     let (tx_cmd, rx_cmd) = mpsc::channel::<Input>();
     let outbound_for_thread = Arc::clone(&outbound);
-    let pitch_publisher: Arc<ArcSwap<Option<PitchReading>>> = Arc::new(ArcSwap::from_pointee(None));
-    let pitch_publisher_for_thread = Arc::clone(&pitch_publisher);
+    let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    let feature_publisher_for_thread = Arc::clone(&feature_publisher);
 
     let control_thread = thread::Builder::new()
         .name("app-coach-control".into())
@@ -88,7 +90,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
                 deps,
                 outbound_for_thread,
                 rx_cmd,
-                pitch_publisher_for_thread,
+                feature_publisher_for_thread,
             )
             .run();
         })
@@ -97,7 +99,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     CoachImpl {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
-        pitch_publisher,
+        feature_publisher,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     }
@@ -113,11 +115,11 @@ struct CoachImpl {
     /// makes any late `send_command` a no-op (the receiver is gone).
     tx_cmd: Mutex<Option<Sender<Input>>>,
     outbound: Arc<Mutex<OutboundQueue>>,
-    /// Lock-free snapshot of the latest pitch reading. The data plane
-    /// publishes; heads read via [`latest_pitch`]. `None` before the
-    /// first reading lands (no session running, first window still
-    /// filling, etc.).
-    pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
+    /// Lock-free snapshot of the latest per-hop feature values. The
+    /// data plane publishes; heads read via [`latest_features`]. `None`
+    /// before the first snapshot lands (no session running, first
+    /// window still filling, etc.).
+    feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -159,8 +161,8 @@ impl AppCoach for CoachImpl {
         }
     }
 
-    fn latest_pitch(&self) -> Option<PitchReading> {
-        **self.pitch_publisher.load()
+    fn latest_features(&self) -> Option<FeatureSnapshot> {
+        **self.feature_publisher.load()
     }
 }
 

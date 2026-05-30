@@ -15,13 +15,14 @@
 //! - [`AppCoach::poll_events`] — drain the outbound event queue.
 //! - [`AppCoach::shutdown`] — synchronously tear down with a timeout.
 //!
-//! The boundary is deliberately FFI-friendly. Phase 2 will add
-//! `latest_pitch()` as a snapshot read for the firehose of pitch
-//! readings; v1 does no pitch detection so that method does not exist
-//! yet.
+//! Plus [`AppCoach::latest_features`] — a snapshot read for the
+//! firehose of per-hop feature values (pitch, onset, breath,
+//! vibrato). Out-of-band from the event queue because its ~85Hz rate
+//! would saturate the bounded queue.
 //!
-//! See `docs/SPEC-AppCoach.md` for the full design context and the
-//! deferred Phase 2 scope.
+//! The boundary is deliberately FFI-friendly.
+//!
+//! See `docs/SPEC-AppCoach.md` for the full design context.
 //!
 //! # Sealed subsystem
 //!
@@ -173,32 +174,57 @@ pub enum SessionErrorKind {
 }
 
 // ---------------------------------------------------------------------
-// Pitch snapshot (Phase 2)
+// Feature snapshot (Phase 2)
 // ---------------------------------------------------------------------
 
-/// Latest pitch estimate from the data plane.
+/// Coherent snapshot of every feature the data plane publishes per hop.
 ///
-/// Heads read this via [`AppCoach::latest_pitch`] on their own cadence
-/// (UI frame rate, log timer, etc.). The data plane publishes a new
-/// reading every `hop` samples worth of audio — typically ~85Hz at
-/// 48kHz with a hop of 512 — so heads polling at 60Hz will see fresh
-/// values most ticks and an occasional repeat.
+/// Heads read this via [`AppCoach::latest_features`] on their own
+/// cadence (UI frame rate, log timer, etc.). The data plane publishes
+/// a new snapshot every `hop` samples worth of audio — typically
+/// ~85Hz at 48kHz with a hop of 512 — so heads polling at 60Hz will
+/// see fresh values most ticks and an occasional repeat.
 ///
 /// Voicedness is encoded as [`f0_hz == 0.0`](Self::f0_hz): a voiced
 /// frame reports a positive Hz value; an unvoiced frame reports
 /// `0.0`. This matches the YIN node's sentinel and keeps the read
-/// path branch-free.
+/// path branch-free. The other features (`onset`, `breath`,
+/// `vibrato_rate`, `vibrato_depth`) are always populated — their
+/// detectors emit `0.0` during inactive frames rather than a
+/// distinguished sentinel.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PitchReading {
+pub struct FeatureSnapshot {
     /// Estimated fundamental frequency, in Hz. `0.0` means unvoiced
     /// (silence, breath, noise — not a frequency the detector
     /// trusts).
     pub f0_hz: f32,
 
+    /// Onset detector output for this hop. Positive values mark a
+    /// note attack; `0.0` between attacks. The exact magnitude
+    /// encodes attack strength — heads can use it as a transient
+    /// indicator or as a binary "did something happen here" flag.
+    pub onset: f32,
+
+    /// Breath / aspiration energy estimate for this hop. Roughly the
+    /// high-frequency / total-energy ratio when the breath detector
+    /// is engaged, `0.0` when it isn't.
+    pub breath: f32,
+
+    /// Vibrato rate in Hz over the most recent analysis window
+    /// (typically ~1.5s). `0.0` when no stable vibrato is detected.
+    /// Lags voicing by the window length — first voiced frames after
+    /// silence will report `0.0` until the window fills.
+    pub vibrato_rate: f32,
+
+    /// Vibrato depth in semitones over the most recent analysis
+    /// window. Pairs with `vibrato_rate`; both go to `0.0` together
+    /// when vibrato detection is inactive.
+    pub vibrato_depth: f32,
+
     /// Wall-clock milliseconds (from the coach's [`Clock`]) at which
-    /// this reading was published. Heads use this to detect staleness
-    /// — if `t_ms` hasn't advanced between two polls, the data plane
-    /// is stalled.
+    /// this snapshot was published. Heads use this to detect
+    /// staleness — if `t_ms` hasn't advanced between two polls, the
+    /// data plane is stalled.
     pub t_ms: u64,
 }
 
@@ -247,20 +273,16 @@ pub trait AppCoach {
     /// cleanup if the head forgot to shut down explicitly.
     fn shutdown(&self, timeout: Duration) -> ShutdownResult;
 
-    /// Snapshot the latest pitch estimate from the data plane.
+    /// Snapshot the latest feature estimate from the data plane.
     ///
     /// Returns `None` before the data plane has published any
-    /// reading (no session running, or session just started and the
+    /// snapshot (no session running, or session just started and the
     /// first window hasn't accumulated yet). Otherwise returns the
-    /// most recent [`PitchReading`].
+    /// most recent [`FeatureSnapshot`].
     ///
     /// Non-blocking, lock-free (the implementation uses an
     /// `ArcSwap`-style snapshot). Heads should poll this at their UI
-    /// cadence — there is no event for pitch updates because the
+    /// cadence — there is no event for feature updates because the
     /// rate (~85Hz) would saturate the bounded event queue.
-    ///
-    /// **v1 returns `None` always** — the data plane lands in a
-    /// subsequent PR. The method exists now so heads can match the
-    /// final shape without further trait churn.
-    fn latest_pitch(&self) -> Option<PitchReading>;
+    fn latest_features(&self) -> Option<FeatureSnapshot>;
 }

@@ -12,7 +12,8 @@ use crate::helpers::{classify_open_error, preferred_sample_rate};
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoachDeps, CoachEvent, Command, PitchReading, SessionConfig, SessionErrorKind, SessionState,
+    AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionErrorKind,
+    SessionState,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
@@ -40,7 +41,7 @@ pub(crate) struct ControlPlane {
     deps: AppCoachDeps,
     outbound: Arc<Mutex<OutboundQueue>>,
     rx: mpsc::Receiver<Input>,
-    pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
+    feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
 
     state: SessionState,
     /// Set when a [`SessionConfig`] has been accepted and the cpal
@@ -58,13 +59,13 @@ impl ControlPlane {
         deps: AppCoachDeps,
         outbound: Arc<Mutex<OutboundQueue>>,
         rx: mpsc::Receiver<Input>,
-        pitch_publisher: Arc<ArcSwap<Option<PitchReading>>>,
+        feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     ) -> Self {
         Self {
             deps,
             outbound,
             rx,
-            pitch_publisher,
+            feature_publisher,
             state: SessionState::Idle,
             capture: None,
             data_plane: None,
@@ -103,7 +104,7 @@ impl ControlPlane {
         }
         // Clear any stale reading so a head polling after shutdown
         // sees `None` instead of the last-known f0.
-        self.pitch_publisher.store(Arc::new(None));
+        self.feature_publisher.store(Arc::new(None));
         tel_info!(
             &*self.deps.telemetry,
             "app-coach: control plane down",
@@ -167,7 +168,7 @@ impl ControlPlane {
         // spawn fails we surface as Other and skip opening the device.
         let (data_plane, producer, dropped_for_cb) = match DataPlane::start(DataPlaneDeps {
             sample_rate,
-            pitch_publisher: Arc::clone(&self.pitch_publisher),
+            feature_publisher: Arc::clone(&self.feature_publisher),
             clock: Arc::clone(&self.deps.clock),
             telemetry: Arc::clone(&self.deps.telemetry),
         }) {
@@ -250,7 +251,7 @@ impl ControlPlane {
         if let Some(dp) = self.data_plane.take() {
             dp.stop(&*self.deps.telemetry);
         }
-        self.pitch_publisher.store(Arc::new(None));
+        self.feature_publisher.store(Arc::new(None));
     }
 
     fn fail(&mut self, kind: SessionErrorKind, reason: String) {

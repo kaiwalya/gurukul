@@ -24,6 +24,9 @@ const COACH_WORLD_JSON: &str = include_str!("../../../dsp/worlds/coach.json");
 pub(crate) fn build_pitch_engine(sample_rate: u32, block_size: usize) -> Result<Engine, String> {
     let mut registry = NodeRegistry::new();
     node_pitch_yin::register(&mut registry);
+    node_onset::register(&mut registry);
+    node_breath::register(&mut registry);
+    node_vibrato::register(&mut registry);
 
     let world: World =
         serde_json::from_str(COACH_WORLD_JSON).map_err(|e| format!("parse coach.json: {e}"))?;
