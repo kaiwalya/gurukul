@@ -285,4 +285,20 @@ pub trait AppCoach {
     /// cadence — there is no event for feature updates because the
     /// rate (~85Hz) would saturate the bounded event queue.
     fn latest_features(&self) -> Option<FeatureSnapshot>;
+
+    /// Drain accumulated raw mic samples into `dst`. Returns the number
+    /// of samples appended. The data plane pushes the same block of
+    /// samples it feeds the engine; heads can build a scope, envelope,
+    /// or any other sample-rate widget without taking on the engine
+    /// boundary themselves.
+    ///
+    /// Drain semantics — non-blocking; samples not drained by the next
+    /// call are coalesced with newer samples up to an internal ring
+    /// capacity. On overflow the *oldest* samples are dropped (the head
+    /// sees a gap, never stale data). Polling at any UI cadence ≥10Hz
+    /// is enough to keep the ring from saturating at 48kHz.
+    ///
+    /// Returns 0 when no session is running, or when the head has
+    /// already drained everything available since the last call.
+    fn drain_audio(&self, dst: &mut Vec<f32>) -> usize;
 }

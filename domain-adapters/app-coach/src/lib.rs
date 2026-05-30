@@ -55,7 +55,7 @@ mod outbound;
 mod pitch_world;
 mod shutdown;
 
-use control_plane::{ControlPlane, Input};
+use control_plane::{ControlPlane, HeadAudioSlot, Input};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
 
@@ -82,6 +82,8 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let feature_publisher_for_thread = Arc::clone(&feature_publisher);
+    let head_audio_slot: HeadAudioSlot = Arc::new(Mutex::new(None));
+    let head_audio_slot_for_thread = Arc::clone(&head_audio_slot);
 
     let control_thread = thread::Builder::new()
         .name("app-coach-control".into())
@@ -91,6 +93,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
                 outbound_for_thread,
                 rx_cmd,
                 feature_publisher_for_thread,
+                head_audio_slot_for_thread,
             )
             .run();
         })
@@ -100,6 +103,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
         feature_publisher,
+        head_audio_slot,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     }
@@ -120,6 +124,10 @@ struct CoachImpl {
     /// before the first snapshot lands (no session running, first
     /// window still filling, etc.).
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+    /// Slot the control plane writes when a session starts (and clears
+    /// on stop). Holds the head-side rtrb consumer of raw mic samples.
+    /// `None` whenever no session is running.
+    head_audio_slot: HeadAudioSlot,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -163,6 +171,19 @@ impl AppCoach for CoachImpl {
 
     fn latest_features(&self) -> Option<FeatureSnapshot> {
         **self.feature_publisher.load()
+    }
+
+    fn drain_audio(&self, dst: &mut Vec<f32>) -> usize {
+        let mut guard = self.head_audio_slot.lock().unwrap();
+        let Some(consumer) = guard.as_mut() else {
+            return 0;
+        };
+        let mut drained = 0;
+        while let Ok(s) = consumer.pop() {
+            dst.push(s);
+            drained += 1;
+        }
+        drained
     }
 }
 
