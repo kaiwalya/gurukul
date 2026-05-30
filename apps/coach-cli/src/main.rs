@@ -3,7 +3,7 @@
 //! The CLI is a *head*: a thin shell that wires peripheral adapters
 //! into an [`AppCoach`], translates subcommands into [`Command`]s,
 //! drains [`CoachEvent`]s, and prints. Real product behaviour
-//! (state machine, capture lifecycle, telemetry) lives in
+//! (state machine, session lifecycle, telemetry) lives in
 //! `adapter-app-coach`.
 //!
 //! See `docs/SPEC-AppCoach.md` for the boundary contract.
@@ -33,11 +33,11 @@ enum Subcmd {
     Run,
     /// Enumerate audio input devices and print a summary.
     ListDevices,
-    /// Freestyle: open the mic and print the live pitch — sing, hum,
-    /// whistle. One line per fresh f0 estimate (~85 Hz at 48k/hop=512);
-    /// `--` shown for unvoiced frames (silence, breath, noise).
-    Capture {
-        /// Duration to capture, in milliseconds.
+    /// Open the mic and print the live pitch — sing, hum, whistle.
+    /// One line per fresh f0 estimate (~85 Hz at 48k/hop=512); `--`
+    /// shown for unvoiced frames (silence, breath, noise).
+    Freestyle {
+        /// Duration of the session, in milliseconds.
         #[arg(long, default_value_t = 3000)]
         duration_ms: u64,
         /// Persistent id (from `list-devices`) of the device to
@@ -52,10 +52,10 @@ fn main() {
     match cli.command.unwrap_or(Subcmd::Run) {
         Subcmd::Run => run_coach(),
         Subcmd::ListDevices => list_devices(),
-        Subcmd::Capture {
+        Subcmd::Freestyle {
             duration_ms,
             persistent_id,
-        } => capture(duration_ms, persistent_id),
+        } => freestyle(duration_ms, persistent_id),
     }
 }
 
@@ -113,7 +113,7 @@ fn list_devices() {
     shutdown(&coach);
 }
 
-fn capture(duration_ms: u64, persistent_id: Option<String>) {
+fn freestyle(duration_ms: u64, persistent_id: Option<String>) {
     let coach = build_coach();
 
     let cfg = SessionConfig {
@@ -135,12 +135,12 @@ fn capture(duration_ms: u64, persistent_id: Option<String>) {
     match started {
         Some(Ok(())) => {}
         Some(Err((kind, reason))) => {
-            eprintln!("capture: session error: {kind:?}: {reason}");
+            eprintln!("freestyle: session error: {kind:?}: {reason}");
             shutdown(&coach);
             return;
         }
         None => {
-            eprintln!("capture: timed out waiting for Running");
+            eprintln!("freestyle: timed out waiting for Running");
             shutdown(&coach);
             return;
         }
