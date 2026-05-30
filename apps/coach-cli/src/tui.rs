@@ -67,24 +67,30 @@ const Y_INITIAL_HI: f32 = 12.0;
 /// holds a note near the edge of the window.
 const Y_HYSTERESIS: f32 = 0.20;
 
-/// Assumed input sample rate for the raw-audio ring. The cpal adapter
-/// negotiates 48k by preference and we don't surface the live SR to
-/// the head — close enough for the scope (50ms slice) and envelope
-/// (5s rolling RMS) which both round to the nearest sample.
-const AUDIO_SR_HZ: usize = 48_000;
+/// Upper-bound sample rate for sizing the audio ring. The cpal adapter
+/// negotiates 48k by preference and that's the highest we'd plausibly
+/// see for voice input; the ring is sized for this so a 44.1k session
+/// just runs with a touch of headroom.
+const AUDIO_SR_HZ_MAX: usize = 48_000;
+
+/// Fallback sample rate used by the scope/envelope renderers before a
+/// session is running (i.e. when [`AppCoach::session_info`] returns
+/// `None`). The audio ring is empty then anyway, so this only affects
+/// axis labels on the empty placeholder.
+const AUDIO_SR_HZ_FALLBACK: u32 = 48_000;
 
 /// Scope window length in milliseconds. Long enough to see a few
 /// cycles of a male fundamental (~80Hz → 12.5ms/cycle, so 4 cycles)
 /// without the trace becoming a smear.
-const SCOPE_WIN_MS: usize = 50;
+const SCOPE_WIN_MS: u64 = 50;
 
-/// Rolling RMS window length, in samples. ~10ms at 48k → smooth enough
+/// Rolling RMS window length, in milliseconds. ~10ms → smooth enough
 /// to read but still tracks attack/release within a phrase.
-const ENVELOPE_WIN_SAMPLES: usize = 480;
+const ENVELOPE_WIN_MS: u64 = 10;
 
-/// Envelope step (one RMS value every N samples). 480 = 10ms steps at
-/// 48k → 100Hz envelope rate → 500 points over the 5s history.
-const ENVELOPE_STEP_SAMPLES: usize = 480;
+/// Envelope step in milliseconds — one RMS frame every 10ms → 100Hz
+/// envelope rate.
+const ENVELOPE_STEP_MS: u64 = 10;
 
 /// History window for the envelope, in milliseconds — matches the
 /// pitch chart so they read together.
@@ -94,10 +100,10 @@ const ENVELOPE_WINDOW_MS: u64 = 5_000;
 /// headroom.
 const ENVELOPE_RING_CAP: usize = 600;
 
-/// Audio ring capacity, in samples. 5s × 48k + scope window so even at
-/// the bottom of the envelope window there's still a scope-worth of
+/// Audio ring capacity, in samples. 5s × max SR + scope window so even
+/// at the bottom of the envelope window there's still a scope-worth of
 /// fresh samples behind the cursor.
-const AUDIO_RING_CAP: usize = AUDIO_SR_HZ * 5 + AUDIO_SR_HZ * SCOPE_WIN_MS / 1000;
+const AUDIO_RING_CAP: usize = AUDIO_SR_HZ_MAX * 5 + AUDIO_SR_HZ_MAX * SCOPE_WIN_MS as usize / 1000;
 
 /// Run the shell until the user quits, or `deadline` elapses.
 /// `deadline = None` means run until the user quits.
@@ -143,9 +149,13 @@ struct State {
     /// when a new RMS window has filled.
     audio_origin: u64,
     /// Ring of recent RMS values, oldest at the front. One value per
-    /// `ENVELOPE_STEP_SAMPLES` of audio. Stored as `(sample_index,
-    /// rms)` so the renderer can place each point on the time axis.
+    /// envelope step of audio. Stored as `(sample_index, rms)` so the
+    /// renderer can place each point on the time axis.
     envelope: VecDeque<(u64, f32)>,
+    /// Live capture sample rate, refreshed every tick from
+    /// `coach.session_info()`. Falls back to [`AUDIO_SR_HZ_FALLBACK`]
+    /// when no session is running.
+    audio_sr_hz: u32,
 }
 
 impl Default for State {
@@ -161,6 +171,7 @@ impl Default for State {
             envelope_cursor: 0,
             audio_origin: 0,
             envelope: VecDeque::new(),
+            audio_sr_hz: AUDIO_SR_HZ_FALLBACK,
         }
     }
 }
@@ -208,14 +219,16 @@ impl State {
     }
 
     /// Walk the cursor forward, emitting one RMS value per full
-    /// `ENVELOPE_STEP_SAMPLES` window. Tagged with the *sample index*
-    /// at the end of the window so the renderer can place each point
-    /// on a time axis without depending on wall-clock or `t_ms`.
+    /// envelope step. Tagged with the *sample index* at the end of the
+    /// window so the renderer can place each point on a time axis
+    /// without depending on wall-clock or `t_ms`.
     fn emit_envelope_frames(&mut self) {
+        let step_samples = (self.audio_sr_hz as u64 * ENVELOPE_STEP_MS) / 1000;
+        let win_samples = (self.audio_sr_hz as u64 * ENVELOPE_WIN_MS) / 1000;
         let total_seen = self.audio_origin + self.audio.len() as u64;
-        while self.envelope_cursor + ENVELOPE_STEP_SAMPLES as u64 <= total_seen {
-            let win_end = self.envelope_cursor + ENVELOPE_STEP_SAMPLES as u64;
-            let win_start = win_end.saturating_sub(ENVELOPE_WIN_SAMPLES as u64);
+        while self.envelope_cursor + step_samples <= total_seen {
+            let win_end = self.envelope_cursor + step_samples;
+            let win_start = win_end.saturating_sub(win_samples);
             // Map sample indices back into ring offsets.
             let ring_lo = win_start.saturating_sub(self.audio_origin) as usize;
             let ring_hi = (win_end - self.audio_origin) as usize;
@@ -241,6 +254,17 @@ impl State {
             }
             self.envelope.push_back((win_end, rms));
             self.envelope_cursor = win_end;
+        }
+    }
+
+    /// Refresh `audio_sr_hz` from the coach. Called each tick before
+    /// `ingest_audio` so envelope/scope math runs against the
+    /// negotiated rate. When `session_info()` returns `None` (no
+    /// session running) we leave the cached value alone so a
+    /// transient drop doesn't flap the renderers.
+    fn refresh_sr(&mut self, coach: &impl AppCoach) {
+        if let Some(info) = coach.session_info() {
+            self.audio_sr_hz = info.sample_rate;
         }
     }
 
@@ -313,7 +337,9 @@ fn event_loop(
 ) -> io::Result<()> {
     loop {
         // Ingest before drawing so the freshest snapshot lands in this
-        // frame instead of the next one.
+        // frame instead of the next one. Refresh SR first so the
+        // audio ingest uses the negotiated rate.
+        state.refresh_sr(coach);
         if let Some(snap) = coach.latest_features() {
             state.ingest(snap);
         }
@@ -457,7 +483,8 @@ fn draw_scope(f: &mut Frame, area: Rect, state: &State) {
         return;
     }
 
-    let win_samples = AUDIO_SR_HZ * SCOPE_WIN_MS / 1000;
+    let sr = state.audio_sr_hz as usize;
+    let win_samples = sr * SCOPE_WIN_MS as usize / 1000;
     let take = win_samples.min(state.audio.len());
     if take == 0 {
         return;
@@ -475,7 +502,7 @@ fn draw_scope(f: &mut Frame, area: Rect, state: &State) {
         let s = state.audio[idx];
         // x: ms ago, ranging from -SCOPE_WIN_MS at the left edge to 0
         // at the right.
-        let ms_ago = -(((take - (i * stride)) as f64) * 1000.0 / AUDIO_SR_HZ as f64);
+        let ms_ago = -(((take - (i * stride)) as f64) * 1000.0 / sr as f64);
         points.push((ms_ago, s as f64));
     }
 
@@ -520,6 +547,7 @@ fn draw_envelope(f: &mut Frame, area: Rect, state: &State) {
     let Some(&(now_sample, _)) = state.envelope.back() else {
         return;
     };
+    let sr = state.audio_sr_hz as f64;
     let win_secs = ENVELOPE_WINDOW_MS as f64 / 1000.0;
     let min_x = -win_secs;
 
@@ -532,7 +560,7 @@ fn draw_envelope(f: &mut Frame, area: Rect, state: &State) {
         .iter()
         .filter_map(|(idx, rms)| {
             let dx = now_sample as f64 - *idx as f64;
-            let secs_ago = -dx / AUDIO_SR_HZ as f64;
+            let secs_ago = -dx / sr;
             if secs_ago < min_x {
                 None
             } else {

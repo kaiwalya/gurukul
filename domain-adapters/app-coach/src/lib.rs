@@ -61,7 +61,7 @@ use shutdown::join_with_timeout;
 
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, ShutdownResult,
+    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionInfo, ShutdownResult,
 };
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,9 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let feature_publisher_for_thread = Arc::clone(&feature_publisher);
+    let session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    let session_info_publisher_for_thread = Arc::clone(&session_info_publisher);
     let head_audio_slot: HeadAudioSlot = Arc::new(Mutex::new(None));
     let head_audio_slot_for_thread = Arc::clone(&head_audio_slot);
 
@@ -93,6 +96,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
                 outbound_for_thread,
                 rx_cmd,
                 feature_publisher_for_thread,
+                session_info_publisher_for_thread,
                 head_audio_slot_for_thread,
             )
             .run();
@@ -103,6 +107,7 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
         feature_publisher,
+        session_info_publisher,
         head_audio_slot,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
@@ -124,6 +129,11 @@ struct CoachImpl {
     /// before the first snapshot lands (no session running, first
     /// window still filling, etc.).
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+    /// Lock-free snapshot of the negotiated session parameters. Written
+    /// by the control plane before emitting `SessionStateChanged(Running)`
+    /// and cleared before the next transition out — see [`SessionInfo`]
+    /// for the ordering contract.
+    session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
     /// Slot the control plane writes when a session starts (and clears
     /// on stop). Holds the head-side rtrb consumer of raw mic samples.
     /// `None` whenever no session is running.
@@ -171,6 +181,10 @@ impl AppCoach for CoachImpl {
 
     fn latest_features(&self) -> Option<FeatureSnapshot> {
         **self.feature_publisher.load()
+    }
+
+    fn session_info(&self) -> Option<SessionInfo> {
+        (**self.session_info_publisher.load()).clone()
     }
 
     fn drain_audio(&self, dst: &mut Vec<f32>) -> usize {
@@ -431,6 +445,60 @@ mod tests {
         assert_eq!(
             stop_states,
             vec![SessionState::Stopping, SessionState::Idle]
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn session_info_is_some_only_while_running() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        assert!(
+            coach.session_info().is_none(),
+            "Idle should have no session info"
+        );
+
+        coach.send_command(Command::StartSession(SessionConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+        let info = coach
+            .session_info()
+            .expect("Running should expose session info");
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.channels, 1);
+
+        coach.send_command(Command::StopSession);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Idle
+                    }
+                )
+            })
+        });
+        assert!(
+            coach.session_info().is_none(),
+            "Idle (after stop) should have no session info"
         );
 
         assert_eq!(

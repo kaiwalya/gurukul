@@ -85,6 +85,35 @@ pub enum Command {
     StopSession,
 }
 
+/// Negotiated parameters of the currently-running session.
+///
+/// `SessionConfig` is what the head *asked for*; `SessionInfo` is what
+/// the device actually agreed to and what the data plane is feeding the
+/// engine right now. Heads use it for any widget that's sample-rate-
+/// dependent (oscilloscopes, envelopes, downsampling math).
+///
+/// **Lifecycle invariant:** [`AppCoach::session_info`] returns
+/// `Some(_)` if and only if the most recent
+/// [`CoachEvent::SessionStateChanged`] reported
+/// [`SessionState::Running`]. It is `None` in `Idle`, `Starting`,
+/// `Stopping`, and `Error` — including before the `Running` event has
+/// landed. The adapter publishes a fresh `SessionInfo` *before*
+/// emitting the `Running` transition and clears it *before* emitting
+/// the next transition, so a head reacting to the event will see
+/// coherent state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfo {
+    /// Negotiated capture sample rate, in Hz.
+    pub sample_rate: u32,
+    /// Negotiated channel count.
+    pub channels: u16,
+    /// The device the session is reading from. `None` when the session
+    /// opened the OS default and no persistent id is available.
+    pub device_id: Option<DeviceId>,
+    /// Negotiated capture buffer size, in frames.
+    pub buffer_frames: u32,
+}
+
 /// What the host wants to capture from.
 pub struct SessionConfig {
     /// Identifies the device to open. `None` requests the system's
@@ -285,6 +314,19 @@ pub trait AppCoach {
     /// cadence — there is no event for feature updates because the
     /// rate (~85Hz) would saturate the bounded event queue.
     fn latest_features(&self) -> Option<FeatureSnapshot>;
+
+    /// Negotiated parameters of the currently-running session, or
+    /// `None` when no session is running.
+    ///
+    /// Lifecycle: `Some(_)` iff state is [`SessionState::Running`].
+    /// `None` everywhere else (`Idle`, `Starting`, `Stopping`,
+    /// `Error`). See [`SessionInfo`] for the ordering guarantees
+    /// against `CoachEvent::SessionStateChanged`.
+    ///
+    /// Non-blocking, lock-free. Heads poll this whenever they need a
+    /// sample-rate-dependent constant (scope window math, downsampling,
+    /// envelope step size). Cheap enough to call every frame.
+    fn session_info(&self) -> Option<SessionInfo>;
 
     /// Drain accumulated raw mic samples into `dst`. Returns the number
     /// of samples appended. The data plane pushes the same block of

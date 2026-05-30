@@ -13,7 +13,7 @@ use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
     AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionErrorKind,
-    SessionState,
+    SessionInfo, SessionState,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
@@ -50,6 +50,12 @@ pub(crate) struct ControlPlane {
     outbound: Arc<Mutex<OutboundQueue>>,
     rx: mpsc::Receiver<Input>,
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+    /// Holds the negotiated `SessionInfo` while a session is `Running`,
+    /// `None` otherwise. The control plane writes it *before* emitting
+    /// `SessionStateChanged(Running)` and clears it *before* emitting
+    /// the next transition out, so a head reacting to the state event
+    /// observes coherent info.
+    session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
     head_audio_slot: HeadAudioSlot,
 
     state: SessionState,
@@ -69,6 +75,7 @@ impl ControlPlane {
         outbound: Arc<Mutex<OutboundQueue>>,
         rx: mpsc::Receiver<Input>,
         feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+        session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
         head_audio_slot: HeadAudioSlot,
     ) -> Self {
         Self {
@@ -76,6 +83,7 @@ impl ControlPlane {
             outbound,
             rx,
             feature_publisher,
+            session_info_publisher,
             head_audio_slot,
             state: SessionState::Idle,
             capture: None,
@@ -114,8 +122,9 @@ impl ControlPlane {
             dp.stop(&*self.deps.telemetry);
         }
         // Clear any stale reading so a head polling after shutdown
-        // sees `None` instead of the last-known f0.
+        // sees `None` instead of the last-known f0 / session info.
         self.feature_publisher.store(Arc::new(None));
+        self.session_info_publisher.store(Arc::new(None));
         *self.head_audio_slot.lock().unwrap() = None;
         tel_info!(
             &*self.deps.telemetry,
@@ -219,6 +228,16 @@ impl ControlPlane {
                     channels = channels as u32,
                     buffer_frames = buffer_frames.unwrap_or(0),
                 );
+                // Publish negotiated session info *before* emitting the
+                // Running transition so any head reacting to the event
+                // sees Some(info) (not None or stale).
+                self.session_info_publisher
+                    .store(Arc::new(Some(SessionInfo {
+                        sample_rate,
+                        channels,
+                        device_id: cfg.device_id.clone(),
+                        buffer_frames: buffer_frames.unwrap_or(0),
+                    })));
                 self.transition(SessionState::Running);
             }
             Err(e) => {
@@ -242,6 +261,10 @@ impl ControlPlane {
                 // actually see Starting at message-arrival time —
                 // but the spec says Stop-during-Start cancels, so
                 // we model it: if capture was opened, drop it.
+                //
+                // Clear session_info *before* the transition so a head
+                // reacting to Stopping observes `None`, not stale info.
+                self.session_info_publisher.store(Arc::new(None));
                 self.transition(SessionState::Stopping);
                 self.teardown_data_path();
                 self.transition(SessionState::Idle);
@@ -283,6 +306,9 @@ impl ControlPlane {
     fn fail(&mut self, kind: SessionErrorKind, reason: String) {
         // Always reachable from Starting (most common); also from
         // Running if a sync path ever invokes this.
+        // Clear session_info before the transition so a head reacting
+        // to Error observes `None`. No-op when called from Starting.
+        self.session_info_publisher.store(Arc::new(None));
         self.transition(SessionState::Error);
         self.push_event(CoachEvent::SessionError {
             kind,
