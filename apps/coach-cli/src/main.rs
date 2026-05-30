@@ -33,7 +33,9 @@ enum Subcmd {
     Run,
     /// Enumerate audio input devices and print a summary.
     ListDevices,
-    /// Open an input device and log per-callback stats.
+    /// Freestyle: open the mic and print the live pitch — sing, hum,
+    /// whistle. One line per fresh f0 estimate (~85 Hz at 48k/hop=512);
+    /// `--` shown for unvoiced frames (silence, breath, noise).
     Capture {
         /// Duration to capture, in milliseconds.
         #[arg(long, default_value_t = 3000)]
@@ -42,13 +44,6 @@ enum Subcmd {
         /// open. Default: system multimedia-role default input.
         #[arg(long)]
         persistent_id: Option<String>,
-        /// Print the live pitch estimate (note + cents) while
-        /// capturing. The CLI polls `latest_pitch()` at ~20 Hz; the
-        /// data plane publishes at ~85 Hz (hop=512 @ 48k), so most
-        /// polls land on a fresh reading. `--` shown for unvoiced
-        /// frames (silence, breath, noise).
-        #[arg(long)]
-        show_pitch: bool,
     },
 }
 
@@ -60,8 +55,7 @@ fn main() {
         Subcmd::Capture {
             duration_ms,
             persistent_id,
-            show_pitch,
-        } => capture(duration_ms, persistent_id, show_pitch),
+        } => capture(duration_ms, persistent_id),
     }
 }
 
@@ -119,7 +113,7 @@ fn list_devices() {
     shutdown(&coach);
 }
 
-fn capture(duration_ms: u64, persistent_id: Option<String>, show_pitch: bool) {
+fn capture(duration_ms: u64, persistent_id: Option<String>) {
     let coach = build_coach();
 
     let cfg = SessionConfig {
@@ -152,11 +146,7 @@ fn capture(duration_ms: u64, persistent_id: Option<String>, show_pitch: bool) {
         }
     }
 
-    if show_pitch {
-        run_pitch_loop(&coach, Duration::from_millis(duration_ms));
-    } else {
-        thread::sleep(Duration::from_millis(duration_ms));
-    }
+    run_pitch_loop(&coach, Duration::from_millis(duration_ms));
 
     coach.send_command(Command::StopSession);
     let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {

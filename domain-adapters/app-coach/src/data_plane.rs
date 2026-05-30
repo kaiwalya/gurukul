@@ -300,3 +300,89 @@ pub(crate) fn push_samples(
         samples_dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain_ports::clock::TestClock;
+    use domain_ports::telemetry::TestTelemetry;
+    use std::time::Instant;
+
+    /// Loopback: synthesise a 440Hz sine, push it through the ring,
+    /// and confirm the worker publishes f0 ≈ 440. Covers the seam
+    /// between push_samples and the ArcSwap publisher — YIN itself
+    /// is covered by node-pitch-yin's own tests.
+    #[test]
+    fn sine_440_round_trips_to_publisher() {
+        const SR: u32 = 48_000;
+        const F0: f32 = 440.0;
+
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
+        let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
+        let pitch_publisher: Arc<ArcSwap<Option<PitchReading>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+
+        let (data_plane, mut producer, dropped) = DataPlane::start(DataPlaneDeps {
+            sample_rate: SR,
+            pitch_publisher: Arc::clone(&pitch_publisher),
+            clock,
+            telemetry: Arc::clone(&telemetry),
+        })
+        .expect("data plane starts");
+
+        // Feed enough audio for YIN to lock: window=2048 must fill,
+        // plus a few hops for the published estimate to stabilise.
+        // 8192 samples = 4 windows, takes ~170ms of audio time but
+        // gets pushed and drained as fast as the worker can keep up.
+        let mut phase: f32 = 0.0;
+        let step = 2.0 * std::f32::consts::PI * F0 / SR as f32;
+        let mut chunk = [0.0_f32; 256];
+        let total_samples = 8192;
+        let mut pushed = 0;
+        while pushed < total_samples {
+            for s in chunk.iter_mut() {
+                *s = (phase).sin() * 0.5;
+                phase += step;
+            }
+            // Push in 256-sample bursts to mimic cpal's variable-size
+            // callbacks; the ring is 4096 deep so we may need to wait
+            // for the worker to drain.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut written = 0;
+            while written < chunk.len() {
+                if producer.push(chunk[written]).is_ok() {
+                    written += 1;
+                } else if Instant::now() > deadline {
+                    panic!("ring stayed full; worker not draining");
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            pushed += chunk.len();
+        }
+
+        // Poll the publisher until we see a voiced reading within
+        // 1Hz of 440, or time out.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut last_f0: f32 = 0.0;
+        let f0 = loop {
+            if let Some(reading) = **pitch_publisher.load() {
+                last_f0 = reading.f0_hz;
+                if reading.f0_hz > 0.0 && (reading.f0_hz - F0).abs() < 1.0 {
+                    break reading.f0_hz;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!("publisher never reported f0 ≈ {F0}Hz (last seen: {last_f0}Hz)");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!((f0 - F0).abs() < 1.0, "expected f0 ≈ {F0}, got {f0}");
+
+        // Tear down cleanly. Drop the producer first so the worker's
+        // pop loop sees the channel close; then stop joins the thread.
+        drop(producer);
+        data_plane.stop(&*telemetry);
+        assert_eq!(dropped.load(Ordering::Acquire), 0, "no drops expected");
+    }
+}
