@@ -67,6 +67,38 @@ const Y_INITIAL_HI: f32 = 12.0;
 /// holds a note near the edge of the window.
 const Y_HYSTERESIS: f32 = 0.20;
 
+/// Assumed input sample rate for the raw-audio ring. The cpal adapter
+/// negotiates 48k by preference and we don't surface the live SR to
+/// the head — close enough for the scope (50ms slice) and envelope
+/// (5s rolling RMS) which both round to the nearest sample.
+const AUDIO_SR_HZ: usize = 48_000;
+
+/// Scope window length in milliseconds. Long enough to see a few
+/// cycles of a male fundamental (~80Hz → 12.5ms/cycle, so 4 cycles)
+/// without the trace becoming a smear.
+const SCOPE_WIN_MS: usize = 50;
+
+/// Rolling RMS window length, in samples. ~10ms at 48k → smooth enough
+/// to read but still tracks attack/release within a phrase.
+const ENVELOPE_WIN_SAMPLES: usize = 480;
+
+/// Envelope step (one RMS value every N samples). 480 = 10ms steps at
+/// 48k → 100Hz envelope rate → 500 points over the 5s history.
+const ENVELOPE_STEP_SAMPLES: usize = 480;
+
+/// History window for the envelope, in milliseconds — matches the
+/// pitch chart so they read together.
+const ENVELOPE_WINDOW_MS: u64 = 5_000;
+
+/// How many envelope samples we keep on hand: 5s × 100Hz + a touch of
+/// headroom.
+const ENVELOPE_RING_CAP: usize = 600;
+
+/// Audio ring capacity, in samples. 5s × 48k + scope window so even at
+/// the bottom of the envelope window there's still a scope-worth of
+/// fresh samples behind the cursor.
+const AUDIO_RING_CAP: usize = AUDIO_SR_HZ * 5 + AUDIO_SR_HZ * SCOPE_WIN_MS / 1000;
+
 /// Run the shell until the user quits, or `deadline` elapses.
 /// `deadline = None` means run until the user quits.
 pub fn run(coach: &impl AppCoach, logs: LogBuffer, deadline: Option<Instant>) -> io::Result<()> {
@@ -95,6 +127,25 @@ struct State {
     /// can compare against the current window.
     y_lo: f32,
     y_hi: f32,
+    /// Rolling 5s+ ring of raw mic samples. Drained from the coach via
+    /// `drain_audio` each tick; the scope reads the freshest 50ms slice,
+    /// the envelope re-buckets the whole ring into RMS frames.
+    audio: VecDeque<f32>,
+    /// Reusable scratch buffer for `drain_audio` so we don't allocate
+    /// every tick.
+    audio_scratch: Vec<f32>,
+    /// Sample index of the *next* envelope frame's window start. Lets
+    /// us emit one envelope point per `ENVELOPE_STEP_SAMPLES` of audio
+    /// regardless of how lumpy `drain_audio` is between ticks.
+    envelope_cursor: u64,
+    /// Sample index of the oldest sample still in `audio`. Bumped as
+    /// we drop from the front; paired with `envelope_cursor` to know
+    /// when a new RMS window has filled.
+    audio_origin: u64,
+    /// Ring of recent RMS values, oldest at the front. One value per
+    /// `ENVELOPE_STEP_SAMPLES` of audio. Stored as `(sample_index,
+    /// rms)` so the renderer can place each point on the time axis.
+    envelope: VecDeque<(u64, f32)>,
 }
 
 impl Default for State {
@@ -105,6 +156,11 @@ impl Default for State {
             last_t_ms: None,
             y_lo: Y_INITIAL_LO,
             y_hi: Y_INITIAL_HI,
+            audio: VecDeque::new(),
+            audio_scratch: Vec::new(),
+            envelope_cursor: 0,
+            audio_origin: 0,
+            envelope: VecDeque::new(),
         }
     }
 }
@@ -119,6 +175,73 @@ impl State {
             self.features.pop_front();
         }
         self.features.push_back(snap);
+    }
+
+    /// Drain any raw mic samples the coach has accumulated and bake
+    /// them into both the audio ring (for the scope) and the rolling
+    /// envelope ring (for the slow envelope plot).
+    ///
+    /// Sample indices (`audio_origin`, `envelope_cursor`) are kept in
+    /// terms of "samples ever seen", so dropping from the front of the
+    /// ring doesn't lose alignment between audio and envelope time.
+    fn ingest_audio(&mut self, coach: &impl AppCoach) {
+        self.audio_scratch.clear();
+        let n = coach.drain_audio(&mut self.audio_scratch);
+        if n == 0 {
+            return;
+        }
+        // Append to the back of the ring, evict from the front if we
+        // overshoot the cap.
+        self.audio.extend(self.audio_scratch.iter().copied());
+        let overflow = self.audio.len().saturating_sub(AUDIO_RING_CAP);
+        if overflow > 0 {
+            self.audio.drain(..overflow);
+            self.audio_origin += overflow as u64;
+            // If the envelope cursor was inside the dropped prefix,
+            // advance it to the new origin so we don't emit RMS over
+            // a window we no longer have samples for.
+            if self.envelope_cursor < self.audio_origin {
+                self.envelope_cursor = self.audio_origin;
+            }
+        }
+        self.emit_envelope_frames();
+    }
+
+    /// Walk the cursor forward, emitting one RMS value per full
+    /// `ENVELOPE_STEP_SAMPLES` window. Tagged with the *sample index*
+    /// at the end of the window so the renderer can place each point
+    /// on a time axis without depending on wall-clock or `t_ms`.
+    fn emit_envelope_frames(&mut self) {
+        let total_seen = self.audio_origin + self.audio.len() as u64;
+        while self.envelope_cursor + ENVELOPE_STEP_SAMPLES as u64 <= total_seen {
+            let win_end = self.envelope_cursor + ENVELOPE_STEP_SAMPLES as u64;
+            let win_start = win_end.saturating_sub(ENVELOPE_WIN_SAMPLES as u64);
+            // Map sample indices back into ring offsets.
+            let ring_lo = win_start.saturating_sub(self.audio_origin) as usize;
+            let ring_hi = (win_end - self.audio_origin) as usize;
+            let ring_hi = ring_hi.min(self.audio.len());
+            let mut sum_sq = 0.0_f32;
+            let mut count = 0_usize;
+            // VecDeque doesn't expose a slice directly across the wrap;
+            // iterate by index — these windows are ≤480 samples so the
+            // per-sample cost is negligible.
+            for i in ring_lo..ring_hi {
+                if let Some(&s) = self.audio.get(i) {
+                    sum_sq += s * s;
+                    count += 1;
+                }
+            }
+            let rms = if count > 0 {
+                (sum_sq / count as f32).sqrt()
+            } else {
+                0.0
+            };
+            if self.envelope.len() == ENVELOPE_RING_CAP {
+                self.envelope.pop_front();
+            }
+            self.envelope.push_back((win_end, rms));
+            self.envelope_cursor = win_end;
+        }
     }
 
     /// Recompute the Y window if recent voiced data has drifted out
@@ -194,6 +317,7 @@ fn event_loop(
         if let Some(snap) = coach.latest_features() {
             state.ingest(snap);
         }
+        state.ingest_audio(coach);
 
         terminal.draw(|f| draw(f, state, logs))?;
         // `draw` borrows state mutably, the rest of this iteration
@@ -260,12 +384,16 @@ fn draw_main(f: &mut Frame, area: Rect, state: &State) {
     //  - readout band: 5 rows normally; collapses to 1-row plain text
     //    when the terminal is too short (height < 20) to fit the
     //    BigText glyphs comfortably alongside chart + diag + hint.
-    //  - chart: fills whatever's left.
+    //  - canvas: chart on the right, scope+envelope split vertically
+    //    on the left. The whole canvas drops to chart-only on narrow
+    //    terminals (width < 100) — scope needs real width to be
+    //    legible.
     //  - diag (breath + vibrato): dropped entirely on narrow
     //    terminals (width < 80) where it would overflow or crowd the
     //    chart. Hint stays — it's the only quit affordance.
     let compact_readout = inner.height < 20;
     let show_diag = inner.width >= 80;
+    let show_scope = inner.width >= 100;
     let readout_rows = if compact_readout { 1 } else { 5 };
 
     let mut constraints: Vec<Constraint> =
@@ -281,7 +409,7 @@ fn draw_main(f: &mut Frame, area: Rect, state: &State) {
         .split(inner);
 
     let readout_area = layout[0];
-    let chart_area = layout[1];
+    let canvas_area = layout[1];
     let (diag_area, hint_area) = if show_diag {
         (Some(layout[2]), layout[3])
     } else {
@@ -293,11 +421,153 @@ fn draw_main(f: &mut Frame, area: Rect, state: &State) {
     } else {
         draw_readout(f, readout_area, state);
     }
-    draw_chart(f, chart_area, state);
+    if show_scope {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(canvas_area);
+        let left = cols[0];
+        let chart_area = cols[1];
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(left);
+        draw_scope(f, rows[0], state);
+        draw_envelope(f, rows[1], state);
+        draw_chart(f, chart_area, state);
+    } else {
+        draw_chart(f, canvas_area, state);
+    }
     if let Some(a) = diag_area {
         draw_diag(f, a, state);
     }
     draw_hint(f, hint_area);
+}
+
+/// Fast oscilloscope: the trailing 50ms of raw mic, plotted as
+/// amplitude vs. time. X axis runs `[-SCOPE_WIN_MS, 0]` in ms, Y axis
+/// is amplitude in `[-1, 1]`. Downsampled to roughly one point per
+/// inner column so we don't shove 2.4k points through ratatui's
+/// braille rasteriser every frame.
+fn draw_scope(f: &mut Frame, area: Rect, state: &State) {
+    let block = Block::default().borders(Borders::ALL).title(" scope ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 3 {
+        return;
+    }
+
+    let win_samples = AUDIO_SR_HZ * SCOPE_WIN_MS / 1000;
+    let take = win_samples.min(state.audio.len());
+    if take == 0 {
+        return;
+    }
+    let start = state.audio.len() - take;
+    // Downsample by stride to ~2 points per terminal column. Braille
+    // packs 2 horizontal × 4 vertical sub-cells per character; one
+    // sample per sub-column keeps the trace crisp without bursting the
+    // dataset.
+    let target_points = (inner.width as usize * 2).max(64);
+    let stride = (take / target_points).max(1);
+
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(take / stride + 1);
+    for (i, idx) in (start..state.audio.len()).step_by(stride).enumerate() {
+        let s = state.audio[idx];
+        // x: ms ago, ranging from -SCOPE_WIN_MS at the left edge to 0
+        // at the right.
+        let ms_ago = -(((take - (i * stride)) as f64) * 1000.0 / AUDIO_SR_HZ as f64);
+        points.push((ms_ago, s as f64));
+    }
+
+    let dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&points);
+
+    let chart = Chart::new(vec![dataset])
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([-(SCOPE_WIN_MS as f64), 0.0])
+                .labels(vec![
+                    Span::raw(format!("-{SCOPE_WIN_MS}ms")),
+                    Span::raw("0"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([-1.0, 1.0])
+                .labels(vec![Span::raw("-1"), Span::raw("0"), Span::raw("1")]),
+        );
+    f.render_widget(chart, inner);
+}
+
+/// Slow envelope: rolling RMS over the last 5s, plotted in dB. Reads
+/// from the pre-computed `state.envelope` ring (one value per
+/// `ENVELOPE_STEP_SAMPLES` of audio); the renderer just maps sample
+/// indices to "seconds ago" using the most-recent envelope point as
+/// the zero reference.
+fn draw_envelope(f: &mut Frame, area: Rect, state: &State) {
+    let block = Block::default().borders(Borders::ALL).title(" envelope ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 3 {
+        return;
+    }
+
+    let Some(&(now_sample, _)) = state.envelope.back() else {
+        return;
+    };
+    let win_secs = ENVELOPE_WINDOW_MS as f64 / 1000.0;
+    let min_x = -win_secs;
+
+    // Linear amplitude on [0, 0.5] reads more naturally than dB at this
+    // size — a quiet hum is near the floor, a loud "ah" is most of the
+    // way up. Clamp at 0.5; sustained louder than that is already
+    // clipping territory and the singer wants to know.
+    let points: Vec<(f64, f64)> = state
+        .envelope
+        .iter()
+        .filter_map(|(idx, rms)| {
+            let dx = now_sample as f64 - *idx as f64;
+            let secs_ago = -dx / AUDIO_SR_HZ as f64;
+            if secs_ago < min_x {
+                None
+            } else {
+                Some((secs_ago, (*rms as f64).min(0.5)))
+            }
+        })
+        .collect();
+
+    if points.is_empty() {
+        return;
+    }
+
+    let dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Magenta))
+        .data(&points);
+
+    let chart = Chart::new(vec![dataset])
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([min_x, 0.0])
+                .labels(vec![
+                    Span::raw(format!("-{}s", win_secs as u64)),
+                    Span::raw("0"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([0.0, 0.5])
+                .labels(vec![Span::raw("0"), Span::raw(".5")]),
+        );
+    f.render_widget(chart, inner);
 }
 
 /// Compact 1-row readout for short terminals. Same data and tinting
