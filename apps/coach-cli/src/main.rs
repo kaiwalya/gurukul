@@ -140,7 +140,7 @@ fn run_tui(duration_ms: Option<u64>, persistent_id: Option<String>) {
     }));
 
     let deadline = duration_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-    if let Err(e) = tui::run(log_buffer, deadline) {
+    if let Err(e) = tui::run(&coach, log_buffer, deadline) {
         eprintln!("coach-cli: tui error: {e}");
     }
 
