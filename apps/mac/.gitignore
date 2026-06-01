@@ -1,7 +1,0 @@
-# Xcode user state and per-user project tweaks
-xcuserdata/
-*.xcuserstate
-
-# Build output
-build/
-DerivedData/
