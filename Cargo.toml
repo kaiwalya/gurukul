@@ -26,6 +26,7 @@ members = [
     "domain-adapters/app-coach",
     "domain-adapters/audio-cpal",
     "apps/coach-cli",
+    "apps/coach-game",
 ]
 resolver = "2"
 
