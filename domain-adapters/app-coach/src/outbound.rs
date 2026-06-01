@@ -50,3 +50,68 @@ impl OutboundQueue {
         out.extend(self.inner.drain(..));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list_devices() -> CoachEvent {
+        CoachEvent::DevicesListed { devices: vec![] }
+    }
+
+    #[test]
+    fn overflow_drops_oldest_and_coalesces_count() {
+        let mut q = OutboundQueue::new(4);
+        for _ in 0..10 {
+            q.push(list_devices());
+        }
+
+        let mut out = Vec::new();
+        q.drain_into(&mut out);
+
+        let dropped = match out.first() {
+            Some(CoachEvent::EventsDropped { count }) => *count,
+            _ => panic!("expected EventsDropped at head of drain"),
+        };
+        assert_eq!(dropped, 6, "10 pushed, cap 4 → 6 dropped");
+        assert_eq!(out.len(), 5, "EventsDropped + 4 surviving events");
+    }
+
+    #[test]
+    fn no_overflow_means_no_dropped_event() {
+        let mut q = OutboundQueue::new(4);
+        q.push(list_devices());
+        q.push(list_devices());
+
+        let mut out = Vec::new();
+        q.drain_into(&mut out);
+
+        assert_eq!(out.len(), 2);
+        assert!(
+            !matches!(out.first(), Some(CoachEvent::EventsDropped { .. })),
+            "no overflow should not emit EventsDropped",
+        );
+    }
+
+    #[test]
+    fn drained_count_resets_between_flushes() {
+        let mut q = OutboundQueue::new(2);
+        for _ in 0..5 {
+            q.push(list_devices());
+        }
+
+        let mut out = Vec::new();
+        q.drain_into(&mut out);
+        assert!(matches!(
+            out.first(),
+            Some(CoachEvent::EventsDropped { count: 3 })
+        ));
+
+        // Second flush with no new drops must not re-emit.
+        q.push(list_devices());
+        out.clear();
+        q.drain_into(&mut out);
+        assert_eq!(out.len(), 1);
+        assert!(!matches!(out[0], CoachEvent::EventsDropped { .. }));
+    }
+}
