@@ -56,7 +56,7 @@ mod outbound;
 mod pitch_world;
 mod shutdown;
 
-use control_plane::{ControlPlane, HeadAudioSlot, Input};
+use control_plane::{ControlPlane, Input};
 use inspect::{EngineInspectImpl, InspectShared};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
@@ -103,8 +103,6 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let session_info_publisher_for_thread = Arc::clone(&session_info_publisher);
-    let head_audio_slot: HeadAudioSlot = Arc::new(Mutex::new(None));
-    let head_audio_slot_for_thread = Arc::clone(&head_audio_slot);
     let inspect_shared = InspectShared::new();
     let inspect_for_thread = Arc::clone(&inspect_shared);
 
@@ -117,7 +115,6 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
                 rx_cmd,
                 feature_publisher_for_thread,
                 session_info_publisher_for_thread,
-                head_audio_slot_for_thread,
                 inspect_for_thread,
             )
             .run();
@@ -129,7 +126,6 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
         outbound,
         feature_publisher,
         session_info_publisher,
-        head_audio_slot,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     };
@@ -159,10 +155,6 @@ struct CoachImpl {
     /// and cleared before the next transition out — see [`SessionInfo`]
     /// for the ordering contract.
     session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
-    /// Slot the control plane writes when a session starts (and clears
-    /// on stop). Holds the head-side rtrb consumer of raw mic samples.
-    /// `None` whenever no session is running.
-    head_audio_slot: HeadAudioSlot,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -210,19 +202,6 @@ impl AppCoach for CoachImpl {
 
     fn session_info(&self) -> Option<SessionInfo> {
         (**self.session_info_publisher.load()).clone()
-    }
-
-    fn drain_audio(&self, dst: &mut Vec<f32>) -> usize {
-        let mut guard = self.head_audio_slot.lock().unwrap();
-        let Some(consumer) = guard.as_mut() else {
-            return 0;
-        };
-        let mut drained = 0;
-        while let Ok(s) = consumer.pop() {
-            dst.push(s);
-            drained += 1;
-        }
-        drained
     }
 }
 
@@ -770,46 +749,6 @@ mod tests {
             opens.load(Ordering::SeqCst),
             2,
             "capture must be reopened on the second Start"
-        );
-
-        assert_eq!(
-            coach.shutdown(Duration::from_secs(1)),
-            ShutdownResult::Clean
-        );
-    }
-
-    #[test]
-    fn events_dropped_surfaces_when_head_never_polls() {
-        let opens = Arc::new(AtomicU32::new(0));
-        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
-        let coach = new(deps);
-
-        // Cheap event source: ListDevices is one event per command.
-        // Send more than the queue capacity so we're guaranteed to
-        // overflow even if a few get drained by background work.
-        let burst = OUTBOUND_QUEUE_CAP + 16;
-        for _ in 0..burst {
-            coach.send_command(Command::ListDevices);
-        }
-
-        // Wait for the queue to fill and the control plane to settle.
-        // We can't observe queue length directly; poll for an
-        // EventsDropped marker, which only appears on overflow.
-        let events = poll_until(&coach, |evs| {
-            evs.iter()
-                .any(|e| matches!(e, CoachEvent::EventsDropped { .. }))
-        });
-
-        let dropped = events
-            .iter()
-            .find_map(|e| match e {
-                CoachEvent::EventsDropped { count } => Some(*count),
-                _ => None,
-            })
-            .expect("EventsDropped should be emitted on overflow");
-        assert!(
-            dropped >= 16,
-            "expected at least 16 drops (sent {burst}, cap {OUTBOUND_QUEUE_CAP}), got {dropped}"
         );
 
         assert_eq!(

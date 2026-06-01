@@ -19,17 +19,9 @@ use domain_ports::app_coach::{
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
 use domain_ports::{tel_debug, tel_info, tel_warn};
-use rtrb::Consumer;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// Slot the control plane uses to hand the head-side raw-audio
-/// consumer to [`CoachImpl::drain_audio`]. Lives in an `Arc<Mutex<…>>`
-/// so it can be shared without lifetime gymnastics; the mutex is
-/// uncontended in practice — the control plane writes it on
-/// session start / stop, the head reads it at the UI tick.
-pub(crate) type HeadAudioSlot = Arc<Mutex<Option<Consumer<f32>>>>;
 
 /// Everything the control plane processes. v1 sources:
 ///
@@ -57,7 +49,6 @@ pub(crate) struct ControlPlane {
     /// the next transition out, so a head reacting to the state event
     /// observes coherent info.
     session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
-    head_audio_slot: HeadAudioSlot,
     /// Shared state behind the [`EngineInspect`](domain_ports::engine_inspect::EngineInspect)
     /// port: selection slot + tap snapshot publisher + node-port list.
     /// Cloned and handed to each new data-plane worker.
@@ -81,7 +72,6 @@ impl ControlPlane {
         rx: mpsc::Receiver<Input>,
         feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
         session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
-        head_audio_slot: HeadAudioSlot,
         inspect: Arc<InspectShared>,
     ) -> Self {
         Self {
@@ -90,7 +80,6 @@ impl ControlPlane {
             rx,
             feature_publisher,
             session_info_publisher,
-            head_audio_slot,
             inspect,
             state: SessionState::Idle,
             capture: None,
@@ -132,7 +121,6 @@ impl ControlPlane {
         // sees `None` instead of the last-known f0 / session info.
         self.feature_publisher.store(Arc::new(None));
         self.session_info_publisher.store(Arc::new(None));
-        *self.head_audio_slot.lock().unwrap() = None;
         self.inspect.clear();
         tel_info!(
             &*self.deps.telemetry,
@@ -212,12 +200,7 @@ impl ControlPlane {
             data_plane,
             producer,
             samples_dropped: dropped_for_cb,
-            head_audio_consumer,
         } = startup;
-
-        // Publish the head-side consumer so coach.drain_audio() finds
-        // it. Cleared again in teardown_data_path on session stop.
-        *self.head_audio_slot.lock().unwrap() = Some(head_audio_consumer);
 
         let callback = self.build_frame_callback(channels, producer, dropped_for_cb);
 
@@ -305,10 +288,6 @@ impl ControlPlane {
         if let Some(dp) = self.data_plane.take() {
             dp.stop(&*self.deps.telemetry);
         }
-        // Clear the head-side raw-audio consumer. A late
-        // coach.drain_audio() now sees `None` instead of a
-        // disconnected ring; symmetric with the feature publisher.
-        *self.head_audio_slot.lock().unwrap() = None;
         self.feature_publisher.store(Arc::new(None));
         // Clear the inspect publishers so the head's debug pane sees
         // an empty node list + no taps until the next session starts.

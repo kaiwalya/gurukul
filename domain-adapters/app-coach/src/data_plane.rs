@@ -56,13 +56,6 @@ pub(crate) const BLOCK_FRAMES: usize = 512;
 /// than any reasonable cpal buffer + worker scheduling jitter.
 const RING_CAPACITY: usize = 4096;
 
-/// Capacity of the worker→head audio transit ring, in samples. Sized
-/// for ~170ms at 48kHz — large enough to absorb a head that ticks at
-/// 30Hz and skips a frame, small enough that an indefinitely-stalled
-/// head doesn't grow memory. Overflow drops oldest samples (head sees
-/// a gap, never stale data).
-const HEAD_AUDIO_CAPACITY: usize = 8192;
-
 // ---------------------------------------------------------------------
 // Public: spawn / teardown
 // ---------------------------------------------------------------------
@@ -82,13 +75,10 @@ pub(crate) struct DataPlane {
 /// - `producer` is moved into the cpal capture callback (RT thread).
 /// - `samples_dropped` is shared with the callback so it can bump
 ///   the counter when the worker ring is full.
-/// - `head_audio_consumer` is parked in [`HeadAudioSlot`] so heads can
-///   pull raw mic samples via `AppCoach::drain_audio`.
 pub(crate) struct DataPlaneStartup {
     pub(crate) data_plane: DataPlane,
     pub(crate) producer: Producer<f32>,
     pub(crate) samples_dropped: Arc<AtomicU64>,
-    pub(crate) head_audio_consumer: Consumer<f32>,
 }
 
 impl DataPlane {
@@ -99,11 +89,6 @@ impl DataPlane {
     /// teardown.
     pub(crate) fn start(deps: DataPlaneDeps) -> Result<DataPlaneStartup, DataPlaneError> {
         let (producer, consumer) = RingBuffer::<f32>::new(RING_CAPACITY);
-        // Worker → head transit ring for raw audio (scope / envelope).
-        // Producer lives on the worker; consumer is handed to the head
-        // through the adapter so coach.drain_audio() can pull samples.
-        let (head_audio_producer, head_audio_consumer) =
-            RingBuffer::<f32>::new(HEAD_AUDIO_CAPACITY);
 
         // Build the engine on the *worker* thread, not here — engines
         // hold trait objects that aren't always `Send`, and the
@@ -124,7 +109,6 @@ impl DataPlane {
             .spawn(move || {
                 run_worker(WorkerArgs {
                     consumer,
-                    head_audio_producer,
                     sample_rate,
                     quit: quit_for_thread,
                     feature_publisher,
@@ -143,7 +127,6 @@ impl DataPlane {
             },
             producer,
             samples_dropped: dropped_for_callback,
-            head_audio_consumer,
         })
     }
 
@@ -196,15 +179,6 @@ impl std::fmt::Display for DataPlaneError {
 
 struct WorkerArgs {
     consumer: Consumer<f32>,
-    /// Producer side of the worker → head audio transit ring. The
-    /// worker copies each engine input block into this ring after the
-    /// engine runs; the head drains it via [`AppCoach::drain_audio`].
-    /// On overflow (head stalled) the newest samples are dropped —
-    /// rtrb is push-fails-on-full. Acceptable: a momentarily-stalled
-    /// head produces a visible flat patch in the scope, not stale
-    /// data. The ring is oversized vs head poll cadence so this is
-    /// rare in practice.
-    head_audio_producer: Producer<f32>,
     sample_rate: u32,
     quit: Arc<AtomicBool>,
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
@@ -216,7 +190,6 @@ struct WorkerArgs {
 fn run_worker(args: WorkerArgs) {
     let WorkerArgs {
         mut consumer,
-        mut head_audio_producer,
         sample_rate,
         quit,
         feature_publisher,
@@ -306,14 +279,6 @@ fn run_worker(args: WorkerArgs) {
         // the debug panel. Cheap no-op when nothing is selected.
         block_seq = block_seq.wrapping_add(1);
         inspect.tap_if_selected(&engine, block_seq);
-
-        // Publish the same block to the head ring so scope/envelope
-        // widgets can see the raw mic signal. Push-fails-on-full is
-        // the default rtrb semantics; samples that don't fit are
-        // simply dropped (head stalled → visible gap, never stale).
-        for &s in &block {
-            let _ = head_audio_producer.push(s);
-        }
 
         // Read every feature for this hop and publish as one snapshot.
         // Always publish — heads can tell voiced from unvoiced via
@@ -420,7 +385,6 @@ mod tests {
             data_plane,
             mut producer,
             samples_dropped: dropped,
-            head_audio_consumer: _,
         } = DataPlane::start(DataPlaneDeps {
             sample_rate: SR,
             feature_publisher: Arc::clone(&feature_publisher),
