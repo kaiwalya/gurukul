@@ -23,7 +23,6 @@ members = [
     "domain-ports",
     "domain-adapters/clock-std",
     "domain-adapters/telemetry-std",
-    "domain-adapters/telemetry-tui",
     "domain-adapters/app-coach",
     "domain-adapters/audio-cpal",
     "apps/coach-cli",
@@ -39,5 +38,3 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 cpal = "0.17"
-ratatui = "0.30"
-crossterm = "0.29"

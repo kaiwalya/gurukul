@@ -2,13 +2,11 @@
 //!
 //! The CLI is a *head*: a thin shell that wires peripheral adapters
 //! into an [`AppCoach`], translates subcommands into [`Command`]s,
-//! drains [`CoachEvent`]s, and prints. Real product behaviour
-//! (state machine, session lifecycle, telemetry) lives in
-//! `adapter-app-coach`.
+//! drains [`CoachEvent`]s, and prints one line per feature snapshot.
+//! Real product behaviour (state machine, session lifecycle,
+//! telemetry) lives in `adapter-app-coach`.
 //!
 //! See `docs/SPEC-AppCoach.md` for the boundary contract.
-
-mod tui;
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
@@ -33,21 +31,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Subcmd {
-    /// Open the mic and run the coach pipeline. Default when no
-    /// subcommand is given. In an interactive terminal this brings up
-    /// the TUI shell (`~` toggles a console pane showing live coach
-    /// logs; `q` / `Esc` / Ctrl-C exits). When stdout is piped or
-    /// redirected — or `--no-tui` is passed — it streams one line per
-    /// fresh f0 estimate (~85 Hz at 48k/hop=512); `--` shown for
-    /// unvoiced frames (silence, breath, noise).
+    /// Open the mic and stream one line per fresh f0 estimate
+    /// (~85 Hz at 48k/hop=512). Unvoiced frames print as `--`.
     Run {
-        /// Force the line-streaming path even in an interactive
-        /// terminal. Useful when piping into `less -R` or grepping
-        /// live output in a real TTY.
-        #[arg(long)]
-        no_tui: bool,
         /// Duration of the session, in milliseconds. Omit to run until
-        /// Ctrl-C. Honoured in both TUI and line-streaming modes.
+        /// Ctrl-C.
         #[arg(long)]
         duration_ms: Option<u64>,
         /// Persistent id (from `list-devices`) of the device to
@@ -62,16 +50,14 @@ enum Subcmd {
 fn main() {
     let cli = Cli::parse();
     let cmd = cli.command.unwrap_or(Subcmd::Run {
-        no_tui: false,
         duration_ms: None,
         persistent_id: None,
     });
     match cmd {
         Subcmd::Run {
-            no_tui,
             duration_ms,
             persistent_id,
-        } => run(no_tui, duration_ms, persistent_id),
+        } => run(duration_ms, persistent_id),
         Subcmd::ListDevices => list_devices(),
     }
 }
@@ -81,10 +67,6 @@ fn main() {
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Build the coach with the stderr telemetry adapter — used by
-/// short-lived non-TUI commands (`list-devices`, plain mode) where
-/// stderr is fair game. The TUI path builds the coach inline so it
-/// can also hold the [`LogBuffer`] handle.
 fn build_coach() -> impl AppCoach {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
@@ -100,55 +82,7 @@ fn build_coach() -> impl AppCoach {
     })
 }
 
-/// Pick the head based on whether stdout is a real terminal. Piped or
-/// redirected output gets the line-streaming path; an interactive TTY
-/// gets the TUI shell. `--no-tui` forces the plain path even in a TTY
-/// — useful for `coach-cli | less -R` and the like.
-fn run(no_tui: bool, duration_ms: Option<u64>, persistent_id: Option<String>) {
-    let use_tui = !no_tui && std::io::stdout().is_terminal();
-    if use_tui {
-        run_tui(duration_ms, persistent_id);
-    } else {
-        run_plain(duration_ms, persistent_id);
-    }
-}
-
-fn run_tui(duration_ms: Option<u64>, persistent_id: Option<String>) {
-    // The TUI owns stdout via the alternate screen — anything that
-    // bypasses Telemetry (cpal warnings, panics) will be invisible
-    // until we leave. Acceptable v1 tradeoff. duration_ms is wired
-    // through so a `--duration-ms N` invocation auto-exits even in
-    // the shell; without it the user quits via q/Esc/Ctrl-C.
-    let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
-    let (tui_telemetry, log_buffer) = adapter_telemetry_tui::new(Arc::clone(&clock), 2048);
-    let telemetry: Arc<dyn Telemetry> = Arc::new(tui_telemetry);
-    let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
-    let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
-
-    let (coach, inspect) = adapter_app_coach::new_with_inspect(AppCoachDeps {
-        clock,
-        telemetry,
-        audio_devices,
-        audio_capture,
-        host_version: env!("CARGO_PKG_VERSION"),
-    });
-
-    coach.send_command(Command::StartSession(SessionConfig {
-        device_id: persistent_id.map(DeviceId),
-        sample_rate: None,
-        buffer_frames: None,
-    }));
-
-    let deadline = duration_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-    if let Err(e) = tui::run(&coach, inspect, log_buffer, deadline) {
-        eprintln!("coach-cli: tui error: {e}");
-    }
-
-    coach.send_command(Command::StopSession);
-    let _ = coach.shutdown(SHUTDOWN_TIMEOUT);
-}
-
-fn run_plain(duration_ms: Option<u64>, persistent_id: Option<String>) {
+fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
     // Install a Ctrl-C handler before we open the mic. The handler
     // flips an atomic that the pitch loop polls — this keeps shutdown
     // graceful (the loop falls out, we StopSession, then shutdown the
@@ -263,21 +197,32 @@ fn run_pitch_loop(coach: &impl AppCoach, duration: Option<Duration>, interrupted
     }
 }
 
+/// One line per snapshot, fixed-width columns so values don't shift
+/// horizontally as they change. Layout (in order):
+///
+/// ```text
+/// [        t ms]  ‹onset›  ‹f0 Hz›  ‹note›  ‹cents›  br ‹x.xx›  vib ‹rate›Hz/‹depth›st
+/// ```
 fn print_features(s: &FeatureSnapshot, use_color: bool) {
-    // Onset/breath/vibrato render unconditionally — they have their own
-    // 0.0-when-inactive convention and aren't gated on voicedness.
     let onset_marker = if s.onset > 0.0 { "•" } else { " " };
-    let breath_str = format!("br {:.2}", s.breath);
+    // breath is always [0, 1]-ish; 4 chars `0.00` keeps width stable.
+    let breath_str = format!("br {:>4.2}", s.breath);
+    // vibrato: 6 chars rate + slash + 5 chars depth keeps the column
+    // width identical whether vibrato is detected or not.
     let vib_str = if s.vibrato_rate > 0.0 {
-        format!("vib {:.1}Hz/{:.2}st", s.vibrato_rate, s.vibrato_depth)
+        format!("vib {:>4.1}Hz/{:>4.2}st", s.vibrato_rate, s.vibrato_depth)
     } else {
-        "vib --".to_string()
+        format!("vib {:>4}Hz/{:>4}st", "--", "--")
     };
 
     if s.f0_hz <= 0.0 {
+        // Unvoiced: pad the f0/note/cents block with spaces so the
+        // trailing `br …` / `vib …` columns align with voiced lines.
+        // Voiced block width = "{:>10.2} Hz  {:>4}  {:>+5} cents"
+        // = 10 + 3 + 4 + 2 + 5 + 6 = 30 chars; pad to 30.
         println!(
-            "[{:>10} ms]  {}  --                       {}  {}",
-            s.t_ms, onset_marker, breath_str, vib_str
+            "[{:>10} ms]  {}  {:<30}  {}  {}",
+            s.t_ms, onset_marker, "--", breath_str, vib_str
         );
         return;
     }
