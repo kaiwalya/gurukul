@@ -51,11 +51,13 @@
 mod control_plane;
 mod data_plane;
 mod helpers;
+mod inspect;
 mod outbound;
 mod pitch_world;
 mod shutdown;
 
 use control_plane::{ControlPlane, HeadAudioSlot, Input};
+use inspect::{EngineInspectImpl, InspectShared};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
 
@@ -63,6 +65,7 @@ use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
     AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionInfo, ShutdownResult,
 };
+use domain_ports::engine_inspect::EngineInspect;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -76,6 +79,21 @@ const OUTBOUND_QUEUE_CAP: usize = 1024;
 /// Build the canonical [`AppCoach`]. Eagerly spawns the control-plane
 /// thread; returns once it's ready to receive [`Input`]s.
 pub fn new(deps: AppCoachDeps) -> impl AppCoach {
+    let (coach, _inspect) = build(deps);
+    coach
+}
+
+/// Build the canonical [`AppCoach`] *and* an [`EngineInspect`] handle
+/// for hosts that want a debug pane. The inspect handle is a sibling
+/// resource — it shares the same engine thread and gets cleared when
+/// the session tears down. Production hosts call [`new`] instead and
+/// pay nothing for the unused publishers.
+pub fn new_with_inspect(deps: AppCoachDeps) -> (impl AppCoach, Arc<dyn EngineInspect>) {
+    let (coach, inspect) = build(deps);
+    (coach, inspect)
+}
+
+fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let outbound = Arc::new(Mutex::new(OutboundQueue::new(OUTBOUND_QUEUE_CAP)));
     let (tx_cmd, rx_cmd) = mpsc::channel::<Input>();
     let outbound_for_thread = Arc::clone(&outbound);
@@ -87,6 +105,8 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
     let session_info_publisher_for_thread = Arc::clone(&session_info_publisher);
     let head_audio_slot: HeadAudioSlot = Arc::new(Mutex::new(None));
     let head_audio_slot_for_thread = Arc::clone(&head_audio_slot);
+    let inspect_shared = InspectShared::new();
+    let inspect_for_thread = Arc::clone(&inspect_shared);
 
     let control_thread = thread::Builder::new()
         .name("app-coach-control".into())
@@ -98,12 +118,13 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
                 feature_publisher_for_thread,
                 session_info_publisher_for_thread,
                 head_audio_slot_for_thread,
+                inspect_for_thread,
             )
             .run();
         })
         .expect("spawn control-plane thread");
 
-    CoachImpl {
+    let coach = CoachImpl {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
         feature_publisher,
@@ -111,7 +132,11 @@ pub fn new(deps: AppCoachDeps) -> impl AppCoach {
         head_audio_slot,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
-    }
+    };
+    let inspect: Arc<dyn EngineInspect> = Arc::new(EngineInspectImpl {
+        shared: inspect_shared,
+    });
+    (coach, inspect)
 }
 
 // ---------------------------------------------------------------------

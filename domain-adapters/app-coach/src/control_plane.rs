@@ -9,6 +9,7 @@
 
 use crate::data_plane::{push_samples, DataPlane, DataPlaneDeps};
 use crate::helpers::{classify_open_error, preferred_sample_rate};
+use crate::inspect::InspectShared;
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
@@ -57,6 +58,10 @@ pub(crate) struct ControlPlane {
     /// observes coherent info.
     session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
     head_audio_slot: HeadAudioSlot,
+    /// Shared state behind the [`EngineInspect`](domain_ports::engine_inspect::EngineInspect)
+    /// port: selection slot + tap snapshot publisher + node-port list.
+    /// Cloned and handed to each new data-plane worker.
+    inspect: Arc<InspectShared>,
 
     state: SessionState,
     /// Set when a [`SessionConfig`] has been accepted and the cpal
@@ -77,6 +82,7 @@ impl ControlPlane {
         feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
         session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
         head_audio_slot: HeadAudioSlot,
+        inspect: Arc<InspectShared>,
     ) -> Self {
         Self {
             deps,
@@ -85,6 +91,7 @@ impl ControlPlane {
             feature_publisher,
             session_info_publisher,
             head_audio_slot,
+            inspect,
             state: SessionState::Idle,
             capture: None,
             data_plane: None,
@@ -126,6 +133,7 @@ impl ControlPlane {
         self.feature_publisher.store(Arc::new(None));
         self.session_info_publisher.store(Arc::new(None));
         *self.head_audio_slot.lock().unwrap() = None;
+        self.inspect.clear();
         tel_info!(
             &*self.deps.telemetry,
             "app-coach: control plane down",
@@ -192,6 +200,7 @@ impl ControlPlane {
             feature_publisher: Arc::clone(&self.feature_publisher),
             clock: Arc::clone(&self.deps.clock),
             telemetry: Arc::clone(&self.deps.telemetry),
+            inspect: Arc::clone(&self.inspect),
         }) {
             Ok(t) => t,
             Err(e) => {
@@ -301,6 +310,11 @@ impl ControlPlane {
         // disconnected ring; symmetric with the feature publisher.
         *self.head_audio_slot.lock().unwrap() = None;
         self.feature_publisher.store(Arc::new(None));
+        // Clear the inspect publishers so the head's debug pane sees
+        // an empty node list + no taps until the next session starts.
+        // The selection slot is intentionally preserved so the user's
+        // pick survives a session restart.
+        self.inspect.clear();
     }
 
     fn fail(&mut self, kind: SessionErrorKind, reason: String) {

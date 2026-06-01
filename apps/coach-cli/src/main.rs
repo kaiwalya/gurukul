@@ -125,7 +125,7 @@ fn run_tui(duration_ms: Option<u64>, persistent_id: Option<String>) {
     let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
     let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
 
-    let coach = adapter_app_coach::new(AppCoachDeps {
+    let (coach, inspect) = adapter_app_coach::new_with_inspect(AppCoachDeps {
         clock,
         telemetry,
         audio_devices,
@@ -140,7 +140,7 @@ fn run_tui(duration_ms: Option<u64>, persistent_id: Option<String>) {
     }));
 
     let deadline = duration_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-    if let Err(e) = tui::run(&coach, log_buffer, deadline) {
+    if let Err(e) = tui::run(&coach, inspect, log_buffer, deadline) {
         eprintln!("coach-cli: tui error: {e}");
     }
 

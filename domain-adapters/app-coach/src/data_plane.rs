@@ -114,6 +114,7 @@ impl DataPlane {
         let feature_publisher = Arc::clone(&deps.feature_publisher);
         let clock = Arc::clone(&deps.clock);
         let telemetry = Arc::clone(&deps.telemetry);
+        let inspect = Arc::clone(&deps.inspect);
         let quit_for_thread = Arc::clone(&quit);
         let dropped_for_callback = Arc::clone(&samples_dropped);
         let sample_rate = deps.sample_rate;
@@ -129,6 +130,7 @@ impl DataPlane {
                     feature_publisher,
                     clock,
                     telemetry,
+                    inspect,
                 });
             })
             .map_err(|e| DataPlaneError::Spawn(e.to_string()))?;
@@ -171,6 +173,7 @@ pub(crate) struct DataPlaneDeps {
     pub(crate) feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
+    pub(crate) inspect: Arc<crate::inspect::InspectShared>,
 }
 
 #[derive(Debug)]
@@ -207,6 +210,7 @@ struct WorkerArgs {
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     clock: Arc<dyn Clock>,
     telemetry: Arc<dyn Telemetry>,
+    inspect: Arc<crate::inspect::InspectShared>,
 }
 
 fn run_worker(args: WorkerArgs) {
@@ -218,6 +222,7 @@ fn run_worker(args: WorkerArgs) {
         feature_publisher,
         clock,
         telemetry,
+        inspect,
     } = args;
 
     // Build the engine on this thread. Errors here go nowhere visible
@@ -236,6 +241,10 @@ fn run_worker(args: WorkerArgs) {
             return;
         }
     };
+
+    // Publish the node/port surface for the debug picker. Cleared on
+    // teardown by the control plane (via InspectShared::clear).
+    inspect.publish_node_ports(&engine);
 
     let ports = match resolve_ports(&engine) {
         Ok(p) => p,
@@ -259,6 +268,9 @@ fn run_worker(args: WorkerArgs) {
     // Scratch buffer for one block worth of samples drained from the
     // ring. Heap-allocated once, before the hot loop.
     let mut block: Vec<f32> = vec![0.0; BLOCK_FRAMES];
+
+    // Monotonic block index. Heads use it to detect missed taps.
+    let mut block_seq: u64 = 0;
 
     while !quit.load(Ordering::Acquire) {
         // Wait until at least one block is available, or quit.
@@ -289,6 +301,11 @@ fn run_worker(args: WorkerArgs) {
         // Feed the engine.
         engine.in_port(ports.mic).copy_from_slice(&block);
         engine.process_block(BLOCK_FRAMES);
+
+        // Publish a tap of the currently-selected port (if any) for
+        // the debug panel. Cheap no-op when nothing is selected.
+        block_seq = block_seq.wrapping_add(1);
+        inspect.tap_if_selected(&engine, block_seq);
 
         // Publish the same block to the head ring so scope/envelope
         // widgets can see the raw mic signal. Push-fails-on-full is
@@ -409,6 +426,7 @@ mod tests {
             feature_publisher: Arc::clone(&feature_publisher),
             clock,
             telemetry: Arc::clone(&telemetry),
+            inspect: crate::inspect::InspectShared::new(),
         })
         .expect("data plane starts");
 

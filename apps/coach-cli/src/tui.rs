@@ -25,6 +25,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use domain_ports::app_coach::{AppCoach, FeatureSnapshot};
+use domain_ports::engine_inspect::{EngineInspect, NodePortInfo, PortShape, Selection};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,6 +35,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use ratatui::{Frame, Terminal};
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tui_big_text::{BigText, PixelSize};
 
@@ -107,11 +109,16 @@ const AUDIO_RING_CAP: usize = AUDIO_SR_HZ_MAX * 5 + AUDIO_SR_HZ_MAX * SCOPE_WIN_
 
 /// Run the shell until the user quits, or `deadline` elapses.
 /// `deadline = None` means run until the user quits.
-pub fn run(coach: &impl AppCoach, logs: LogBuffer, deadline: Option<Instant>) -> io::Result<()> {
+pub fn run(
+    coach: &impl AppCoach,
+    inspect: Arc<dyn EngineInspect>,
+    logs: LogBuffer,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let mut terminal = setup()?;
     let mut state = State::default();
 
-    let outcome = event_loop(&mut terminal, &mut state, coach, &logs, deadline);
+    let outcome = event_loop(&mut terminal, &mut state, coach, &*inspect, &logs, deadline);
 
     teardown(&mut terminal)?;
     outcome
@@ -156,6 +163,21 @@ struct State {
     /// `coach.session_info()`. Falls back to [`AUDIO_SR_HZ_FALLBACK`]
     /// when no session is running.
     audio_sr_hz: u32,
+    /// Debug pane open? Toggled with `d`. When on, shows the engine's
+    /// node/port list and the live tap of whichever entry is selected.
+    debug_open: bool,
+    /// Cached node/port surface, refreshed every tick from
+    /// [`EngineInspect::list_node_ports`]. Empty until a session is
+    /// running and the worker has published its surface.
+    node_ports: Vec<NodePortInfo>,
+    /// Index into `node_ports` of the currently-highlighted row. Held
+    /// across frames so up/down keys feel sticky. Out-of-range when
+    /// `node_ports` shrinks; resolved at draw time.
+    debug_cursor: usize,
+    /// Has the user pressed Enter on the highlighted row at least once?
+    /// Used to decide whether to show the "press Enter to select" hint
+    /// vs the live tap payload.
+    debug_selected: bool,
 }
 
 impl Default for State {
@@ -172,6 +194,10 @@ impl Default for State {
             audio_origin: 0,
             envelope: VecDeque::new(),
             audio_sr_hz: AUDIO_SR_HZ_FALLBACK,
+            debug_open: false,
+            node_ports: Vec::new(),
+            debug_cursor: 0,
+            debug_selected: false,
         }
     }
 }
@@ -332,6 +358,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut State,
     coach: &impl AppCoach,
+    inspect: &dyn EngineInspect,
     logs: &LogBuffer,
     deadline: Option<Instant>,
 ) -> io::Result<()> {
@@ -344,8 +371,11 @@ fn event_loop(
             state.ingest(snap);
         }
         state.ingest_audio(coach);
+        // Keep the debug picker's view of the engine surface fresh.
+        // Cheap: a clone of a small Vec from an ArcSwap.
+        state.node_ports = inspect.list_node_ports();
 
-        terminal.draw(|f| draw(f, state, logs))?;
+        terminal.draw(|f| draw(f, state, inspect, logs))?;
         // `draw` borrows state mutably, the rest of this iteration
         // doesn't — borrow ends at the closure return.
 
@@ -358,16 +388,58 @@ fn event_loop(
         if event::poll(TICK)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Esc is overloaded: when the debug pane is open
+                    // with an active selection, it clears the
+                    // selection first; otherwise it exits the shell.
+                    if key.code == KeyCode::Esc && state.debug_open && state.debug_selected {
+                        inspect.set_selection(None);
+                        state.debug_selected = false;
+                        continue;
+                    }
                     if should_quit(key.code, key.modifiers) {
                         return Ok(());
                     }
-                    if key.code == KeyCode::Char('~') {
-                        state.console_open = !state.console_open;
-                    }
+                    handle_key(key.code, key.modifiers, state, inspect);
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// Route a key press to the right pane. Quit keys and the overloaded
+/// Esc (which clears the active tap before quitting) are handled in
+/// `event_loop` directly; this is the rest.
+fn handle_key(code: KeyCode, _mods: KeyModifiers, state: &mut State, inspect: &dyn EngineInspect) {
+    match code {
+        KeyCode::Char('~') => {
+            state.console_open = !state.console_open;
+        }
+        KeyCode::Char('d') => {
+            state.debug_open = !state.debug_open;
+        }
+        KeyCode::Up if state.debug_open => {
+            if state.debug_cursor > 0 {
+                state.debug_cursor -= 1;
+            }
+        }
+        KeyCode::Down if state.debug_open => {
+            let max = state.node_ports.len().saturating_sub(1);
+            if state.debug_cursor < max {
+                state.debug_cursor += 1;
+            }
+        }
+        KeyCode::Enter if state.debug_open => {
+            if let Some(info) = state.node_ports.get(state.debug_cursor) {
+                inspect.set_selection(Some(Selection {
+                    node: info.node.clone(),
+                    port: info.port.clone(),
+                    shape: info.shape,
+                }));
+                state.debug_selected = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -376,26 +448,44 @@ fn should_quit(code: KeyCode, mods: KeyModifiers) -> bool {
         || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL))
 }
 
-fn draw(f: &mut Frame, state: &mut State, logs: &LogBuffer) {
+fn draw(f: &mut Frame, state: &mut State, inspect: &dyn EngineInspect, logs: &LogBuffer) {
     state.refit_y();
     let area = f.area();
-    if state.console_open {
-        let [main, console] = split_with_console(area);
-        draw_main(f, main, state);
-        draw_console(f, console, logs);
-    } else {
-        draw_main(f, area, state);
+    // Layered: main + optional debug + optional console, each on the
+    // bottom. Both off → main fills the screen.
+    match (state.debug_open, state.console_open) {
+        (false, false) => draw_main(f, area, state),
+        (true, false) => {
+            let [main, debug] = split_with_bottom(area);
+            draw_main(f, main, state);
+            draw_debug(f, debug, state, inspect);
+        }
+        (false, true) => {
+            let [main, console] = split_with_bottom(area);
+            draw_main(f, main, state);
+            draw_console(f, console, logs);
+        }
+        (true, true) => {
+            // Two bottom panes — split the bottom 40% in half.
+            let [main, bottom] = split_with_bottom(area);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(bottom);
+            draw_main(f, main, state);
+            draw_debug(f, cols[0], state, inspect);
+            draw_console(f, cols[1], logs);
+        }
     }
 }
 
-fn split_with_console(area: Rect) -> [Rect; 2] {
-    // Console takes the bottom 40% — enough rows to actually read,
-    // not so many it eats the canvas. Capped at 20 rows so it stays
-    // sane on tall terminals.
-    let console_rows = (area.height as u32 * 40 / 100).clamp(6, 20) as u16;
+fn split_with_bottom(area: Rect) -> [Rect; 2] {
+    // Bottom pane takes 40% of height — enough rows to actually read,
+    // capped at 20 so it stays sane on tall terminals.
+    let bottom_rows = (area.height as u32 * 40 / 100).clamp(6, 20) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(console_rows)])
+        .constraints([Constraint::Min(0), Constraint::Length(bottom_rows)])
         .split(area);
     [layout[0], layout[1]]
 }
@@ -664,13 +754,15 @@ fn draw_readout(f: &mut Frame, area: Rect, state: &State) {
     let (text, hz_text, style) = match latest_voiced {
         Some(s) => {
             let (note, cents) = note_and_cents(s.f0_hz);
-            // Pad both halves so the block has identical character
-            // width every frame: 3-char note slot (covers `C#4` and
-            // pads `A4 `), space, sign + 3-digit zero-padded cents.
-            // Without this the centred BigText jitters left/right as
-            // `+3` → `+12` → `-100` change width.
+            // Drop the octave for the big readout — `A` vs `C#` is the
+            // information the singer wants; the octave is in the Hz row
+            // and on the pitch chart's Y axis. Pad the note slot to 2
+            // chars (`A ` vs `C#`) and the cents slot to a fixed sign +
+            // 3 digits (`+003` / `-100`) so the centred BigText block
+            // doesn't jitter left/right between frames.
+            let note_no_octave = note.trim_end_matches(|c: char| c.is_ascii_digit());
             let sign = if cents >= 0 { '+' } else { '-' };
-            let text = format!("{note:<3} {sign}{:03}", cents.unsigned_abs());
+            let text = format!("{note_no_octave:<2} {sign}{:03}", cents.unsigned_abs());
             let hz_text = format!("{:.2} Hz", s.f0_hz);
             let style = cents_style(cents);
             (text, hz_text, style)
@@ -742,10 +834,193 @@ fn draw_hint(f: &mut Frame, area: Rect) {
     let hint = Line::from(vec![
         Span::styled("~", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" console   "),
+        Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" debug   "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ]);
     f.render_widget(Paragraph::new(hint), area);
+}
+
+/// Debug pane: a node/port picker on the left, a live tap readout for
+/// the current selection on the right. Rendered shape depends on the
+/// port's [`PortShape`] — audio gets a mini scope, FeatureHz a single
+/// number, etc.
+fn draw_debug(f: &mut Frame, area: Rect, state: &State, inspect: &dyn EngineInspect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" debug (↑↓ move · Enter select · Esc clear) ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 20 || inner.height < 3 {
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(inner);
+    draw_debug_picker(f, cols[0], state);
+    draw_debug_value(f, cols[1], state, inspect);
+}
+
+fn draw_debug_picker(f: &mut Frame, area: Rect, state: &State) {
+    if state.node_ports.is_empty() {
+        let para = Paragraph::new(Line::from(Span::styled(
+            "no engine running",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(para, area);
+        return;
+    }
+
+    // Window the list around the cursor so a long node table still
+    // shows the highlighted row. Each entry is one line.
+    let rows = area.height as usize;
+    let total = state.node_ports.len();
+    let cursor = state.debug_cursor.min(total.saturating_sub(1));
+    let start = cursor.saturating_sub(rows / 2);
+    let end = (start + rows).min(total);
+
+    let lines: Vec<Line> = state.node_ports[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            let highlight = start + i == cursor;
+            let label = format!("{}.{}  [{}]", info.node, info.port, shape_tag(info.shape));
+            let style = if highlight {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(label, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_debug_value(f: &mut Frame, area: Rect, state: &State, inspect: &dyn EngineInspect) {
+    if !state.debug_selected {
+        let para = Paragraph::new(Line::from(Span::styled(
+            "press Enter to tap the highlighted port",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(para, area);
+        return;
+    }
+    let Some(tap) = inspect.latest_tap() else {
+        let para = Paragraph::new(Line::from(Span::styled(
+            "waiting for first sample…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(para, area);
+        return;
+    };
+
+    match tap.shape {
+        PortShape::FeatureHz => draw_value_hz(f, area, &tap.samples),
+        PortShape::FeatureEvent => draw_value_event(f, area, &tap.samples),
+        PortShape::Control => draw_value_control(f, area, &tap.samples),
+        PortShape::Audio => draw_value_audio(f, area, &tap.samples),
+    }
+}
+
+fn draw_value_hz(f: &mut Frame, area: Rect, samples: &[f32]) {
+    let v = samples.first().copied().unwrap_or(0.0);
+    let text = if v > 0.0 {
+        format!("{v:>9.2} Hz")
+    } else {
+        "-- Hz".to_string()
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, area);
+}
+
+fn draw_value_event(f: &mut Frame, area: Rect, samples: &[f32]) {
+    // Max-abs over the block — events tend to be short impulses and
+    // a per-sample readout would just flicker.
+    let mag = samples
+        .iter()
+        .copied()
+        .fold(0.0_f32, |acc, s| acc.max(s.abs()));
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!("event peak {mag:.3}"),
+            Style::default().fg(Color::Magenta),
+        )),
+        Line::from(Span::styled(
+            format!("{} samples", samples.len()),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, area);
+}
+
+fn draw_value_control(f: &mut Frame, area: Rect, samples: &[f32]) {
+    let v = samples.first().copied().unwrap_or(0.0);
+    let para = Paragraph::new(Line::from(Span::styled(
+        format!("{v:>+10.4}"),
+        Style::default().fg(Color::White),
+    )))
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, area);
+}
+
+fn draw_value_audio(f: &mut Frame, area: Rect, samples: &[f32]) {
+    if samples.is_empty() || area.width < 4 || area.height < 3 {
+        return;
+    }
+    let n = samples.len();
+    let target = (area.width as usize * 2).max(32);
+    let stride = (n / target).max(1);
+    let points: Vec<(f64, f64)> = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .step_by(stride)
+        .map(|(i, s)| (i as f64, s as f64))
+        .collect();
+
+    let dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&points);
+    let chart = Chart::new(vec![dataset])
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([0.0, n as f64])
+                .labels::<Vec<Span<'static>>>(vec![]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([-1.0, 1.0])
+                .labels(vec![Span::raw("-1"), Span::raw("0"), Span::raw("1")]),
+        );
+    f.render_widget(chart, area);
+}
+
+/// Short tag for a port shape — shown in the picker so the user knows
+/// what readout to expect when they select it.
+fn shape_tag(shape: PortShape) -> &'static str {
+    match shape {
+        PortShape::Audio => "audio",
+        PortShape::FeatureHz => "Hz",
+        PortShape::FeatureEvent => "event",
+        PortShape::Control => "ctl",
+    }
 }
 
 fn draw_chart(f: &mut Frame, area: Rect, state: &State) {
