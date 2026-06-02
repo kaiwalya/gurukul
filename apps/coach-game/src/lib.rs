@@ -21,6 +21,7 @@ pub mod game;
 pub mod menu;
 pub mod state;
 pub mod ui;
+pub mod widgets;
 
 use bevy::prelude::*;
 use state::{AppState, HasPausedSession, KnownDevices, SelectedDevice};
@@ -37,7 +38,22 @@ pub fn build_app(app: &mut App) {
         .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<game::LastFeatureTs>()
         // Always-on
-        .add_systems(Update, (coach::drain_events, ui::update_button_colors))
+        .add_systems(
+            Update,
+            (
+                coach::drain_events,
+                ui::update_button_colors,
+                // Order: rebuild_slots spawns slot children; apply_state
+                // paints them. `.chain()` inserts the sync point that
+                // flushes the rebuild's spawn commands so apply_state
+                // sees the new SlotDot entities on the same frame.
+                (
+                    widgets::note_dial::rebuild_slots,
+                    widgets::note_dial::apply_state,
+                )
+                    .chain(),
+            ),
+        )
         // Shutdown lives in `Last` so it runs after any system that
         // writes AppExit (Quit button, window-close handler, etc.) in
         // the same frame the runner is about to exit on.

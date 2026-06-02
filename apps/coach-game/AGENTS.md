@@ -43,6 +43,21 @@ gives you an empty log file and a misleading "no output" conclusion.
 - One file per screen under `menu/`. When a screen grows beyond
   ~200 lines, split *inside* its module rather than flattening across
   the menu/ tree.
+- Rotating a UI node uses `UiTransform::from_rotation(Rot2::radians(...))`,
+  not `Transform`. `Transform` belongs to the render-hierarchy world
+  (`GlobalTransform` validates its parent has `GlobalTransform`), and
+  `Node` doesn't require it — adding `Transform` to a UI child fires
+  B0004 on the parent. `UiTransform` rotates clockwise, matching the
+  clock convention used elsewhere.
+- A `Changed<X>` paint pass needs a sync point if it depends on
+  entities spawned earlier in the same frame. Order with `.chain()`
+  so the spawning system's `Commands` flush before the paint reads
+  them; otherwise the first frame paints zero children and the next
+  frame skips because nothing is `Changed`.
+- Two top-level UI roots in the same screen can z-fight — a sibling
+  root with a fullscreen background can occlude another root. Prefer
+  parenting overlays/widgets to the screen root via `ChildOf` rather
+  than spawning them as independent roots.
 
 ## Project-wide rules
 
