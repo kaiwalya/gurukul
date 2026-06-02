@@ -3,24 +3,52 @@
 //! pre-menu scaffold.
 
 use crate::coach::Coach;
-use crate::state::SelectedDevice;
+use crate::state::{AppState, HasPausedSession, SelectedDevice};
 use bevy::prelude::*;
 use domain_ports::app_coach::{Command, FeatureSnapshot, SessionConfig};
 
 #[derive(Resource, Default)]
 pub struct LastFeatureTs(u64);
 
-pub fn on_enter(coach: NonSend<Coach>, selected: Res<SelectedDevice>) {
+pub fn on_enter(
+    coach: NonSend<Coach>,
+    selected: Res<SelectedDevice>,
+    mut has_paused: ResMut<HasPausedSession>,
+) {
     coach.0.send_command(Command::StartSession(SessionConfig {
         device_id: selected.0.clone(),
         sample_rate: None,
         buffer_frames: None,
     }));
+    // Whether we got here from MainMenu (New Game / Continue) or from
+    // Paused (Resume), a session is now live and there's no separate
+    // paused-session to keep around.
+    has_paused.0 = false;
 }
 
 pub fn on_exit(coach: NonSend<Coach>, mut last: ResMut<LastFeatureTs>) {
     coach.0.send_command(Command::StopSession);
     last.0 = 0;
+}
+
+/// Esc in InGame → Paused (stops session via OnEnter(Paused)). Marks
+/// `HasPausedSession` so the main menu can offer Continue.
+pub fn handle_esc_in_game(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<AppState>>,
+    mut has_paused: ResMut<HasPausedSession>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        has_paused.0 = true;
+        next.set(AppState::Paused);
+    }
+}
+
+/// Esc in Paused → InGame (starts a fresh session via OnEnter(InGame)).
+pub fn handle_esc_paused(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(AppState::InGame);
+    }
 }
 
 pub fn log_features(coach: NonSend<Coach>, mut last: ResMut<LastFeatureTs>) {

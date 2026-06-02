@@ -31,6 +31,21 @@ pub fn spawn_coach(world: &mut World) {
     world.insert_non_send_resource(Coach(Box::new(coach)));
 }
 
+/// On `AppExit`, synchronously tear down the coach so its control
+/// plane thread and any open audio stream end before the process
+/// returns from `main`. Without this, hitting Quit (or closing the
+/// window) leaves the renderer gone but the AppCoach background
+/// thread still running — terminal never returns to the prompt.
+///
+/// 2-second timeout matches what a clean teardown takes plus some
+/// slack; on timeout the coach detaches and logs via telemetry.
+pub fn shutdown_on_exit(mut exits: MessageReader<bevy::app::AppExit>, coach: NonSend<Coach>) {
+    if exits.read().next().is_some() {
+        let result = coach.0.shutdown(std::time::Duration::from_secs(2));
+        info!("coach shutdown: {result:?}");
+    }
+}
+
 /// Always-on event drain. Splits `DevicesListed` into the
 /// `KnownDevices` resource so the Settings → Audio screen can render
 /// it; surfaces lifecycle / errors / drops as logs.

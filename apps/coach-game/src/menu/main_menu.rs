@@ -1,11 +1,14 @@
 //! Main menu screen: title + three buttons (New Game / Settings / Quit).
+//!
+//! When `HasPausedSession` is set, the start button reads "Continue"
+//! instead of "New Game" — the marker (`NewGameButton`) stays the same,
+//! since both labels lead to InGame and the OnEnter handler clears the
+//! flag either way.
 
-use crate::state::AppState;
+use crate::state::{AppState, HasPausedSession};
 use crate::ui::*;
 use bevy::prelude::*;
 
-/// Marker components on each button so the click handler can tell
-/// them apart with a `With<...>` filter instead of a string match.
 #[derive(Component)]
 pub struct NewGameButton;
 #[derive(Component)]
@@ -13,7 +16,8 @@ pub struct SettingsButton;
 #[derive(Component)]
 pub struct QuitButton;
 
-pub fn spawn(mut commands: Commands) {
+pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
+    let start_label = if has_paused.0 { "Continue" } else { "New Game" };
     commands.spawn((
         DespawnOnExit(AppState::MainMenu),
         Node {
@@ -39,7 +43,7 @@ pub fn spawn(mut commands: Commands) {
                     ..default()
                 },
             ),
-            menu_button("New Game", NewGameButton),
+            menu_button(start_label, NewGameButton),
             menu_button("Settings", SettingsButton),
             menu_button("Quit", QuitButton),
         ],
@@ -91,13 +95,30 @@ pub fn handle_settings(
     }
 }
 
+/// Quit by despawning the primary window rather than writing
+/// `AppExit::Success` directly. Bevy 0.18.1 has a known macOS deadlock
+/// when AppExit is sent programmatically from a system
+/// (bevyengine/bevy#23313): the winit event loop hangs and the window
+/// stays open. Despawning `PrimaryWindow` re-enters the native close
+/// path, which fires AppExit cleanly via `exit_on_primary_closed`.
+///
+/// In headless tests there is no PrimaryWindow, so the query is empty
+/// and we fall back to writing AppExit directly. The shutdown-on-exit
+/// assertion in `quit_button_writes_app_exit_and_shuts_down_coach`
+/// covers both paths.
 pub fn handle_quit(
     q: Query<&Interaction, (Changed<Interaction>, With<QuitButton>)>,
+    window: Query<Entity, With<bevy::window::PrimaryWindow>>,
+    mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
     for i in q.iter() {
         if *i == Interaction::Pressed {
-            exit.write(AppExit::Success);
+            if let Ok(w) = window.single() {
+                commands.entity(w).despawn();
+            } else {
+                exit.write(AppExit::Success);
+            }
         }
     }
 }

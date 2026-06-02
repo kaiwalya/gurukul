@@ -126,30 +126,29 @@ pub fn rebuild_device_list(
     };
     commands.entity(list_entity).despawn_related::<Children>();
 
-    let default_row = (
-        Button,
-        DeviceRow(None),
-        Node {
-            padding: UiRect::axes(px(12), px(8)),
-            width: percent(100),
-            ..default()
-        },
-        BackgroundColor(row_color(selected.0.is_none())),
-        children![(
-            Text::new("System default"),
-            TextFont {
-                font_size: FONT_BODY,
-                ..default()
-            },
-            TextColor(COLOR_TEXT),
-        )],
+    spawn_device_row(
+        &mut commands,
+        list_entity,
+        None,
+        "System default",
+        selected.0.is_none(),
     );
-    commands.entity(list_entity).with_child(default_row);
-
     for device in &known.0 {
         let id = device.persistent_id.clone();
         let selected_now = selected.0 == id;
-        let row = (
+        spawn_device_row(&mut commands, list_entity, id, &device.name, selected_now);
+    }
+}
+
+fn spawn_device_row(
+    commands: &mut Commands,
+    list_entity: Entity,
+    id: Option<DeviceId>,
+    label: &str,
+    selected_now: bool,
+) {
+    let row = commands
+        .spawn((
             Button,
             DeviceRow(id),
             Node {
@@ -158,17 +157,20 @@ pub fn rebuild_device_list(
                 ..default()
             },
             BackgroundColor(row_color(selected_now)),
-            children![(
-                Text::new(device.name.clone()),
-                TextFont {
-                    font_size: FONT_BODY,
-                    ..default()
-                },
-                TextColor(COLOR_TEXT),
-            )],
-        );
-        commands.entity(list_entity).with_child(row);
+            ChildOf(list_entity),
+        ))
+        .id();
+    if selected_now {
+        commands.entity(row).insert(ButtonSelected);
     }
+    commands.entity(row).with_child((
+        Text::new(label.to_string()),
+        TextFont {
+            font_size: FONT_BODY,
+            ..default()
+        },
+        TextColor(COLOR_TEXT),
+    ));
 }
 
 fn row_color(selected: bool) -> Color {

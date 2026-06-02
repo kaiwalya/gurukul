@@ -23,7 +23,7 @@ pub mod state;
 pub mod ui;
 
 use bevy::prelude::*;
-use state::{AppState, KnownDevices, SelectedDevice};
+use state::{AppState, HasPausedSession, KnownDevices, SelectedDevice};
 
 /// Register the game's state, resources, and systems. Split out of
 /// `main` so headless tests can call it after `MinimalPlugins +
@@ -33,9 +33,15 @@ pub fn build_app(app: &mut App) {
     app.init_state::<AppState>()
         .init_resource::<SelectedDevice>()
         .init_resource::<KnownDevices>()
+        .init_resource::<HasPausedSession>()
+        .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<game::LastFeatureTs>()
         // Always-on
         .add_systems(Update, (coach::drain_events, ui::update_button_colors))
+        // Shutdown lives in `Last` so it runs after any system that
+        // writes AppExit (Quit button, window-close handler, etc.) in
+        // the same frame the runner is about to exit on.
+        .add_systems(Last, coach::shutdown_on_exit)
         // MainMenu
         .add_systems(OnEnter(AppState::MainMenu), menu::main_menu::spawn)
         .add_systems(
@@ -63,6 +69,24 @@ pub fn build_app(app: &mut App) {
         .add_systems(OnExit(AppState::InGame), game::on_exit)
         .add_systems(
             Update,
-            game::log_features.run_if(in_state(AppState::InGame)),
+            (game::log_features, game::handle_esc_in_game).run_if(in_state(AppState::InGame)),
+        )
+        // Paused
+        .add_systems(
+            OnEnter(AppState::Paused),
+            (menu::paused::spawn, menu::paused::reset_confirm_flag),
+        )
+        .add_systems(OnExit(AppState::Paused), menu::paused::reset_confirm_flag)
+        .add_systems(
+            Update,
+            (
+                menu::paused::handle_resume,
+                menu::paused::handle_quit_to_main,
+                menu::paused::handle_confirm_yes,
+                menu::paused::handle_confirm_cancel,
+                menu::paused::sync_confirm_modal,
+                game::handle_esc_paused,
+            )
+                .run_if(in_state(AppState::Paused)),
         );
 }

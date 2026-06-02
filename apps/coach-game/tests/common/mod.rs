@@ -56,11 +56,14 @@ impl AppCoach for FakeCoach {
 
 /// Build a headless test app with the production system wiring + a
 /// `FakeCoach` inserted as the `NonSend` resource. Returns the app and
-/// a handle to the fake's state for assertions.
+/// a handle to the fake's state for assertions. `InputPlugin` is
+/// included so systems that read `Res<ButtonInput<KeyCode>>` (e.g. Esc
+/// handlers) resolve their resources.
 pub fn build_test_app() -> (App, FakeCoach) {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(StatesPlugin);
+    app.add_plugins(bevy::input::InputPlugin);
 
     let fake = FakeCoach::default();
     app.insert_non_send_resource(Coach(Box::new(fake.clone())));
