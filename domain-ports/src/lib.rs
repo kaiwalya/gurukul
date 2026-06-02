@@ -70,4 +70,5 @@ pub mod audio_capture;
 pub mod audio_devices;
 pub mod clock;
 pub mod engine_inspect;
+pub mod music;
 pub mod telemetry;

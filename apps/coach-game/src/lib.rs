@@ -24,7 +24,7 @@ pub mod ui;
 pub mod widgets;
 
 use bevy::prelude::*;
-use state::{AppState, HasPausedSession, KnownDevices, SelectedDevice};
+use state::{AppSettings, AppState, HasPausedSession, KnownDevices, SelectedDevice, SongTonality};
 
 /// Register the game's state, resources, and systems. Split out of
 /// `main` so headless tests can call it after `MinimalPlugins +
@@ -32,17 +32,23 @@ use state::{AppState, HasPausedSession, KnownDevices, SelectedDevice};
 /// `Coach` construction.
 pub fn build_app(app: &mut App) {
     app.init_state::<AppState>()
+        .init_resource::<AppSettings>()
+        .init_resource::<SongTonality>()
         .init_resource::<SelectedDevice>()
         .init_resource::<KnownDevices>()
         .init_resource::<HasPausedSession>()
         .init_resource::<menu::paused::ShowingQuitConfirm>()
+        .init_resource::<menu::settings::SettingsTab>()
+        .init_resource::<menu::settings::MusicSelection>()
         .init_resource::<game::LastFeatureTs>()
         // Always-on
+        .add_observer(ui::on_scroll)
         .add_systems(
             Update,
             (
                 coach::drain_events,
                 ui::update_button_colors,
+                ui::send_scroll_events,
                 // Order: rebuild_slots spawns slot children; apply_state
                 // paints them. `.chain()` inserts the sync point that
                 // flushes the rebuild's spawn commands so apply_state
@@ -75,7 +81,16 @@ pub fn build_app(app: &mut App) {
             Update,
             (
                 menu::settings::rebuild_device_list,
+                menu::settings::rebuild_settings_list,
+                menu::settings::rebuild_master_rows,
+                menu::settings::sync_tab_visibility,
+                menu::settings::sync_music_detail,
+                menu::settings::handle_tab_click,
                 menu::settings::handle_row_click,
+                menu::settings::handle_master_row_click,
+                menu::settings::handle_reference_hz_click,
+                menu::settings::handle_tuning_system_click,
+                menu::settings::handle_note_system_click,
                 menu::settings::handle_back,
             )
                 .run_if(in_state(AppState::Settings)),
@@ -83,7 +98,7 @@ pub fn build_app(app: &mut App) {
         // InGame
         .add_systems(
             OnEnter(AppState::InGame),
-            (game::on_enter, game::dial::spawn),
+            (game::on_enter, game::dial::spawn, game::hud::spawn),
         )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
         .add_systems(
@@ -92,6 +107,7 @@ pub fn build_app(app: &mut App) {
                 game::log_features,
                 game::handle_esc_in_game,
                 game::dial::update_from_features,
+                game::hud::refresh,
             )
                 .run_if(in_state(AppState::InGame)),
         )

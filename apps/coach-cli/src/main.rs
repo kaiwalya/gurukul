@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionState,
+    AppCoach, AppCoachDeps, AudioConfig, CoachEvent, Command, FeatureSnapshot, SessionState,
     ShutdownResult,
 };
 use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
@@ -98,7 +98,7 @@ fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
 
     let coach = build_coach();
 
-    let cfg = SessionConfig {
+    let cfg = AudioConfig {
         device_id: persistent_id.map(DeviceId),
         sample_rate: None,
         buffer_frames: None,

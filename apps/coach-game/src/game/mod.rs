@@ -3,11 +3,12 @@
 //! the note dial overlay (see [`dial`]).
 
 pub mod dial;
+pub mod hud;
 
 use crate::coach::Coach;
-use crate::state::{AppState, HasPausedSession, SelectedDevice};
+use crate::state::{AppSettings, AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
-use domain_ports::app_coach::{Command, FeatureSnapshot, SessionConfig};
+use domain_ports::app_coach::{AudioConfig, Command, FeatureSnapshot};
 
 #[derive(Resource, Default)]
 pub struct LastFeatureTs(u64);
@@ -15,9 +16,20 @@ pub struct LastFeatureTs(u64);
 pub fn on_enter(
     coach: NonSend<Coach>,
     selected: Res<SelectedDevice>,
+    settings: Res<AppSettings>,
+    tonality: Res<SongTonality>,
     mut has_paused: ResMut<HasPausedSession>,
 ) {
-    coach.0.send_command(Command::StartSession(SessionConfig {
+    // Configure the musical frame of reference *before* starting audio,
+    // so the coach holds the tuning + tonality the moment a session is
+    // live. The two are decoupled (configure causes no state change),
+    // but configuring first means the reference is never momentarily
+    // absent while Running.
+    coach.0.send_command(Command::ConfigureSession {
+        tuning: settings.tuning_spec(),
+        tonality: tonality.0,
+    });
+    coach.0.send_command(Command::StartSession(AudioConfig {
         device_id: selected.0.clone(),
         sample_rate: None,
         buffer_frames: None,

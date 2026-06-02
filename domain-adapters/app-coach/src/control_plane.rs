@@ -13,11 +13,12 @@ use crate::inspect::InspectShared;
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionConfig, SessionErrorKind,
-    SessionInfo, SessionState,
+    AppCoachDeps, AudioConfig, AudioInfo, CoachEvent, Command, FeatureSnapshot, SessionErrorKind,
+    SessionState,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
+use domain_ports::music::{Tonality, Tuning, TuningSpec};
 use domain_ports::{tel_debug, tel_info, tel_warn};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -43,19 +44,28 @@ pub(crate) struct ControlPlane {
     outbound: Arc<Mutex<OutboundQueue>>,
     rx: mpsc::Receiver<Input>,
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
-    /// Holds the negotiated `SessionInfo` while a session is `Running`,
+    /// Holds the negotiated `AudioInfo` while a session is `Running`,
     /// `None` otherwise. The control plane writes it *before* emitting
     /// `SessionStateChanged(Running)` and clears it *before* emitting
     /// the next transition out, so a head reacting to the state event
     /// observes coherent info.
-    session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
+    audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
     /// Shared state behind the [`EngineInspect`](domain_ports::engine_inspect::EngineInspect)
     /// port: selection slot + tap snapshot publisher + node-port list.
     /// Cloned and handed to each new data-plane worker.
     inspect: Arc<InspectShared>,
 
     state: SessionState,
-    /// Set when a [`SessionConfig`] has been accepted and the cpal
+    /// The musical frame of reference — the built [`Tuning`] and the
+    /// [`Tonality`] the singer is in — set by
+    /// [`Command::ConfigureSession`]. `None` until the head first
+    /// configures. Decoupled from the audio lifecycle: it is *not*
+    /// cleared by start/stop, only by shutdown. The data plane does not
+    /// consume it yet (pitch *scoring* against the scale is a later
+    /// phase); today it is held so the head's reads stay coherent and
+    /// the seam exists for scoring to plug into.
+    session_model: Option<(Tuning, Tonality)>,
+    /// Set when an [`AudioConfig`] has been accepted and the cpal
     /// stream is open. `None` in `Idle` / `Error`. Lives on this
     /// thread — `CaptureSession` is `!Send`.
     capture: Option<CaptureSession>,
@@ -71,7 +81,7 @@ impl ControlPlane {
         outbound: Arc<Mutex<OutboundQueue>>,
         rx: mpsc::Receiver<Input>,
         feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
-        session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
+        audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
         inspect: Arc<InspectShared>,
     ) -> Self {
         Self {
@@ -79,9 +89,10 @@ impl ControlPlane {
             outbound,
             rx,
             feature_publisher,
-            session_info_publisher,
+            audio_info_publisher,
             inspect,
             state: SessionState::Idle,
+            session_model: None,
             capture: None,
             data_plane: None,
         }
@@ -120,8 +131,12 @@ impl ControlPlane {
         // Clear any stale reading so a head polling after shutdown
         // sees `None` instead of the last-known f0 / session info.
         self.feature_publisher.store(Arc::new(None));
-        self.session_info_publisher.store(Arc::new(None));
+        self.audio_info_publisher.store(Arc::new(None));
         self.inspect.clear();
+        // The musical frame of reference is decoupled from the audio
+        // lifecycle, so it survives start/stop — but shutdown is the end
+        // of the coach, so drop it here.
+        self.session_model = None;
         tel_info!(
             &*self.deps.telemetry,
             "app-coach: control plane down",
@@ -135,6 +150,9 @@ impl ControlPlane {
             Input::FromHead(Command::ListDevices) => self.do_list_devices(),
             Input::FromHead(Command::StartSession(cfg)) => self.do_start_session(cfg),
             Input::FromHead(Command::StopSession) => self.do_stop_session(),
+            Input::FromHead(Command::ConfigureSession { tuning, tonality }) => {
+                self.do_configure_session(tuning, tonality)
+            }
         }
     }
 
@@ -143,7 +161,7 @@ impl ControlPlane {
         self.push_event(CoachEvent::DevicesListed { devices });
     }
 
-    fn do_start_session(&mut self, cfg: SessionConfig) {
+    fn do_start_session(&mut self, cfg: AudioConfig) {
         if self.state != SessionState::Idle {
             tel_debug!(
                 &*self.deps.telemetry,
@@ -223,13 +241,12 @@ impl ControlPlane {
                 // Publish negotiated session info *before* emitting the
                 // Running transition so any head reacting to the event
                 // sees Some(info) (not None or stale).
-                self.session_info_publisher
-                    .store(Arc::new(Some(SessionInfo {
-                        sample_rate,
-                        channels,
-                        device_id: cfg.device_id.clone(),
-                        buffer_frames: buffer_frames.unwrap_or(0),
-                    })));
+                self.audio_info_publisher.store(Arc::new(Some(AudioInfo {
+                    sample_rate,
+                    channels,
+                    device_id: cfg.device_id.clone(),
+                    buffer_frames: buffer_frames.unwrap_or(0),
+                })));
                 self.transition(SessionState::Running);
             }
             Err(e) => {
@@ -254,9 +271,9 @@ impl ControlPlane {
                 // but the spec says Stop-during-Start cancels, so
                 // we model it: if capture was opened, drop it.
                 //
-                // Clear session_info *before* the transition so a head
+                // Clear audio_info *before* the transition so a head
                 // reacting to Stopping observes `None`, not stale info.
-                self.session_info_publisher.store(Arc::new(None));
+                self.audio_info_publisher.store(Arc::new(None));
                 self.transition(SessionState::Stopping);
                 self.teardown_data_path();
                 self.transition(SessionState::Idle);
@@ -274,6 +291,34 @@ impl ControlPlane {
                 );
             }
         }
+    }
+
+    /// Set the musical frame of reference. Builds the [`Tuning`] from
+    /// the spec and stores it with the [`Tonality`]. Valid in any state;
+    /// no [`SessionState`] change, no event — the musical lifecycle is
+    /// decoupled from the audio one.
+    ///
+    /// The well-formedness invariant (scale intervals sum to the
+    /// tuning's slot count) is checked here, at the `Tuning × Tonality`
+    /// join — the only place both halves are in hand. Today only code
+    /// constructs the payload, so a bad sum is a programming bug caught
+    /// by `debug_assert`; this graduates to a runtime reject (keep the
+    /// prior model) when an untrusted picker can reach it.
+    fn do_configure_session(&mut self, spec: TuningSpec, tonality: Tonality) {
+        let tuning = Tuning::new(spec);
+        debug_assert!(
+            tonality.well_formed(tuning.n() as u8),
+            "tonality scale intervals {:?} do not sum to tuning slot count {}",
+            tonality.steps(),
+            tuning.n(),
+        );
+        tel_debug!(
+            &*self.deps.telemetry,
+            "app-coach: session configured",
+            slots = tuning.n() as u32,
+            tonic = tonality.tonic.offset as u32,
+        );
+        self.session_model = Some((tuning, tonality));
     }
 
     /// Drop the capture (stops RT callback, drops the ring producer),
@@ -299,9 +344,9 @@ impl ControlPlane {
     fn fail(&mut self, kind: SessionErrorKind, reason: String) {
         // Always reachable from Starting (most common); also from
         // Running if a sync path ever invokes this.
-        // Clear session_info before the transition so a head reacting
+        // Clear audio_info before the transition so a head reacting
         // to Error observes `None`. No-op when called from Starting.
-        self.session_info_publisher.store(Arc::new(None));
+        self.audio_info_publisher.store(Arc::new(None));
         self.transition(SessionState::Error);
         self.push_event(CoachEvent::SessionError {
             kind,

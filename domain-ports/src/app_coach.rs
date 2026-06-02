@@ -34,6 +34,7 @@
 use crate::audio_capture::AudioCapture;
 use crate::audio_devices::{AudioDevices, DeviceId, InputDevice};
 use crate::clock::Clock;
+use crate::music::{Tonality, TuningSpec};
 use crate::telemetry::Telemetry;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +75,7 @@ pub enum Command {
     /// Open the selected device and start a session.
     /// `Idle → Starting → Running` on success;
     /// `Idle → Starting → Error` on failure.
-    StartSession(SessionConfig),
+    StartSession(AudioConfig),
 
     /// Tear down the current session.
     /// `Running → Stopping → Idle`.
@@ -83,26 +84,42 @@ pub enum Command {
     /// `CaptureStarted`): cancels the in-flight start and transitions
     /// `Starting → Stopping → Idle` with no spurious `Running` flash.
     StopSession,
+
+    /// Set the *musical* frame of reference: how the instrument is tuned
+    /// and which scale the singer is in. The coach builds a
+    /// [`Tuning`](crate::music::Tuning) from `tuning` and holds it with
+    /// `tonality` as the reference for judging pitch.
+    ///
+    /// **Decoupled from the audio lifecycle.** Valid in *any* state and
+    /// causes **no** [`SessionState`] change and **no** event: the
+    /// musical lifecycle (configure) is independent of the audio
+    /// lifecycle (start/stop). Reconfiguring mid-session just swaps the
+    /// frame of reference. Heads may configure before, after, or without
+    /// ever starting audio.
+    ConfigureSession {
+        tuning: TuningSpec,
+        tonality: Tonality,
+    },
 }
 
 /// Negotiated parameters of the currently-running session.
 ///
-/// `SessionConfig` is what the head *asked for*; `SessionInfo` is what
+/// `AudioConfig` is what the head *asked for*; `AudioInfo` is what
 /// the device actually agreed to and what the data plane is feeding the
 /// engine right now. Heads use it for any widget that's sample-rate-
 /// dependent (oscilloscopes, envelopes, downsampling math).
 ///
-/// **Lifecycle invariant:** [`AppCoach::session_info`] returns
+/// **Lifecycle invariant:** [`AppCoach::audio_info`] returns
 /// `Some(_)` if and only if the most recent
 /// [`CoachEvent::SessionStateChanged`] reported
 /// [`SessionState::Running`]. It is `None` in `Idle`, `Starting`,
 /// `Stopping`, and `Error` — including before the `Running` event has
-/// landed. The adapter publishes a fresh `SessionInfo` *before*
+/// landed. The adapter publishes a fresh `AudioInfo` *before*
 /// emitting the `Running` transition and clears it *before* emitting
 /// the next transition, so a head reacting to the event will see
 /// coherent state.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionInfo {
+pub struct AudioInfo {
     /// Negotiated capture sample rate, in Hz.
     pub sample_rate: u32,
     /// Negotiated channel count.
@@ -114,8 +131,12 @@ pub struct SessionInfo {
     pub buffer_frames: u32,
 }
 
-/// What the host wants to capture from.
-pub struct SessionConfig {
+/// What the host wants to capture from — the *audio* parameters of a
+/// session (device + stream format). Distinct from the *musical*
+/// configuration of a session (tuning + tonality), which is carried by
+/// [`Command::ConfigureSession`] and is decoupled from the audio
+/// lifecycle.
+pub struct AudioConfig {
     /// Identifies the device to open. `None` requests the system's
     /// multimedia-role default input.
     ///
@@ -320,11 +341,11 @@ pub trait AppCoach {
     ///
     /// Lifecycle: `Some(_)` iff state is [`SessionState::Running`].
     /// `None` everywhere else (`Idle`, `Starting`, `Stopping`,
-    /// `Error`). See [`SessionInfo`] for the ordering guarantees
+    /// `Error`). See [`AudioInfo`] for the ordering guarantees
     /// against `CoachEvent::SessionStateChanged`.
     ///
     /// Non-blocking, lock-free. Heads poll this whenever they need a
     /// sample-rate-dependent constant (scope window math, downsampling,
     /// envelope step size). Cheap enough to call every frame.
-    fn session_info(&self) -> Option<SessionInfo>;
+    fn audio_info(&self) -> Option<AudioInfo>;
 }

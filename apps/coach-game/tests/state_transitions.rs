@@ -56,8 +56,11 @@ fn new_game_transitions_to_in_game_and_starts_session() {
     assert_eq!(current_state(&app), AppState::InGame);
     let cmds = drain_commands(&fake);
     assert!(
-        matches!(cmds.as_slice(), [Command::StartSession(_)]),
-        "expected exactly one StartSession after entering InGame, got {} commands",
+        matches!(
+            cmds.as_slice(),
+            [Command::ConfigureSession { .. }, Command::StartSession(_)]
+        ),
+        "expected ConfigureSession then StartSession after entering InGame, got {} commands",
         cmds.len()
     );
 }
@@ -76,11 +79,11 @@ fn start_session_uses_selected_device_id() {
 
     let cmds = drain_commands(&fake);
     match cmds.as_slice() {
-        [Command::StartSession(cfg)] => {
+        [Command::ConfigureSession { .. }, Command::StartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(id));
         }
         other => panic!(
-            "expected StartSession with our device id, got {} cmds",
+            "expected ConfigureSession then StartSession with our device id, got {} cmds",
             other.len()
         ),
     }
@@ -298,8 +301,11 @@ fn resuming_from_paused_starts_a_fresh_session() {
     assert!(!app.world().resource::<HasPausedSession>().0);
     let cmds = drain_commands(&fake);
     assert!(
-        matches!(cmds.as_slice(), [Command::StartSession(_)]),
-        "expected exactly one StartSession on resume, got {} commands",
+        matches!(
+            cmds.as_slice(),
+            [Command::ConfigureSession { .. }, Command::StartSession(_)]
+        ),
+        "expected ConfigureSession then StartSession on resume, got {} commands",
         cmds.len()
     );
 }
@@ -516,11 +522,11 @@ fn full_device_selection_flow_carries_to_start_session() {
 
     let cmds = drain_commands(&fake);
     match cmds.as_slice() {
-        [Command::StartSession(cfg)] => {
+        [Command::ConfigureSession { .. }, Command::StartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(airpods_id));
         }
         other => panic!(
-            "expected exactly one StartSession with the AirPods id, got {} cmds",
+            "expected ConfigureSession then StartSession with the AirPods id, got {} cmds",
             other.len()
         ),
     }

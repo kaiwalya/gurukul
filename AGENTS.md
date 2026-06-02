@@ -14,6 +14,7 @@ rules apply:
 Every fact has one source of truth. Don't duplicate it elsewhere; link instead.
 
 - Product vision, roadmap, testing, research → [`docs/*.md`](docs/)
+- Music-model structure (4 axes, two roots, label-ring lock modes, dial layers) → [`docs/MUSIC_MODEL.md`](docs/MUSIC_MODEL.md). Read before changing `AppSettings` / `SessionConfig` / dial labelling / any musical-vocabulary code.
 - Phase status → [`docs/ROADMAP.md`](docs/ROADMAP.md) (the "Current phase" line). Never restate phase state in `README.md`, commits, or other docs.
 - Workspace / crate list → [`Cargo.toml`](Cargo.toml) workspace members.
 - Quick-start commands → [`README.md`](README.md).

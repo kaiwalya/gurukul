@@ -63,7 +63,7 @@ use shutdown::join_with_timeout;
 
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, CoachEvent, Command, FeatureSnapshot, SessionInfo, ShutdownResult,
+    AppCoach, AppCoachDeps, AudioInfo, CoachEvent, Command, FeatureSnapshot, ShutdownResult,
 };
 use domain_ports::engine_inspect::EngineInspect;
 use std::sync::mpsc::{self, Sender};
@@ -100,9 +100,9 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let feature_publisher_for_thread = Arc::clone(&feature_publisher);
-    let session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>> =
+    let audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>> =
         Arc::new(ArcSwap::from_pointee(None));
-    let session_info_publisher_for_thread = Arc::clone(&session_info_publisher);
+    let audio_info_publisher_for_thread = Arc::clone(&audio_info_publisher);
     let inspect_shared = InspectShared::new();
     let inspect_for_thread = Arc::clone(&inspect_shared);
 
@@ -114,7 +114,7 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
                 outbound_for_thread,
                 rx_cmd,
                 feature_publisher_for_thread,
-                session_info_publisher_for_thread,
+                audio_info_publisher_for_thread,
                 inspect_for_thread,
             )
             .run();
@@ -125,7 +125,7 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
         feature_publisher,
-        session_info_publisher,
+        audio_info_publisher,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     };
@@ -152,9 +152,9 @@ struct CoachImpl {
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     /// Lock-free snapshot of the negotiated session parameters. Written
     /// by the control plane before emitting `SessionStateChanged(Running)`
-    /// and cleared before the next transition out — see [`SessionInfo`]
+    /// and cleared before the next transition out — see [`AudioInfo`]
     /// for the ordering contract.
-    session_info_publisher: Arc<ArcSwap<Option<SessionInfo>>>,
+    audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -200,8 +200,8 @@ impl AppCoach for CoachImpl {
         **self.feature_publisher.load()
     }
 
-    fn session_info(&self) -> Option<SessionInfo> {
-        (**self.session_info_publisher.load()).clone()
+    fn audio_info(&self) -> Option<AudioInfo> {
+        (**self.audio_info_publisher.load()).clone()
     }
 }
 
@@ -226,7 +226,7 @@ impl Drop for CoachImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_ports::app_coach::{SessionConfig, SessionErrorKind, SessionState};
+    use domain_ports::app_coach::{AudioConfig, SessionErrorKind, SessionState};
     use domain_ports::audio_capture::{
         AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureSession,
     };
@@ -235,6 +235,7 @@ mod tests {
         Transport,
     };
     use domain_ports::clock::{Clock, TestClock};
+    use domain_ports::music::{harmonium_key, Tonality, TuningKind, TuningSpec};
     use domain_ports::telemetry::TestTelemetry;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -399,7 +400,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -457,18 +458,143 @@ mod tests {
         );
     }
 
+    /// A 12-TET, A=440 tuning with Bilawal (Sa Re Ga Ma Pa Dha Ni) on
+    /// slot 0 — the default musical frame for these tests.
+    fn bilawal_config() -> (TuningSpec, Tonality) {
+        let tuning = TuningSpec {
+            root_note_hz: 261.625_56, // C
+            kind: TuningKind::TwelveTet,
+            root: harmonium_key(0),
+        };
+        let tonality = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        (tuning, tonality)
+    }
+
+    /// Drain the coach once past a known reply (a `DevicesListed` from a
+    /// `ListDevices` we send) so we can assert what did *not* arrive
+    /// before it. Used to prove `ConfigureSession` emits no event: a
+    /// configure can't be polled *for* (it's silent), so we sandwich it
+    /// before a command that does reply and check the accumulated events.
+    fn drain_past_list_devices(coach: &impl AppCoach) -> Vec<CoachEvent> {
+        coach.send_command(Command::ListDevices);
+        poll_until(coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::DevicesListed { .. }))
+        })
+    }
+
+    fn no_state_changes(events: &[CoachEvent]) -> bool {
+        !events
+            .iter()
+            .any(|e| matches!(e, CoachEvent::SessionStateChanged { .. }))
+    }
+
     #[test]
-    fn session_info_is_some_only_while_running() {
+    fn configure_in_idle_emits_no_state_change_no_error() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        let (tuning, tonality) = bilawal_config();
+        coach.send_command(Command::ConfigureSession { tuning, tonality });
+
+        // The configure is silent; sandwich it before a ListDevices and
+        // assert nothing else slipped through.
+        let events = drain_past_list_devices(&coach);
+        assert!(
+            no_state_changes(&events),
+            "ConfigureSession in Idle must not change session state",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::SessionError { .. })),
+            "ConfigureSession must not error",
+        );
+        // It also must not have opened any audio device.
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn configure_while_running_keeps_running_no_event() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Start audio → Running.
+        coach.send_command(Command::StartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+
+        // Reconfigure mid-session. Decoupled: no transition, no event.
+        let (tuning, tonality) = bilawal_config();
+        // A different tonic, to make the swap meaningful.
+        let tonality = Tonality {
+            tonic: harmonium_key(2), // Sa on D
+            ..tonality
+        };
+        coach.send_command(Command::ConfigureSession { tuning, tonality });
+
+        let events = drain_past_list_devices(&coach);
+        assert!(
+            no_state_changes(&events),
+            "ConfigureSession while Running must not change session state",
+        );
+        // Audio was opened exactly once (the start); configure didn't
+        // touch the audio lifecycle.
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(
+            coach.audio_info().is_some(),
+            "still Running after reconfigure",
+        );
+
+        coach.send_command(Command::StopSession);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Idle
+                    }
+                )
+            })
+        });
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn audio_info_is_some_only_while_running() {
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
         assert!(
-            coach.session_info().is_none(),
+            coach.audio_info().is_none(),
             "Idle should have no session info"
         );
 
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -484,7 +610,7 @@ mod tests {
             })
         });
         let info = coach
-            .session_info()
+            .audio_info()
             .expect("Running should expose session info");
         assert_eq!(info.sample_rate, 48_000);
         assert_eq!(info.channels, 1);
@@ -501,7 +627,7 @@ mod tests {
             })
         });
         assert!(
-            coach.session_info().is_none(),
+            coach.audio_info().is_none(),
             "Idle (after stop) should have no session info"
         );
 
@@ -517,7 +643,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::FailUnsupported, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -576,7 +702,7 @@ mod tests {
         let coach = new(deps);
 
         // Reach Running.
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -595,7 +721,7 @@ mod tests {
 
         // Second Start: should be ignored. No new state event, no
         // new open call.
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -627,7 +753,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: Some(DeviceId("does-not-exist".into())),
             sample_rate: None,
             buffer_frames: None,
@@ -687,7 +813,7 @@ mod tests {
         let coach = new(deps);
 
         // Cycle 1: Start → Running.
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -718,7 +844,7 @@ mod tests {
         });
 
         // Cycle 2: Start again — must reopen capture and reach Running.
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -764,7 +890,7 @@ mod tests {
         let coach = new(deps);
 
         // Reach Running so there's actual state to tear down.
-        coach.send_command(Command::StartSession(SessionConfig {
+        coach.send_command(Command::StartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,

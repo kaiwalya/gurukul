@@ -104,8 +104,9 @@ v1 set:
 ```rust
 enum Command {
     ListDevices,
-    StartSession(SessionConfig),
+    StartSession(AudioConfig),
     StopSession,
+    ConfigureSession { tuning: TuningSpec, tonality: Tonality },
 }
 ```
 
@@ -116,6 +117,18 @@ enum Command {
   `idle → starting → error`). In v1 this just opens the AudioCapture
   stream; in Phase 2 it also spawns the pitch worker.
 - `StopSession`: kicks off `running → stopping → idle`.
+- `ConfigureSession`: sets the *musical* frame of reference (how the
+  instrument is tuned + the scale the singer is in). **Decoupled from
+  the audio lifecycle** — valid in any state, causes **no**
+  `SessionState` change and emits **no** event. The coach builds a
+  `Tuning` from the spec and holds it with the `Tonality`. Today nothing
+  downstream consumes it (pitch *scoring* against the scale is a later
+  phase); the seam exists so scoring can plug in without re-plumbing the
+  boundary. Bad payloads are a `debug_assert` today (only code builds
+  them); this graduates to a runtime reject — keep the prior model — when
+  an untrusted picker can reach it. The musical types
+  (`InstrumentKey`, `TuningKind`, `Tonality`, `TuningSpec`) live in
+  `domain-ports::music`; see `docs/MUSIC_MODEL.md`.
 
 **Deferred to Phase 2:** `SetPitchEnabled` (no pitch yet).
 
@@ -171,17 +184,22 @@ readings never enter the event queue.
 
 ---
 
-## 5. `SessionConfig` and device selection
+## 5. `AudioConfig` and device selection
 
 ```rust
 pub struct DeviceId(pub String);   // newtype — heads can't fabricate
 
-struct SessionConfig {
+struct AudioConfig {
     device_id: Option<DeviceId>,   // None = system default
     sample_rate: Option<u32>,      // None = AppCoach picks (prefer 48k)
     buffer_frames: Option<u32>,    // None = adapter default
 }
 ```
+
+`AudioConfig` carries the *audio* parameters only. The *musical*
+configuration of a session (tuning + tonality — the frame of reference
+for judging pitch) is carried separately by `Command::ConfigureSession`
+and is decoupled from the audio lifecycle (see §3).
 
 - Device picked by `persistent_id` string, not by handle. The head got
   the id from a prior `DevicesListed` event; the string survives FFI
