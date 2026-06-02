@@ -81,11 +81,19 @@ pub fn build_app(app: &mut App) {
                 .run_if(in_state(AppState::Settings)),
         )
         // InGame
-        .add_systems(OnEnter(AppState::InGame), game::on_enter)
+        .add_systems(
+            OnEnter(AppState::InGame),
+            (game::on_enter, game::dial::spawn),
+        )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
         .add_systems(
             Update,
-            (game::log_features, game::handle_esc_in_game).run_if(in_state(AppState::InGame)),
+            (
+                game::log_features,
+                game::handle_esc_in_game,
+                game::dial::update_from_features,
+            )
+                .run_if(in_state(AppState::InGame)),
         )
         // Paused
         .add_systems(

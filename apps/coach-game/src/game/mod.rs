@@ -1,6 +1,8 @@
 //! InGame state: open a session with the selected device, stream
-//! features. No rendering yet — features print to stdout, same as the
-//! pre-menu scaffold.
+//! features. Features print to stdout (see [`log_features`]) and feed
+//! the note dial overlay (see [`dial`]).
+
+pub mod dial;
 
 use crate::coach::Coach;
 use crate::state::{AppState, HasPausedSession, SelectedDevice};

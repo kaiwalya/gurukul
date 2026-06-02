@@ -74,6 +74,10 @@ pub fn build_test_app() -> (App, FakeCoach) {
 
 /// Pull the most recent commands the fake has seen and clear them.
 /// Useful in tests that want to assert per-transition behaviour.
+///
+/// `allow(dead_code)` because `common/` is recompiled per test binary,
+/// so a helper used only by some integration tests warns in the others.
+#[allow(dead_code)]
 pub fn drain_commands(fake: &FakeCoach) -> Vec<Command> {
     std::mem::take(&mut fake.inner.lock().unwrap().commands)
 }
