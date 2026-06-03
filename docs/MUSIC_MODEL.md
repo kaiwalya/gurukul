@@ -269,6 +269,17 @@ language.
 
 ### 3. Note system (vocabulary)
 
+> **Status: designed, not built.** This axis is *deferred*. The head is
+> currently **vocabulary-free** — it stores no note-naming scheme and
+> invents no labels. The sections below describe the intended model so
+> the label layer lands coherently; until then, nothing in code names a
+> slot or a tonic. The HUD shows the [math view](#what-s-in-code-today)
+> (degrees / keys / Hz) instead. An earlier pass *did* implement a
+> `NoteSystem` enum (`tonic_label`, `scale_name`, `AppSettings.note_system`)
+> head-side; it was removed precisely because it duplicated the model's
+> vocabulary outside `music.rs` and drifted. Reintroduce it only as the
+> real `LabelRing`/`LockMode` layer (see [What's deferred](#whats-deferred)).
+
 The labels used to talk about slots. Pure presentation; no effect on
 math, geometry, or audio.
 
@@ -276,7 +287,9 @@ math, geometry, or audio.
 - **Sargam Latin** — Sa, Re, Ga, Ma, Pa, Dha, Ni (plus komal/tivra
   forms; see below for why this list is shorter than 12).
 - **Sargam Devanagari** — सा, रे, ग, म, प, ध, नि.
-- Stored as: `AppSettings.note_system: NoteSystem`.
+- Will be stored as: a head-side label-layer choice (shape TBD — see
+  the `LabelRing`/`LockMode` sketch below), **not** on `AppSettings`
+  today.
 
 **Why it's its own axis:** Vocabulary is orthogonal to acoustics. The
 same 12-TET slot at 440 Hz is "A" in Western or some other label in
@@ -345,12 +358,15 @@ Note what each column does:
   Bilawal" the way a Western singer announces "I'm singing D Major":
   *here is where I put my Sa today, here is the scale I'm using.*
 
-This is why the HUD badge reads "Kaali-1 Bilawal" for a Sargam user
-with the tonic on key 1, and "C♯ Major" for a Western user with the
-same tonic key. Same data, two different absolute-naming
-vocabularies. The dial face — when the label ring is rendered, layer
-5 — would meanwhile show "Sa" at the top in both cases (Sargam),
-or "C" at the top with the highlight rotated to slot 1 (Western).
+This is why the HUD badge would read "Kaali-1 Bilawal" for a Sargam
+user with the tonic on key 1, and "C♯ Major" for a Western user with
+the same tonic key, *once the label layer ships*. Same data, two
+different absolute-naming vocabularies. The dial face — when the label
+ring is rendered, layer 5 — would meanwhile show "Sa" at the top in
+both cases (Sargam), or "C" at the top with the highlight rotated to
+slot 1 (Western). **Today**, with the head vocabulary-free, the HUD
+shows the math view (`deg 0 2 4 5 7 9 11` / `key …` / `Hz …`) — the
+same data with no names attached.
 
 #### Where this collides with the `LabelRing` abstraction
 
@@ -471,21 +487,27 @@ scale ring (layer 4).
 **Worked: what frequency is "Sa"?** The trap is that `scale_intervals`
 plays *no part* in finding Sa — Sa is the tonic, before any interval.
 The intervals only locate Re, Ga, … So the path to Sa's Hz is the
-short one. Example: a 12-key harmonium tuned from A
-(`root = { offset: 9, octave_size: 12 }`), the singer puts Sa on D
-(`tonic = { offset: 2, octave_size: 12 }`):
+short one. Example: a 12-key harmonium tuned from A in octave 1
+(`root = { offset: 21, octave_size: 12 }`), the singer puts Sa on the D
+just below it (`tonic = { offset: 14, octave_size: 12 }`):
 
-1. **Keyboard → slot** (the one bridge, `TuningView::slot_of`):
-   `(tonic.offset − root.offset).rem_euclid(N) = (2 − 9).rem_euclid(12)
-   = 5`. D is slot 5 — five 12-TET steps above the A we tuned from.
-2. **Slot → Hz**: `slots[5] = root_note_hz × 2^(5/12) = 440 × 2^(5/12)
-   ≈ 587.3 Hz` (D5). That's Sa.
+1. **Keyboard → delta** (subtract the gauge first, the only path to Hz):
+   `delta = tonic.offset − root.offset = 14 − 21 = −7`. Sa sits seven
+   12-TET steps *below* the A we tuned from.
+2. **Delta → Hz** (slot and octave from the *same* delta, via one
+   divmod): slot = `(−7).rem_euclid(12) = 5`, octave = `(−7).div_euclid(12)
+   = −1`, so `slots[5] × 2^(−1) = 440 × 2^(5/12) × 2^(−1) ≈ 293.7 Hz`
+   (D one octave below the A). That's Sa.
 
-A general scale degree `d` *does* use the intervals — start at the
-tonic's slot, add the first `d` intervals:
-`slot_d = (slot_of(tonic) + Σ scale_intervals[0..d]) mod N`, then
-`freq = slots[slot_d]`. Degree 0 (Sa) has an empty sum, recovering the
-trace above.
+A general scale degree `d` *does* use the intervals — place it on the
+keyboard first (`key_d.offset = tonic.offset + Σ scale_intervals[0..d]`),
+then resolve that key through the same delta-from-root path:
+`hz(key_d)` computes `delta = key_d − root` and folds slot *and* octave
+from that one delta (`slots[delta mod N] × 2^(delta div N)`). Degree 0
+(Sa) has an empty sum (`key_0 = tonic`), recovering the trace above.
+Crucially the octave comes from the *full* delta, not from folding the
+degree into the root's octave — that keeps the scale ascending instead
+of wrapping (the octave-wrap bug we fixed).
 
 ## State vs View — two layers
 
@@ -638,14 +660,15 @@ A Sargam user, A=440 standard, singing Bilawal in D on a 12-TET dial:
 | Axis | Value | Stored as |
 |---|---|---|
 | Tuning reference | 440 Hz | `AppSettings.reference_hz = 440.0` |
-| Tuning system | 12-TET | `AppSettings.tuning_system = TwelveTET` |
-| Note system | Sargam Latin | `AppSettings.note_system = SargamLatin` |
+| Tuning system | 12-TET | `AppSettings.tuning_kind = TwelveTet` |
+| Note system | Sargam Latin | *(deferred axis-3 label layer — no `AppSettings` field today)* |
 | Song tonic | D (key 2) | `Tonality.tonic = harmonium_key(2)` |
 | Scale | Bilawal | `Tonality.scale_intervals = [2,2,1,2,2,2,1,0,…]` |
 
 The first three axes are head-held `AppSettings`; `tuning_spec()`
 marshals them into the `TuningSpec` that crosses the port (root pegged
-at `harmonium_key(9)` = A, `root_note_hz = reference_hz`). The tonic +
+at `harmonium_key(21)` = A in octave 1, `root_note_hz = reference_hz`).
+The tonic +
 scale ride in the head's `SongTonality(Tonality)` resource and cross
 the port as a `Tonality` via `ConfigureSession`.
 
@@ -712,12 +735,13 @@ are equivalent under rotation (in fact identity); Kafi ↔ Dorian are
 rotations of each other; etc. The singer sees the name for *their*
 school.
 
-**Practical consequence:** `scale_name(steps, note_system)` returns
-"Bilawal" for Sargam, "Major" for Western on the same step vector.
-This is the school namespace acting through the note-system axis. The
-current implementation is a 3-entry stub; the real machinery (per-
-school catalogues with rotation-equivalence detection at load) is
-deferred.
+**Practical consequence:** a future `scale_name(steps, note_system)`
+would return "Bilawal" for Sargam, "Major" for Western on the same
+step vector — the school namespace acting through the note-system
+axis. This is **not built** (an earlier 3-entry stub was removed with
+the rest of the head vocabulary); the real machinery (per-school
+catalogues with rotation-equivalence detection at load) is deferred
+and lands alongside the note-system axis.
 
 ## What's in code today
 
@@ -731,24 +755,38 @@ scale_intervals }`, and the `tuning_view` module of free functions
 `Tuning` (owns a `Vec<f32>`) does not.
 
 The coach receives the model via `Command::ConfigureSession { tuning:
-TuningSpec, tonality: Tonality }` (decoupled from audio lifecycle — no
-state change, no event). The control plane builds the `Tuning` and
-stores `(Tuning, Tonality)` as its session model.
+TuningSpec, tonality: Tonality }`, **decoupled from the audio
+lifecycle** — it's accepted in any state and causes no
+`SessionState` change. On every configure the control plane builds the
+`Tuning`, stores `(Tuning, Tonality)` as its session model, and
+publishes the **event-sourcing pair** that lets any head reconstruct
+the musical frame:
+
+- a **snapshot** — `AppCoach::music_info() -> Option<MusicInfo>` where
+  `MusicInfo { tuning: TuningSpec, tonality: Tonality }`. A materialized
+  read-cache (lock-free `ArcSwap`). **Sticky**: `None` only before the
+  first configure, survives start/stop, cleared only on shutdown.
+- an **event** — `CoachEvent::SessionConfigured { tuning, tonality }`,
+  the log entry whose fold reconstructs `music_info`. Snapshot is
+  written *before* the event, so a head reacting to the event reads a
+  coherent snapshot. (Same pattern as `audio_info` + `SessionStateChanged`.)
+
+The head is **vocabulary-free**: nothing below names a slot, a scale,
+or a tonic. Naming is the deferred [note-system axis](#3-note-system-vocabulary).
 
 In `apps/coach-game/src/state.rs`:
 
-- `AppSettings { reference_hz, tuning_system, note_system }` — axes
-  1, 2, 3 — plus `tuning_spec()`, which pegs the tuning root at
-  `harmonium_key(9)` (A) with `root_note_hz = reference_hz`.
+- `AppSettings { reference_hz, tuning_kind: TuningKind }` — axes 1, 2
+  only — plus `tuning_spec()`, which pegs the tuning root at
+  `harmonium_key(21)` (A in octave 1) with `root_note_hz = reference_hz`
+  and copies `tuning_kind` straight through (no head-side enum). There is
+  **no** `note_system` field, no `tonic_label`, no `scale_name`. The root
+  sits in octave 1 (not the lowest octave) so a song tonic an octave
+  below it lands in the singing register rather than the cellar.
 - `SongTonality(Tonality)` resource — axis 4. Default = Bilawal on
-  `harmonium_key(0)`.
-- `NoteSystem::tonic_label(slot) -> &str` — Job B (tonic naming)
-  table. Western: `C, C♯, D, ...`. Sargam (both Latin and
-  Devanagari): `Safed-1, Kaali-1, Safed-2, ...`. Used by the HUD and
-  by the eventual tonic picker.
-- `scale_name(steps, note_system) -> String` — 3-entry stub
-  (Bilawal/Major, Kalyan/Lydian, Bhairav/Double-harmonic). Replaced
-  by the per-school catalogue when it lands.
+  `harmonium_key(12)` (C in octave 1, one octave below the A=440 root →
+  middle register, C ≈ 262 Hz). Written to the coach via
+  `ConfigureSession` on InGame entry.
 
 In `apps/coach-game/src/game/dial.rs`:
 
@@ -763,15 +801,36 @@ In `apps/coach-game/src/game/dial.rs`:
 
 In `apps/coach-game/src/game/hud.rs`:
 
-- Top-left badge reads tonic from `SongTonality.0.tonic.fold()` via
-  `NoteSystem::tonic_label` and scale name from
-  `scale_name(song.steps(), …)`.
-- Renders "Safed-2 Bilawal" / "D Major" depending on note system.
-  Correct for an arbitrary tonic key.
+- Top-left panel shows the **math view** of the current tonality,
+  sourced from the coach's `music_info()` snapshot (not the head's own
+  `SongTonality` — reading the snapshot exercises the round-trip). Three
+  rows describe the same scale: `deg` (0-based prefix sum of the scale
+  intervals, e.g. `0 2 4 5 7 9 11`), `key` (those degrees + tonic
+  offset, in `InstrumentKey` space), and `Hz` (each key resolved through
+  the active `Tuning` via `tuning_view::hz`). The Hz row ascends
+  naturally with no octave-lifting at the call site: `hz` derives slot
+  *and* octave from the same root-relative delta, so degrees below the
+  tuning root simply read an octave down. For Bilawal on C (octave 1,
+  `harmonium_key(12)`) against the A=440 12-TET tuning (root at
+  `harmonium_key(21)`):
+
+  ```
+  deg   0   2   4   5   7   9  11
+  key  12  14  16  17  19  21  23
+  Hz  262 294 330 349 392 440 494
+  ```
+
+  Note the root A lands exactly on 440 (key 21 = degree 9), and Sa sits
+  a clean octave below the root in the middle register.
+
+  No note names — that's the deferred label layer. `None` snapshot
+  renders an honest "—" placeholder.
 
 In Settings UI:
 
-- Audio + Music tabs, master/detail in Music — edits axes 1–3.
+- Audio + Music tabs, master/detail in Music. Music edits axes 1–2 only
+  (reference Hz, tuning kind) — the note-system picker was removed with
+  the head vocabulary.
 
 ## What's deferred
 

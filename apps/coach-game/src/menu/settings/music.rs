@@ -1,12 +1,16 @@
 //! Music tab of the Settings screen: master/detail layout.
 //!
-//! Three `AppSettings` fields (reference Hz, tuning system, note
-//! system) are exposed as pickers. The tab is split horizontally:
+//! Two `AppSettings` fields (reference Hz, tuning kind) are exposed as
+//! pickers. There is deliberately **no note-system picker**: the head
+//! is vocabulary-free (see `docs/MUSIC_MODEL.md`). Choosing a note
+//! naming scheme belongs to the deferred label layer; until it ships,
+//! the only musical settings are the raw calibration inputs. The tab is
+//! split horizontally:
 //!
 //! - **Master pane** (left): one row per setting, showing name + the
 //!   current value. Click selects which picker to show.
 //! - **Detail pane** (right): the picker for the currently-selected
-//!   setting. All three pickers are kept spawned; inactive ones are
+//!   setting. Both pickers are kept spawned; the inactive one is
 //!   collapsed with `Display::None` (same trick as tab switching).
 //!
 //! Selection state lives in [`MusicSelection`]. Master rows rebuild
@@ -15,9 +19,10 @@
 //! pickers rebuild on `Changed<AppSettings>` like before.
 
 use super::{spawn_choice_row, SettingsTab, TabContent};
-use crate::state::{AppSettings, NoteSystem, TuningSystem};
+use crate::state::AppSettings;
 use crate::ui::*;
 use bevy::prelude::*;
+use domain_ports::music::TuningKind;
 
 /// Which setting's picker the detail pane is currently showing. Pure
 /// UI state, local to the Music tab. Resets to the first row on every
@@ -26,18 +31,14 @@ use bevy::prelude::*;
 pub enum MusicSelection {
     #[default]
     ReferenceHz,
-    TuningSystem,
-    NoteSystem,
+    TuningKind,
 }
 
 #[derive(Component)]
 pub struct ReferenceHzList;
 
 #[derive(Component)]
-pub struct TuningSystemList;
-
-#[derive(Component)]
-pub struct NoteSystemList;
+pub struct TuningKindList;
 
 /// Marker on the master pane so we can despawn-and-respawn its rows
 /// when their "current value" subtitle needs to update.
@@ -58,10 +59,7 @@ pub struct MusicMasterRow(pub MusicSelection);
 pub struct ReferenceHzRow(pub f32);
 
 #[derive(Component, Clone, Copy)]
-pub struct TuningSystemRow(pub TuningSystem);
-
-#[derive(Component, Clone, Copy)]
-pub struct NoteSystemRow(pub NoteSystem);
+pub struct TuningKindRow(pub TuningKind);
 
 const REFERENCE_HZ_CHOICES: [(f32, &str); 4] = [
     (440.0, "A = 440 Hz (standard)"),
@@ -117,7 +115,7 @@ pub(super) fn spawn_tab(commands: &mut Commands, parent: Entity) {
         ))
         .id();
 
-    // Three pickers, identical shape — width fills the detail pane.
+    // Two pickers, identical shape — width fills the detail pane.
     commands.spawn((
         ChildOf(detail),
         ReferenceHzList,
@@ -130,18 +128,7 @@ pub(super) fn spawn_tab(commands: &mut Commands, parent: Entity) {
     ));
     commands.spawn((
         ChildOf(detail),
-        TuningSystemList,
-        Node {
-            width: percent(100),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(6),
-            display: Display::None,
-            ..default()
-        },
-    ));
-    commands.spawn((
-        ChildOf(detail),
-        NoteSystemList,
+        TuningKindList,
         Node {
             width: percent(100),
             flex_direction: FlexDirection::Column,
@@ -164,16 +151,8 @@ pub fn rebuild_settings_list(
     mut commands: Commands,
     settings: Res<AppSettings>,
     ref_hz_list: Query<Entity, With<ReferenceHzList>>,
-    tuning_list: Query<Entity, With<TuningSystemList>>,
-    note_list: Query<Entity, With<NoteSystemList>>,
-    just_added: Query<
-        Entity,
-        Or<(
-            Added<ReferenceHzList>,
-            Added<TuningSystemList>,
-            Added<NoteSystemList>,
-        )>,
-    >,
+    tuning_list: Query<Entity, With<TuningKindList>>,
+    just_added: Query<Entity, Or<(Added<ReferenceHzList>, Added<TuningKindList>)>>,
 ) {
     if !settings.is_changed() && just_added.is_empty() {
         return;
@@ -194,30 +173,13 @@ pub fn rebuild_settings_list(
 
     if let Ok(list_entity) = tuning_list.single() {
         commands.entity(list_entity).despawn_related::<Children>();
-        for sys in [TuningSystem::TwelveTET, TuningSystem::HindustaniJust] {
+        for kind in [TuningKind::TwelveTet, TuningKind::HindustaniJust] {
             spawn_choice_row(
                 &mut commands,
                 list_entity,
-                TuningSystemRow(sys),
-                tuning_system_label(sys),
-                settings.tuning_system == sys,
-            );
-        }
-    }
-
-    if let Ok(list_entity) = note_list.single() {
-        commands.entity(list_entity).despawn_related::<Children>();
-        for sys in [
-            NoteSystem::Western,
-            NoteSystem::SargamLatin,
-            NoteSystem::SargamDevanagari,
-        ] {
-            spawn_choice_row(
-                &mut commands,
-                list_entity,
-                NoteSystemRow(sys),
-                note_system_label(sys),
-                settings.note_system == sys,
+                TuningKindRow(kind),
+                tuning_kind_label(kind),
+                settings.tuning_kind == kind,
             );
         }
     }
@@ -253,18 +215,10 @@ pub fn rebuild_master_rows(
     spawn_master_row(
         &mut commands,
         pane_entity,
-        MusicSelection::TuningSystem,
+        MusicSelection::TuningKind,
         "Tuning system",
-        tuning_system_label(settings.tuning_system),
-        *selection == MusicSelection::TuningSystem,
-    );
-    spawn_master_row(
-        &mut commands,
-        pane_entity,
-        MusicSelection::NoteSystem,
-        "Note system",
-        note_system_label(settings.note_system),
-        *selection == MusicSelection::NoteSystem,
+        tuning_kind_label(settings.tuning_kind),
+        *selection == MusicSelection::TuningKind,
     );
 }
 
@@ -331,37 +285,14 @@ fn spawn_master_row(
 pub fn sync_music_detail(
     selection: Res<MusicSelection>,
     mut commands: Commands,
-    mut ref_hz: Query<
-        &mut Node,
-        (
-            With<ReferenceHzList>,
-            Without<TuningSystemList>,
-            Without<NoteSystemList>,
-        ),
-    >,
-    mut tuning: Query<
-        &mut Node,
-        (
-            With<TuningSystemList>,
-            Without<ReferenceHzList>,
-            Without<NoteSystemList>,
-        ),
-    >,
-    mut note: Query<
-        &mut Node,
-        (
-            With<NoteSystemList>,
-            Without<ReferenceHzList>,
-            Without<TuningSystemList>,
-        ),
-    >,
+    mut ref_hz: Query<&mut Node, (With<ReferenceHzList>, Without<TuningKindList>)>,
+    mut tuning: Query<&mut Node, (With<TuningKindList>, Without<ReferenceHzList>)>,
     mut rows: Query<(Entity, &MusicMasterRow, &mut BackgroundColor)>,
     just_added: Query<
         Entity,
         Or<(
             Added<ReferenceHzList>,
-            Added<TuningSystemList>,
-            Added<NoteSystemList>,
+            Added<TuningKindList>,
             Added<MusicMasterRow>,
         )>,
     >,
@@ -385,10 +316,7 @@ pub fn sync_music_detail(
         set_display(&mut n, *selection == MusicSelection::ReferenceHz);
     }
     if let Ok(mut n) = tuning.single_mut() {
-        set_display(&mut n, *selection == MusicSelection::TuningSystem);
-    }
-    if let Ok(mut n) = note.single_mut() {
-        set_display(&mut n, *selection == MusicSelection::NoteSystem);
+        set_display(&mut n, *selection == MusicSelection::TuningKind);
     }
 
     for (entity, row, mut bg) in rows.iter_mut() {
@@ -422,18 +350,10 @@ fn reference_hz_value_label(hz: f32) -> String {
     format!("A = {hz:.1} Hz")
 }
 
-fn tuning_system_label(s: TuningSystem) -> &'static str {
+fn tuning_kind_label(s: TuningKind) -> &'static str {
     match s {
-        TuningSystem::TwelveTET => "12-tone equal temperament",
-        TuningSystem::HindustaniJust => "Hindustani Just intonation",
-    }
-}
-
-fn note_system_label(s: NoteSystem) -> &'static str {
-    match s {
-        NoteSystem::Western => "Western (C, D, E, ...)",
-        NoteSystem::SargamLatin => "Sargam (Sa, Re, Ga, ...)",
-        NoteSystem::SargamDevanagari => "Sargam Devanagari (स, रे, ग, ...)",
+        TuningKind::TwelveTet => "12-tone equal temperament",
+        TuningKind::HindustaniJust => "Hindustani Just intonation",
     }
 }
 
@@ -448,24 +368,13 @@ pub fn handle_reference_hz_click(
     }
 }
 
-pub fn handle_tuning_system_click(
-    q: Query<(&Interaction, &TuningSystemRow), (Changed<Interaction>, With<Button>)>,
+pub fn handle_tuning_kind_click(
+    q: Query<(&Interaction, &TuningKindRow), (Changed<Interaction>, With<Button>)>,
     mut settings: ResMut<AppSettings>,
 ) {
     for (interaction, row) in q.iter() {
         if *interaction == Interaction::Pressed {
-            settings.tuning_system = row.0;
-        }
-    }
-}
-
-pub fn handle_note_system_click(
-    q: Query<(&Interaction, &NoteSystemRow), (Changed<Interaction>, With<Button>)>,
-    mut settings: ResMut<AppSettings>,
-) {
-    for (interaction, row) in q.iter() {
-        if *interaction == Interaction::Pressed {
-            settings.note_system = row.0;
+            settings.tuning_kind = row.0;
         }
     }
 }

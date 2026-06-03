@@ -67,6 +67,12 @@ pub fn drain_events(coach: NonSend<Coach>, mut known: ResMut<KnownDevices>) {
                 warn!("events dropped: {count}");
             }
             CoachEvent::DefaultInputChanged { .. } => {}
+            // The musical frame was (re)configured. The HUD reads the
+            // published `music_info` snapshot directly each frame, so
+            // there's nothing to fold here — just trace it.
+            CoachEvent::SessionConfigured { tuning, tonality } => {
+                info!("session configured: {tuning:?} / {tonality:?}");
+            }
         }
     }
 }

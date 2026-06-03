@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use coach_game::coach::Coach;
 use domain_ports::app_coach::{
-    AppCoach, AudioInfo, CoachEvent, Command, FeatureSnapshot, ShutdownResult,
+    AppCoach, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo, ShutdownResult,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +22,7 @@ pub struct FakeCoachState {
     pub pending_events: Vec<CoachEvent>,
     pub latest_features: Option<FeatureSnapshot>,
     pub audio_info: Option<AudioInfo>,
+    pub music_info: Option<MusicInfo>,
     pub shutdown_calls: u32,
 }
 
@@ -51,6 +52,10 @@ impl AppCoach for FakeCoach {
 
     fn audio_info(&self) -> Option<AudioInfo> {
         self.inner.lock().unwrap().audio_info.clone()
+    }
+
+    fn music_info(&self) -> Option<MusicInfo> {
+        self.inner.lock().unwrap().music_info
     }
 }
 

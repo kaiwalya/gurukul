@@ -44,6 +44,7 @@ pub fn build_app(app: &mut App) {
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
         .init_resource::<game::LastFeatureTs>()
+        .init_resource::<game::hud::LastMusicInfo>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
@@ -92,8 +93,7 @@ pub fn build_app(app: &mut App) {
                 menu::settings::handle_row_click,
                 menu::settings::handle_master_row_click,
                 menu::settings::handle_reference_hz_click,
-                menu::settings::handle_tuning_system_click,
-                menu::settings::handle_note_system_click,
+                menu::settings::handle_tuning_kind_click,
                 menu::settings::handle_back,
             )
                 .run_if(in_state(AppState::Settings)),

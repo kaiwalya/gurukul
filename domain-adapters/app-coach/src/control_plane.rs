@@ -13,8 +13,8 @@ use crate::inspect::InspectShared;
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoachDeps, AudioConfig, AudioInfo, CoachEvent, Command, FeatureSnapshot, SessionErrorKind,
-    SessionState,
+    AppCoachDeps, AudioConfig, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo,
+    SessionErrorKind, SessionState,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
@@ -50,6 +50,13 @@ pub(crate) struct ControlPlane {
     /// the next transition out, so a head reacting to the state event
     /// observes coherent info.
     audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
+    /// The sticky snapshot face of [`Command::ConfigureSession`]: the
+    /// current [`MusicInfo`] (tuning spec + tonality), `None` until the
+    /// first configure. Written *before* emitting
+    /// [`CoachEvent::SessionConfigured`] so a head reacting to the event
+    /// reads coherent state. Never cleared by start/stop — the musical
+    /// config is decoupled from the audio lifecycle.
+    music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
     /// Shared state behind the [`EngineInspect`](domain_ports::engine_inspect::EngineInspect)
     /// port: selection slot + tap snapshot publisher + node-port list.
     /// Cloned and handed to each new data-plane worker.
@@ -82,6 +89,7 @@ impl ControlPlane {
         rx: mpsc::Receiver<Input>,
         feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
         audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
+        music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
         inspect: Arc<InspectShared>,
     ) -> Self {
         Self {
@@ -90,6 +98,7 @@ impl ControlPlane {
             rx,
             feature_publisher,
             audio_info_publisher,
+            music_info_publisher,
             inspect,
             state: SessionState::Idle,
             session_model: None,
@@ -135,8 +144,10 @@ impl ControlPlane {
         self.inspect.clear();
         // The musical frame of reference is decoupled from the audio
         // lifecycle, so it survives start/stop — but shutdown is the end
-        // of the coach, so drop it here.
+        // of the coach, so drop it here (both the held model and the
+        // sticky snapshot, so a post-shutdown poll sees `None`).
         self.session_model = None;
+        self.music_info_publisher.store(Arc::new(None));
         tel_info!(
             &*self.deps.telemetry,
             "app-coach: control plane down",
@@ -319,6 +330,18 @@ impl ControlPlane {
             tonic = tonality.tonic.offset as u32,
         );
         self.session_model = Some((tuning, tonality));
+        // Publish the snapshot *before* the event so a head reacting to
+        // `SessionConfigured` reads a coherent `music_info()`. The
+        // snapshot carries the flat `TuningSpec` (not the built
+        // `Tuning`), mirroring the event payload.
+        self.music_info_publisher.store(Arc::new(Some(MusicInfo {
+            tuning: spec,
+            tonality,
+        })));
+        self.push_event(CoachEvent::SessionConfigured {
+            tuning: spec,
+            tonality,
+        });
     }
 
     /// Drop the capture (stops RT callback, drops the ring producer),

@@ -91,11 +91,18 @@ pub enum Command {
     /// `tonality` as the reference for judging pitch.
     ///
     /// **Decoupled from the audio lifecycle.** Valid in *any* state and
-    /// causes **no** [`SessionState`] change and **no** event: the
-    /// musical lifecycle (configure) is independent of the audio
-    /// lifecycle (start/stop). Reconfiguring mid-session just swaps the
-    /// frame of reference. Heads may configure before, after, or without
-    /// ever starting audio.
+    /// causes **no** [`SessionState`] change: the musical lifecycle
+    /// (configure) is independent of the audio lifecycle (start/stop).
+    /// Reconfiguring mid-session just swaps the frame of reference.
+    /// Heads may configure before, after, or without ever starting
+    /// audio.
+    ///
+    /// **Published as state.** Each configure updates the sticky
+    /// [`MusicInfo`] snapshot ([`AppCoach::music_info`]) *and* emits a
+    /// [`CoachEvent::SessionConfigured`] carrying the new config — the
+    /// snapshot/event pair of one transition (snapshot written first).
+    /// A head can read current state via the snapshot or fold the event
+    /// stream to reconstruct it; the two never drift.
     ConfigureSession {
         tuning: TuningSpec,
         tonality: Tonality,
@@ -157,6 +164,31 @@ pub struct AudioConfig {
     pub buffer_frames: Option<u32>,
 }
 
+/// The coach's current *musical* frame of reference — the snapshot
+/// face of [`Command::ConfigureSession`].
+///
+/// This is the materialized read-cache of the musical config: a head
+/// that just wants "what tuning + scale is the coach holding right
+/// now?" reads [`AppCoach::music_info`]; a head doing event-sourcing
+/// folds the [`CoachEvent::SessionConfigured`] stream to the same
+/// value. Both are written in the same place (the configure handler),
+/// snapshot before event, so they cannot drift.
+///
+/// **Lifecycle:** `None` only before the first `ConfigureSession`.
+/// Once set it is **sticky** — it persists across start/stop/error,
+/// because the musical configuration is decoupled from the audio
+/// lifecycle (unlike [`AudioInfo`], which clears on stop). Each
+/// configure overwrites it last-write-wins.
+///
+/// Carries [`TuningSpec`] (flat/`Copy`), not the `Vec`-bearing
+/// [`Tuning`](crate::music::Tuning): the snapshot stays FFI-friendly,
+/// and a head wanting Hz rebuilds the `Tuning` from the spec itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MusicInfo {
+    pub tuning: TuningSpec,
+    pub tonality: Tonality,
+}
+
 // ---------------------------------------------------------------------
 // Events (coach → head)
 // ---------------------------------------------------------------------
@@ -170,6 +202,17 @@ pub enum CoachEvent {
 
     /// The session state machine moved.
     SessionStateChanged { new_state: SessionState },
+
+    /// The *musical* frame of reference was (re)configured via
+    /// [`Command::ConfigureSession`]. Carries the full new
+    /// configuration so a head can update from the payload alone —
+    /// this is the log entry whose fold reconstructs
+    /// [`AppCoach::music_info`]. Emitted on *every* configure (not just
+    /// the first), independent of the audio lifecycle.
+    SessionConfigured {
+        tuning: TuningSpec,
+        tonality: Tonality,
+    },
 
     /// Accompanies an `→ Error` transition with detail. `kind` lets
     /// heads branch / localize; `reason` is free-form for logs.
@@ -348,4 +391,16 @@ pub trait AppCoach {
     /// sample-rate-dependent constant (scope window math, downsampling,
     /// envelope step size). Cheap enough to call every frame.
     fn audio_info(&self) -> Option<AudioInfo>;
+
+    /// The coach's current musical frame of reference (tuning +
+    /// tonality), or `None` before the first
+    /// [`Command::ConfigureSession`].
+    ///
+    /// Unlike [`audio_info`](Self::audio_info), this is **sticky**: it
+    /// survives start/stop/error because the musical config is
+    /// decoupled from the audio lifecycle. See [`MusicInfo`].
+    ///
+    /// Non-blocking, lock-free. Heads paint the dial / HUD off this
+    /// every frame.
+    fn music_info(&self) -> Option<MusicInfo>;
 }

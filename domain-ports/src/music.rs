@@ -31,6 +31,44 @@
 //!   *math* works in. The bridge between the two is
 //!   [`tuning_view::slot_of`].
 //!
+//! # The gauge law (why the math has the shape it does)
+//!
+//! Think of these three spaces as **coordinate frames on one underlying
+//! log-frequency line** (the physics analogy is exact — frames + gauge):
+//!
+//! - **Key space** ([`InstrumentKey::offset`]) is *affine*: positions
+//!   and their differences are meaningful, but the **origin is a gauge**
+//!   — a pure labelling choice. "offset 0 = C" is a convention, not a
+//!   fact. Shift *every* offset (keys, roots, tonics) by the same
+//!   constant and **no observable changes** — we verified this: moving
+//!   the A=440 root from offset 9 to 21 (and the tonic 0→12) left the
+//!   resolved Hz table byte-for-byte identical.
+//! - **Hz space** is the only frame with a true physical anchor
+//!   (`root_note_hz`). Frequencies and frequency *ratios* are
+//!   invariants.
+//!
+//! **The law: no logic may depend on a gauge.** Concretely: nothing may
+//! depend on an *absolute* offset — only on **differences** (intervals),
+//! because a difference is what survives a gauge shift (`(a+c) − (b+c) =
+//! a − b`). Anything that reads a bare `key.offset` and branches on its
+//! value is treating a convention as physical, and *will* break when the
+//! origin is re-chosen.
+//!
+//! **Why this is structural, not a style note.** The transform
+//! `key → Hz` is *forced* to factor through `delta = key − root`:
+//! subtract to the invariant on the first line, then compute only with
+//! invariants, and gauge-dependence becomes **unrepresentable** rather
+//! than merely avoided. The historical octave-wrap bug was exactly a
+//! gauge leak — it derived the octave from `key.octave() −
+//! root.octave()` (two separately gauge-dependent quantities that didn't
+//! cancel) instead of one `divmod` of the single invariant `delta`. See
+//! [`tuning_view::hz`]: slot and octave are *both* projections of the
+//! same `delta`, which is what keeps them consistent.
+//!
+//! Practical residue: keep all frame-aware arithmetic inside
+//! [`tuning_view`] (the one module licensed to know the frames);
+//! everyone else passes [`InstrumentKey`]s around opaquely.
+//!
 //! # FFI surface
 //!
 //! [`InstrumentKey`], [`TuningKind`], [`Tonality`], and [`TuningSpec`]
@@ -80,8 +118,13 @@ impl InstrumentKey {
 }
 
 /// A key on a 12-key keyboard (harmonium / piano) at the given offset.
-/// Stamps `octave_size = 12`. `harmonium_key(0)` is Safed-1 / C;
-/// `harmonium_key(9)` is the A a tuner anchors "A=440" on.
+/// Stamps `octave_size = 12`. The line is **C-origin**: offset 0 is C,
+/// counting up in semitones (C=0, C♯=1, … A=9, B=11), with the octave
+/// in the high bits (`offset / 12`). So `harmonium_key(0)` is Safed-1 /
+/// C in octave 0; `harmonium_key(9)` is the A in octave 0; the A a
+/// tuner anchors "A=440" on is conventionally placed in octave 1,
+/// `harmonium_key(21)` (21 = 9 + 12), so song tonics an octave below it
+/// land in the singing register rather than the lowest octave.
 pub fn harmonium_key(offset: u8) -> InstrumentKey {
     InstrumentKey {
         offset,
@@ -276,22 +319,43 @@ impl Tuning {
 pub mod tuning_view {
     use super::{InstrumentKey, Tuning};
 
-    /// Keyboard space → slot space. The one bridge between the two
-    /// spaces. Folds to one octave (the slot pattern repeats every
-    /// octave), so the result is always `0..N`.
-    pub fn slot_of(t: &Tuning, key: InstrumentKey) -> usize {
-        let n = t.slots.len() as i32;
-        ((key.offset as i32 - t.root.offset as i32).rem_euclid(n)) as usize
+    /// Signed interval from the tuning's root to `key`, in keys. The one
+    /// quantity both [`slot_of`] and [`hz`] derive from — computing slot
+    /// and octave from the *same* delta is what keeps them consistent
+    /// (split origins were the cause of the octave-wrap bug). Panics (in
+    /// debug) on an `octave_size` mismatch: a key from a different
+    /// keyboard (12-key vs 22-shruti) has no meaning against this
+    /// tuning, and silently folding it would hide the error.
+    fn delta(t: &Tuning, key: InstrumentKey) -> i32 {
+        debug_assert_eq!(
+            key.octave_size, t.root.octave_size,
+            "key octave_size {} doesn't match tuning root {}",
+            key.octave_size, t.root.octave_size
+        );
+        key.offset as i32 - t.root.offset as i32
     }
 
-    /// Hz of any physical key, at any octave. `slots` holds one octave;
-    /// the octave the key sits in is a power-of-two multiplier applied
-    /// after the fold. The octave is measured *relative to the root's
-    /// octave* — there is no requirement that the root sit in octave 0;
-    /// this form is correct for any `root.octave()`.
+    /// Keyboard space → slot space. Folds the root-relative interval to
+    /// one octave (the slot pattern repeats every octave), so the result
+    /// is always `0..N`.
+    pub fn slot_of(t: &Tuning, key: InstrumentKey) -> usize {
+        let n = t.slots.len() as i32;
+        delta(t, key).rem_euclid(n) as usize
+    }
+
+    /// Hz of any key, at any octave, **relative to the root**. `slots`
+    /// holds one octave built up from the root note (`slots[0] ==
+    /// root_note_hz`); a key `delta` semitones from the root reads
+    /// `slots[delta mod N] × 2^(delta div N)`. The slot and the octave
+    /// multiplier come from the *same* `delta`, so a key below the root
+    /// lands an octave down (negative `div_euclid`) rather than wrapping
+    /// up into the root's octave — walking a scale from a tonic below
+    /// the root yields an ascending line, no post-hoc octave-lifting
+    /// needed.
     pub fn hz(t: &Tuning, key: InstrumentKey) -> f32 {
-        let octave = key.octave() - t.root.octave();
-        t.slots[slot_of(t, key)] * 2f32.powi(octave)
+        let n = t.slots.len() as i32;
+        let d = delta(t, key);
+        t.slots[d.rem_euclid(n) as usize] * 2f32.powi(d.div_euclid(n))
     }
 }
 
@@ -381,21 +445,25 @@ mod tests {
 
     #[test]
     fn sa_on_d_of_an_a_tuned_harmonium() {
-        // Harmonium tuned from A (root offset 9), 12-TET, A=440.
+        // Harmonium tuned from A in octave 1 (offset 21), 12-TET, A=440.
         let tuning = Tuning::new(TuningSpec {
             root_note_hz: 440.0,
             kind: TuningKind::TwelveTet,
-            root: harmonium_key(9),
+            root: harmonium_key(21),
         });
-        // Singer puts Sa on D (offset 2).
-        let sa = harmonium_key(2);
-        // Keyboard → slot: (2 - 9).rem_euclid(12) = 5.
+        // Singer puts Sa on D in octave 1 (offset 14).
+        let sa = harmonium_key(14);
+        // Keyboard → slot: (14 - 21).rem_euclid(12) = 5.
         assert_eq!(tuning_view::slot_of(&tuning, sa), 5);
-        // Slot → Hz: 440 × 2^(5/12) ≈ 587.3 Hz (D5).
+        // Slot → Hz: D sits *below* A in the same octave, so the
+        // interval is negative (delta = -7 → octave -1): 440 × 2^(5/12)
+        // × 2^-1 ≈ 293.7 Hz. The octave comes from the same delta as the
+        // slot, so a key below the root lands an octave down rather than
+        // wrapping up above A.
         let hz = tuning_view::hz(&tuning, sa);
         assert!(
-            (hz - 587.33).abs() < 0.1,
-            "Sa should be ~587.3 Hz, got {hz}"
+            (hz - 293.66).abs() < 0.1,
+            "Sa should be ~293.7 Hz, got {hz}"
         );
     }
 
@@ -412,6 +480,27 @@ mod tests {
             octave_size: 12,
         }; // octave 1, same fold
         assert!((tuning_view::hz(&tuning, c5) - 2.0 * tuning_view::hz(&tuning, c4)).abs() < 1e-2);
+    }
+
+    #[test]
+    fn scale_below_root_ascends_naturally() {
+        // 12-TET rooted at A=440. Walk Bilawal degrees from Sa on C
+        // (key 0): 0 2 4 5 7 9 11 — all below A on the keyboard. Because
+        // the octave comes from the same (negative) delta as the slot,
+        // each key reads in octave -1 until it reaches A, so the line
+        // climbs C4→B4 with no octave-lifting hack.
+        let tuning = Tuning::new(TuningSpec {
+            root_note_hz: 440.0,
+            kind: TuningKind::TwelveTet,
+            root: harmonium_key(9),
+        });
+        let line: Vec<i32> = [0u8, 2, 4, 5, 7, 9, 11]
+            .iter()
+            .map(|&d| tuning_view::hz(&tuning, harmonium_key(d)).round() as i32)
+            .collect();
+        // Strictly non-decreasing, and a C-major octave from C4.
+        assert!(line.windows(2).all(|w| w[1] >= w[0]), "{line:?}");
+        assert_eq!(line, vec![262, 294, 330, 349, 392, 440, 494]);
     }
 
     // --- FFI surface: the crossing types are Copy ---------------------

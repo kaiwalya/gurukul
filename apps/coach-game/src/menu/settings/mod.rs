@@ -31,10 +31,9 @@ use domain_ports::app_coach::Command;
 // internal split.
 pub use audio::{handle_row_click, rebuild_device_list, DeviceList, DeviceRow};
 pub use music::{
-    handle_master_row_click, handle_note_system_click, handle_reference_hz_click,
-    handle_tuning_system_click, rebuild_master_rows, rebuild_settings_list, sync_music_detail,
-    MusicMasterRow, MusicSelection, NoteSystemList, NoteSystemRow, ReferenceHzList, ReferenceHzRow,
-    TuningSystemList, TuningSystemRow,
+    handle_master_row_click, handle_reference_hz_click, handle_tuning_kind_click,
+    rebuild_master_rows, rebuild_settings_list, sync_music_detail, MusicMasterRow, MusicSelection,
+    ReferenceHzList, ReferenceHzRow, TuningKindList, TuningKindRow,
 };
 
 /// Which tab is active on the Settings screen. Pure UI state — lives

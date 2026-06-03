@@ -120,15 +120,18 @@ enum Command {
 - `ConfigureSession`: sets the *musical* frame of reference (how the
   instrument is tuned + the scale the singer is in). **Decoupled from
   the audio lifecycle** — valid in any state, causes **no**
-  `SessionState` change and emits **no** event. The coach builds a
-  `Tuning` from the spec and holds it with the `Tonality`. Today nothing
-  downstream consumes it (pitch *scoring* against the scale is a later
-  phase); the seam exists so scoring can plug in without re-plumbing the
-  boundary. Bad payloads are a `debug_assert` today (only code builds
-  them); this graduates to a runtime reject — keep the prior model — when
-  an untrusted picker can reach it. The musical types
-  (`InstrumentKey`, `TuningKind`, `Tonality`, `TuningSpec`) live in
-  `domain-ports::music`; see `docs/MUSIC_MODEL.md`.
+  `SessionState` change. The coach builds a `Tuning` from the spec,
+  holds it with the `Tonality`, and on every configure publishes the
+  **event-sourcing pair** (§4a): the `music_info()` snapshot (written
+  first) and a `SessionConfigured` event (the log entry). Pitch
+  *scoring* against the scale is a later phase; the seam — and now a
+  recoverable record of the frame — exists so scoring (and any head)
+  can plug in without re-plumbing the boundary. Bad payloads are a
+  `debug_assert` today (only code builds them); this graduates to a
+  runtime reject — keep the prior model — when an untrusted picker can
+  reach it. The musical types (`InstrumentKey`, `TuningKind`,
+  `Tonality`, `TuningSpec`, `MusicInfo`) live in `domain-ports::music`
+  / `domain-ports::app_coach`; see `docs/MUSIC_MODEL.md`.
 
 **Deferred to Phase 2:** `SetPitchEnabled` (no pitch yet).
 
@@ -147,6 +150,7 @@ v1 set:
 enum CoachEvent {
     DevicesListed { devices: Vec<InputDevice> },
     SessionStateChanged { new_state: SessionState },
+    SessionConfigured { tuning: TuningSpec, tonality: Tonality },
     SessionError { kind: SessionErrorKind, reason: String },
     DefaultInputChanged { new_default: Option<DeviceId> },
     EventsDropped { count: u32 },
@@ -171,11 +175,40 @@ enum SessionErrorKind {
   emitter for this is a TODO — there is no device-listener port yet,
   and we will not block v1 on adding one. The variant exists on the
   enum so heads can match on it exhaustively; v1 just never emits it.
+- `SessionConfigured` is emitted on *every* `ConfigureSession` (not just
+  the first), carrying the exact `tuning` + `tonality` that were applied.
+  It is the **log entry** half of the event-sourcing pair (§4a) —
+  decoupled from the audio lifecycle, so it fires whether or not a
+  session is running.
 - `EventsDropped` surfaces backpressure (see §2). One event per
   drop-burst, not one per dropped event.
 
 **`RingOverrun` is Phase 2** (no data plane in v1, so no ring, so no
 overrun to surface).
+
+### 4a. The musical event-sourcing pair
+
+`ConfigureSession` is the one command that mutates *musical* state, and
+it does so through a snapshot+event pair, mirroring the
+`audio_info` / `SessionStateChanged` pattern:
+
+- **Snapshot — `music_info() -> Option<MusicInfo>`.** A lock-free
+  read-cache (`ArcSwap`) holding the current `MusicInfo { tuning:
+  TuningSpec, tonality: Tonality }`. Written **first**, before the event,
+  so a head reacting to the event always reads a coherent snapshot.
+  **Sticky**: `None` only before the first `ConfigureSession`; it
+  survives session start/stop (unlike `audio_info`, which clears on stop)
+  and is cleared only on shutdown. This is the "current musical frame"
+  any head can poll at any time without replaying events.
+- **Event — `SessionConfigured { tuning, tonality }`.** The append-only
+  log entry. Folding the event stream reconstructs exactly what
+  `music_info()` returns — the snapshot is a materialized view of the
+  log. Emitted on every configure.
+
+Why both: the snapshot is for *state* (what is the frame right now),
+the event is for *reactions* (the frame just changed — repaint). A head
+that only polls uses the snapshot; a head that reacts uses the event and
+trusts the snapshot is already coherent when it does.
 
 **`SessionErrorKind::WorkerPanic` is Phase 2** (no pitch worker in v1).
 

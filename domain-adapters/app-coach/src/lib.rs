@@ -63,7 +63,8 @@ use shutdown::join_with_timeout;
 
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, AudioInfo, CoachEvent, Command, FeatureSnapshot, ShutdownResult,
+    AppCoach, AppCoachDeps, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo,
+    ShutdownResult,
 };
 use domain_ports::engine_inspect::EngineInspect;
 use std::sync::mpsc::{self, Sender};
@@ -103,6 +104,9 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let audio_info_publisher_for_thread = Arc::clone(&audio_info_publisher);
+    let music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    let music_info_publisher_for_thread = Arc::clone(&music_info_publisher);
     let inspect_shared = InspectShared::new();
     let inspect_for_thread = Arc::clone(&inspect_shared);
 
@@ -115,6 +119,7 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
                 rx_cmd,
                 feature_publisher_for_thread,
                 audio_info_publisher_for_thread,
+                music_info_publisher_for_thread,
                 inspect_for_thread,
             )
             .run();
@@ -126,6 +131,7 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
         outbound,
         feature_publisher,
         audio_info_publisher,
+        music_info_publisher,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
     };
@@ -155,6 +161,11 @@ struct CoachImpl {
     /// and cleared before the next transition out — see [`AudioInfo`]
     /// for the ordering contract.
     audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
+    /// Lock-free sticky snapshot of the musical frame of reference.
+    /// Written by the control plane in the configure handler (before
+    /// the `SessionConfigured` event); survives start/stop. See
+    /// [`MusicInfo`].
+    music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
 }
@@ -202,6 +213,10 @@ impl AppCoach for CoachImpl {
 
     fn audio_info(&self) -> Option<AudioInfo> {
         (**self.audio_info_publisher.load()).clone()
+    }
+
+    fn music_info(&self) -> Option<MusicInfo> {
+        **self.music_info_publisher.load()
     }
 }
 
@@ -490,16 +505,20 @@ mod tests {
     }
 
     #[test]
-    fn configure_in_idle_emits_no_state_change_no_error() {
+    fn configure_in_idle_publishes_snapshot_and_event_no_state_change() {
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
+        // Before any configure, the snapshot is None.
+        assert!(coach.music_info().is_none());
+
         let (tuning, tonality) = bilawal_config();
         coach.send_command(Command::ConfigureSession { tuning, tonality });
 
-        // The configure is silent; sandwich it before a ListDevices and
-        // assert nothing else slipped through.
+        // Configure causes no *audio* state change, but it does emit a
+        // SessionConfigured event. Sandwich it before a ListDevices and
+        // inspect the accumulated events.
         let events = drain_past_list_devices(&coach);
         assert!(
             no_state_changes(&events),
@@ -511,6 +530,18 @@ mod tests {
                 .any(|e| matches!(e, CoachEvent::SessionError { .. })),
             "ConfigureSession must not error",
         );
+        // It DID emit the configure event with the payload we sent.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoachEvent::SessionConfigured { tonality: t, .. } if *t == tonality
+            )),
+            "ConfigureSession must emit SessionConfigured with the new tonality",
+        );
+        // And published the sticky snapshot — readable now, in Idle.
+        let info = coach.music_info().expect("snapshot set after configure");
+        assert_eq!(info.tonality, tonality);
+        assert_eq!(info.tuning, tuning);
         // It also must not have opened any audio device.
         assert_eq!(opens.load(Ordering::SeqCst), 0);
 
@@ -521,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_while_running_keeps_running_no_event() {
+    fn configure_while_running_keeps_running_and_snapshot_is_sticky() {
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -543,12 +574,13 @@ mod tests {
             })
         });
 
-        // Reconfigure mid-session. Decoupled: no transition, no event.
-        let (tuning, tonality) = bilawal_config();
+        // Reconfigure mid-session. Decoupled: no *audio* state change,
+        // but it does emit SessionConfigured + update the snapshot.
+        let (tuning, _) = bilawal_config();
         // A different tonic, to make the swap meaningful.
         let tonality = Tonality {
             tonic: harmonium_key(2), // Sa on D
-            ..tonality
+            ..bilawal_config().1
         };
         coach.send_command(Command::ConfigureSession { tuning, tonality });
 
@@ -557,6 +589,13 @@ mod tests {
             no_state_changes(&events),
             "ConfigureSession while Running must not change session state",
         );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoachEvent::SessionConfigured { tonality: t, .. } if *t == tonality
+            )),
+            "reconfigure must emit SessionConfigured with the new tonic",
+        );
         // Audio was opened exactly once (the start); configure didn't
         // touch the audio lifecycle.
         assert_eq!(opens.load(Ordering::SeqCst), 1);
@@ -564,6 +603,8 @@ mod tests {
             coach.audio_info().is_some(),
             "still Running after reconfigure",
         );
+        // Snapshot reflects the latest configure.
+        assert_eq!(coach.music_info().unwrap().tonality, tonality);
 
         coach.send_command(Command::StopSession);
         let _ = poll_until(&coach, |evs| {
@@ -576,6 +617,15 @@ mod tests {
                 )
             })
         });
+
+        // Sticky: the musical snapshot survives the audio stop, unlike
+        // audio_info which clears to None.
+        assert!(coach.audio_info().is_none(), "audio_info clears on stop",);
+        assert_eq!(
+            coach.music_info().unwrap().tonality,
+            tonality,
+            "music_info is sticky across stop",
+        );
 
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),
