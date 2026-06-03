@@ -24,3 +24,12 @@ cargo run -p dsp-cli -- render dsp/worlds/hello.json | dot -Tsvg > graph.svg
 ```
 
 See [`dsp/worlds/hello.json`](dsp/worlds/hello.json) for the canonical demo graph — hand-edit it to rewire, add, or remove nodes.
+
+The Bevy coach app:
+
+```
+./scripts/fetch-assets.sh    # once: fetch the Devanagari UI font (not in git)
+cargo run -p coach-game
+```
+
+Skipping the fetch is harmless — the app falls back to its built-in font, and only the Sargam-Devanagari note labels render as missing glyphs.

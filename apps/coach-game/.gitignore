@@ -1,0 +1,4 @@
+# Dev-time UI assets fetched by `scripts/fetch-assets.sh` (font binaries
+# kept out of git for license/size reasons; the release bundle embeds
+# them properly).
+assets/fonts/

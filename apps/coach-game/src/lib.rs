@@ -8,6 +8,8 @@
 //! exit). Module layout:
 //!
 //! - `coach` — AppCoach handle + always-on event drain.
+//! - `font` — global default-font override (Devanagari support); wired
+//!   in `main`, not `build_app` (tests have no AssetServer).
 //! - `state` — AppState enum + shared resources.
 //! - `ui` — colour palette + per-frame button repaint.
 //! - `menu::main_menu`, `menu::settings` — menu screens.
@@ -17,6 +19,7 @@
 //! schedule against a fake `AppCoach`.
 
 pub mod coach;
+pub mod font;
 pub mod game;
 pub mod menu;
 pub mod state;

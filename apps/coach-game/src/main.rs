@@ -3,7 +3,7 @@
 
 use bevy::prelude::*;
 use bevy::window::Window;
-use coach_game::{build_app, coach};
+use coach_game::{build_app, coach, font};
 
 fn main() {
     let mut app = App::new();
@@ -14,7 +14,10 @@ fn main() {
         }),
         ..default()
     }));
-    app.add_systems(Startup, (spawn_camera, coach::spawn_coach));
+    app.add_systems(Startup, (spawn_camera, coach::spawn_coach, font::load));
+    // Promote the Devanagari font to the default slot once it loads.
+    // Runs every frame until the asset lands, then removes its marker.
+    app.add_systems(Update, font::promote_to_default);
     build_app(&mut app);
     app.run();
 }
