@@ -112,6 +112,7 @@ pub fn build_app(app: &mut App) {
                 game::log_features,
                 game::handle_esc_in_game,
                 game::dial::update_from_features,
+                game::dial::repaint_slots,
                 game::hud::refresh,
             )
                 // Read this frame's republished resources, not last

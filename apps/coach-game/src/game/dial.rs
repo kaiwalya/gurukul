@@ -1,22 +1,23 @@
 //! InGame dial: a 12-position note dial with C as the root, tracking
 //! the coach's live `f0` as the primary needle.
 //!
-//! Two tunings are available (see [`tuning_12tet`] and
-//! [`tuning_hindustani_just`]); the active one is selected at the call
-//! site in [`spawn`]. The needle math ([`angle_from_f0`]) is the same
-//! for both — the needle just shows "where on the log-frequency circle
-//! is this Hz, relative to C". The tunings differ only in *where the
-//! 12 slots sit* on that circle (the targets). Switching tuning moves
+//! The tuning is **not** chosen here — the dial spawns empty and paints
+//! its slots from [`MusicInfoRes`], the read model the coach publishes on
+//! `ConfigureSession` (the same snapshot the HUD reads). So the slots
+//! reflect the singer's *real* tuning + tonality, not a hardcoded
+//! 12-TET/C default. The needle math ([`angle_from_f0`]) is
+//! tuning-independent — the needle just shows "where on the log-frequency
+//! circle is this Hz, relative to C". The tuning differs only in *where
+//! the 12 slots sit* on that circle (the targets). Switching tuning moves
 //! the targets the needle is judged against, not the needle itself.
 //!
-//! Slot *positions* come from the tuning (12-TET or Hindustani Just);
-//! slot *active/inactive* comes from [`SongTonality`] — its scale
-//! intervals, walked from the tonic, pick out which slots are in the
-//! current scale. Default scale is Bilawal on Safed-1, so 7 of 12 slots
-//! render highlighted. Voiced → one primary needle pointing at the
-//! detected pitch. Unvoiced → no needle (`needles.is_empty()`), which
-//! the widget also reads as "no current slot". No smoothing — raw `f0`
-//! straight from the feature stream.
+//! Slot *positions* come from the tuning's [`TuningKind`] (12-TET or
+//! Hindustani Just); slot *active/inactive* comes from the [`Tonality`] —
+//! its key-widths, walked from the tonic, pick out which slots are in the
+//! current scale. Voiced → one primary needle pointing at the detected
+//! pitch. Unvoiced → no needle (`needles.is_empty()`), which the widget
+//! also reads as "no current slot". No smoothing — raw `f0` straight from
+//! the feature stream.
 //!
 //! **The scale mask is a head-side render projection** ([`in_scale_mask`]).
 //! It is tuning-independent — the lit *slots* are the same integer set
@@ -25,8 +26,8 @@
 //! the [`Tonality`]'s intervals itself rather than asking the coach;
 //! see `docs/MUSIC_MODEL.md` § "The mask is a head-side projection".
 
-use crate::coach::LatestFeatures;
-use crate::state::{AppState, SongTonality};
+use crate::coach::{LatestFeatures, MusicInfoRes};
+use crate::state::AppState;
 use crate::widgets::note_dial::{DialScale, DialSlot, DialState, Needle, NeedleStyle};
 use bevy::prelude::*;
 use domain_ports::app_coach::FeatureSnapshot;
@@ -72,16 +73,15 @@ pub fn in_scale_mask(tonality: &Tonality) -> [bool; SLOT_COUNT] {
     mask
 }
 
-/// Spawn the dial as a bottom-right overlay on InGame entry. Twelve
-/// slots laid out for the chosen tuning, the in-scale subset marked
-/// `active = true` by walking [`SongTonality`].
-pub fn spawn(mut commands: Commands, tonality: Res<SongTonality>) {
-    // Pick the tuning here. Flip to `tuning_hindustani_just()` to
-    // render Sa-rooted Just slot positions instead.
-    let slot_angles = tuning_12tet();
-    let mask = in_scale_mask(&tonality.0);
-
-    let slots = slot_angles
+/// Build the 12 dial slots for a tuning + tonality: each slot's angle
+/// from the [`TuningKind`]'s slot positions, each slot's `active` flag
+/// from the [`Tonality`]'s in-scale mask. Pulled out so [`spawn`] (shell)
+/// and [`repaint_slots`] (paint) share one definition, and so it's unit
+/// testable without a Bevy world.
+fn build_slots(kind: TuningKind, tonality: &Tonality) -> Vec<DialSlot> {
+    let angles = slot_angles(kind);
+    let mask = in_scale_mask(tonality);
+    angles
         .into_iter()
         .enumerate()
         .map(|(i, angle)| DialSlot {
@@ -89,8 +89,17 @@ pub fn spawn(mut commands: Commands, tonality: Res<SongTonality>) {
             label: None,
             active: mask[i],
         })
-        .collect();
+        .collect()
+}
 
+/// Spawn the dial as a bottom-right overlay on InGame entry, **empty**.
+/// The slots aren't known yet: the tuning + tonality come from the
+/// coach's read model ([`MusicInfoRes`]), which may not have landed on the
+/// frame the dial spawns. [`repaint_slots`] fills them in as soon as the
+/// snapshot is available (and again whenever it changes). Until then the
+/// dial renders as a bare ring with no slots — honest absence, mirroring
+/// the HUD's `—` placeholder.
+pub fn spawn(mut commands: Commands) {
     commands.spawn((
         DespawnOnExit(AppState::InGame),
         InGameDial,
@@ -102,9 +111,33 @@ pub fn spawn(mut commands: Commands, tonality: Res<SongTonality>) {
             height: px(324),
             ..default()
         },
-        DialScale { slots },
+        DialScale { slots: Vec::new() },
         DialState::default(),
     ));
+}
+
+/// Paint the dial's slots from the [`MusicInfoRes`] read model. Writes a
+/// fresh [`DialScale`] (which the widget's `rebuild_slots` repaints on via
+/// `Changed<DialScale>`) when either:
+///
+/// - the snapshot just changed (`music.is_changed()` — a new
+///   `ConfigureSession` round-tripped through the coach), or
+/// - the dial still has no slots (freshly spawned this InGame visit while
+///   the resource already held a `Some` from a prior session — no resource
+///   change fires, so we detect the empty shell and fill it).
+///
+/// No `Some` snapshot yet → leave the dial empty; nothing to draw.
+pub fn repaint_slots(music: Res<MusicInfoRes>, mut dial: Query<&mut DialScale, With<InGameDial>>) {
+    let Some(info) = music.0 else {
+        return;
+    };
+    let Ok(mut scale) = dial.single_mut() else {
+        return;
+    };
+    if !music.is_changed() && !scale.slots.is_empty() {
+        return;
+    }
+    scale.slots = build_slots(info.tuning.kind, &info.tonality);
 }
 
 /// Each frame, read the latest feature snapshot and update the dial's
@@ -243,6 +276,38 @@ mod tests {
         let high = Tonality::new(harmonium_key(14), &[2, 2, 1, 2, 2, 2, 1]);
         let low = Tonality::new(harmonium_key(2), &[2, 2, 1, 2, 2, 2, 1]);
         assert_eq!(in_scale_mask(&high), in_scale_mask(&low));
+    }
+
+    // --- build_slots (angles from tuning, active from tonality) -------
+
+    #[test]
+    fn build_slots_marks_in_scale_active_and_others_inactive() {
+        // Bilawal on Safed-1, 12-TET. The active flags must equal the
+        // in-scale mask, and the angles the 12-TET geometry.
+        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let slots = build_slots(TuningKind::TwelveTet, &t);
+        assert_eq!(slots.len(), SLOT_COUNT);
+
+        let mask = in_scale_mask(&t);
+        let angles = tuning_12tet();
+        for (i, slot) in slots.iter().enumerate() {
+            assert_eq!(slot.active, mask[i], "slot {i} active");
+            assert!((slot.angle - angles[i]).abs() < 1e-5, "slot {i} angle");
+            assert!(slot.label.is_none(), "slot {i} label — head is vocab-free");
+        }
+    }
+
+    #[test]
+    fn build_slots_angles_follow_the_tuning_kind() {
+        // Just intonation moves the slot angles (Ga ~14 cents flat) while
+        // the active set — a pure tonality projection — stays put.
+        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let tet = build_slots(TuningKind::TwelveTet, &t);
+        let just = build_slots(TuningKind::HindustaniJust, &t);
+        assert_ne!(tet[4].angle, just[4].angle, "Ga angle must differ");
+        for i in 0..SLOT_COUNT {
+            assert_eq!(tet[i].active, just[i].active, "slot {i} active set");
+        }
     }
 
     // --- angle_from_f0 -------------------------------------------------
