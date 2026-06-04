@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 use domain_ports::audio_devices::{DeviceId, InputDevice};
-use domain_ports::music::{harmonium_key, Tonality, TuningKind, TuningSpec};
+use domain_ports::music::{harmonium_key, ScaleShape, Tonality, TuningKind, TuningSpec};
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[states(scoped_entities)]
@@ -40,6 +40,15 @@ pub struct SelectedDevice(pub Option<DeviceId>);
 /// and renders one row per device.
 #[derive(Resource, Default)]
 pub struct KnownDevices(pub Vec<InputDevice>);
+
+/// The most recent scale catalogue from [`CoachEvent::ScalesListed`].
+/// Populated by [`drain_events`](crate::coach::drain_events) in response
+/// to [`Command::ListScales`] — the read side of the CQRS split, same
+/// pattern as [`KnownDevices`]. Empty until the first `ListScales` reply
+/// arrives (honest absence: the picker waits for `KnownScales` to be
+/// non-empty before rendering rows).
+#[derive(Resource, Default)]
+pub struct KnownScales(pub Vec<ScaleShape>);
 
 /// Calibration layer for the musical UI. Settings the user sets once
 /// and forgets — the harmonium-maker's choices, not the singer's.

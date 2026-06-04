@@ -4,6 +4,7 @@
 
 pub mod dial;
 pub mod hud;
+pub mod scale_picker;
 
 use crate::coach::{Coach, LatestFeatures};
 use crate::state::{AppSettings, AppState, HasPausedSession, SelectedDevice, SongTonality};

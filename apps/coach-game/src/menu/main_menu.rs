@@ -17,7 +17,11 @@ pub struct SettingsButton;
 pub struct QuitButton;
 
 pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
-    let start_label = if has_paused.0 { "Continue" } else { "Free Practice" };
+    let start_label = if has_paused.0 {
+        "Continue"
+    } else {
+        "Free Practice"
+    };
     commands.spawn((
         DespawnOnExit(AppState::MainMenu),
         Node {

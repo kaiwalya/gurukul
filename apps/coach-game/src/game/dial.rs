@@ -1,5 +1,7 @@
-//! InGame dial: a 12-position note dial with C as the root, tracking
-//! the coach's live `f0` as the primary needle.
+//! InGame dial: a note dial with C as the root, tracking the coach's
+//! live `f0` as the primary needle. The dial sizes itself to the
+//! tuning's actual slot count N: 12 for 12-TET and Hindustani Just,
+//! 22 for the 22-shruti grid.
 //!
 //! The tuning is **not** chosen here — the dial spawns empty and paints
 //! its slots from [`MusicInfoRes`], the read model the coach publishes on
@@ -8,23 +10,25 @@
 //! 12-TET/C default. The needle math ([`angle_from_f0`]) is
 //! tuning-independent — the needle just shows "where on the log-frequency
 //! circle is this Hz, relative to C". The tuning differs only in *where
-//! the 12 slots sit* on that circle (the targets). Switching tuning moves
+//! the N slots sit* on that circle (the targets). Switching tuning moves
 //! the targets the needle is judged against, not the needle itself.
 //!
-//! Slot *positions* come from the tuning's [`TuningKind`] (12-TET or
-//! Hindustani Just); slot *active/inactive* comes from the [`Tonality`] —
-//! its key-widths, walked from the tonic, pick out which slots are in the
-//! current scale. Voiced → one primary needle pointing at the detected
-//! pitch. Unvoiced → no needle (`needles.is_empty()`), which the widget
-//! also reads as "no current slot". No smoothing — raw `f0` straight from
-//! the feature stream.
+//! Slot *positions* come from the tuning's [`TuningKind`] (12-TET,
+//! Hindustani Just, or 22-shruti); slot *active/inactive* comes from the
+//! [`Tonality`] — its key-widths, walked from the tonic, pick out which
+//! slots are in the current scale. Voiced → one primary needle pointing
+//! at the detected pitch. Unvoiced → no needle (`needles.is_empty()`),
+//! which the widget also reads as "no current slot". No smoothing — raw
+//! `f0` straight from the feature stream.
 //!
 //! **The scale mask is a head-side render projection** ([`in_scale_mask`]).
-//! It is tuning-independent — the lit *slots* are the same integer set
-//! whether the tuning is 12-TET or Just (the tuning only changes where
-//! each slot is *drawn*, via the angle tables below). So the head walks
-//! the [`Tonality`]'s intervals itself rather than asking the coach;
-//! see `docs/MUSIC_MODEL.md` § "The mask is a head-side projection".
+//! It is tuning-independent in nature — the lit *slot indices* are the
+//! same walk whether the tuning is 12-TET or Just (the tuning only
+//! changes where each slot is *drawn*, via the angle tables below). N
+//! (the octave slot count from the tuning) is threaded in so the mask
+//! covers exactly as many slots as the angle table. So the head walks the
+//! [`Tonality`]'s intervals itself rather than asking the coach; see
+//! `docs/MUSIC_MODEL.md` § "The mask is a head-side projection".
 
 use crate::coach::{LatestFeatures, MusicInfoRes};
 use crate::state::AppState;
@@ -44,48 +48,51 @@ const C_REF_HZ: f32 = 261.625_56;
 #[derive(Component)]
 pub struct InGameDial;
 
-/// Number of dial slots — one chromatic octave. The angle tables and
-/// the scale mask are both sized to this. Non-12 tunings (Carnatic
-/// 22-shruti) are deferred; when they land this becomes the tuning's
-/// slot count rather than a constant.
-const SLOT_COUNT: usize = 12;
-
-/// Walk a [`Tonality`]'s key-widths to a 12-slot in-scale mask.
+/// Walk a [`Tonality`]'s key-widths to an N-slot in-scale mask.
 /// Index `i` is `true` iff slot `i` is one of the scale's notes.
 ///
-/// Starts at the tonic's within-octave position (`tonic.offset %
-/// SLOT_COUNT`) and adds each key-width modulo [`SLOT_COUNT`], marking
-/// every visited slot. The tonic itself is always lit; the final width
-/// lands back on it by construction (a well-formed scale's widths sum to
-/// the slot count), so it isn't double-counted.
+/// `n` is the tuning's octave slot count (12 for 12-TET / Hindustani
+/// Just, 22 for the 22-shruti grid). The mask length equals `n` and must
+/// match the length of the angle table built by [`slot_angles`] for the
+/// same tuning — callers coordinate this through [`build_slots`].
+///
+/// Starts at the tonic's within-octave position (`tonic.offset % n`)
+/// and adds each key-width modulo `n`, marking every visited slot. The
+/// tonic itself is always lit; the final width lands back on it by
+/// construction (a well-formed scale's widths sum to `n`), so it isn't
+/// double-counted.
 ///
 /// This is the **scale ring** (layer 4) — pure integer projection of the
-/// `Tonality`, tuning-independent. Lives head-side because the head
-/// holds the `Tonality`; the coach is not consulted.
-pub fn in_scale_mask(tonality: &Tonality) -> [bool; SLOT_COUNT] {
-    let mut mask = [false; SLOT_COUNT];
-    // The scale ring is a *discrete* projection — it lights whole slots —
-    // so round the continuous key positions to integer slot indices. Scale
-    // widths and the tonic are whole numbers by the `Tonality` invariant
-    // (only the live slide is fractional), so rounding is exact here, not a
-    // fudge.
-    let mut cursor = tonality.tonic.offset.round() as usize % SLOT_COUNT;
+/// `Tonality`, tuning-independent. The discrete projection — lighting
+/// whole slots — means we round the continuous key positions to integer
+/// slot indices. Scale widths and the tonic are whole numbers by the
+/// `Tonality` invariant (only the live slide is fractional), so rounding
+/// is exact here, not a fudge. Lives head-side because the head holds
+/// the `Tonality`; the coach is not consulted.
+pub fn in_scale_mask(tonality: &Tonality, n: usize) -> Vec<bool> {
+    let mut mask = vec![false; n];
+    // Round the continuous tonic offset to an integer slot index, then
+    // fold into [0, n). Scale widths are whole numbers (Tonality
+    // invariant), so rounding is exact.
+    let mut cursor = tonality.tonic.offset.round() as usize % n;
     mask[cursor] = true;
     for width in tonality.widths() {
-        cursor = (cursor + width.0.round() as usize) % SLOT_COUNT;
+        cursor = (cursor + width.0.round() as usize) % n;
         mask[cursor] = true;
     }
     mask
 }
 
-/// Build the 12 dial slots for a tuning + tonality: each slot's angle
+/// Build the N dial slots for a tuning + tonality: each slot's angle
 /// from the [`TuningKind`]'s slot positions, each slot's `active` flag
-/// from the [`Tonality`]'s in-scale mask. Pulled out so [`spawn`] (shell)
-/// and [`repaint_slots`] (paint) share one definition, and so it's unit
-/// testable without a Bevy world.
+/// from the [`Tonality`]'s in-scale mask. N comes from the tuning — 12
+/// for 12-TET / Hindustani Just, 22 for the 22-shruti grid. Pulled out
+/// so [`spawn`] (shell) and [`repaint_slots`] (paint) share one
+/// definition, and so it's unit testable without a Bevy world.
 fn build_slots(kind: TuningKind, tonality: &Tonality) -> Vec<DialSlot> {
     let angles = slot_angles(kind);
-    let mask = in_scale_mask(tonality);
+    let n = angles.len();
+    let mask = in_scale_mask(tonality, n);
     angles
         .into_iter()
         .enumerate()
@@ -186,34 +193,35 @@ pub fn update_from_features(
     });
 }
 
-/// The 12 slot angles for a tuning kind, built from the canonical
+/// The N slot angles for a tuning kind, built from the canonical
 /// frequencies in [`domain_ports::music`].
 ///
 /// Each slot's frequency comes from the model's
 /// [`TuningKind::shape`](domain_ports::music::TuningKind::shape) (the one
-/// place the 12-TET spacing and the Just 5-limit ratios are defined), and
-/// the dial only does the *geometry*: turn each slot's
+/// place the 12-TET spacing, the Just 5-limit ratios, and the 22-shruti
+/// Shadja-grama ratios are defined), and the dial only does the
+/// *geometry*: turn each slot's
 /// [`octave_position`](domain_ports::music::tuning_view::octave_position)
-/// into a clock angle (`× TAU`). So switching a ratio happens in the model
-/// and the dial follows automatically — no ratio table lives here.
+/// into a clock angle (`× TAU`). So switching a ratio happens in the
+/// model and the dial follows automatically — no ratio table lives here.
 ///
-/// Angles are in `[0, TAU)`, clock convention: 0 = 12 o'clock = C / Sa,
-/// positive radians clockwise. The reference frequency the model is built
-/// from doesn't matter for the *angles* (only ratios survive the
-/// octave-position fold), so we build the shape against [`C_REF_HZ`] and
-/// read positions relative to the same anchor.
-fn slot_angles(kind: TuningKind) -> [f32; SLOT_COUNT] {
+/// The returned `Vec` has length N (12 for 12-TET / Hindustani Just, 22
+/// for the 22-shruti grid). Angles are in `[0, TAU)`, clock convention:
+/// 0 = 12 o'clock = C / Sa, positive radians clockwise. The reference
+/// frequency the model is built from doesn't matter for the *angles*
+/// (only ratios survive the octave-position fold), so we build the shape
+/// against [`C_REF_HZ`] and read positions relative to the same anchor.
+fn slot_angles(kind: TuningKind) -> Vec<f32> {
     let slots = kind.shape(C_REF_HZ);
-    let mut out = [0.0; SLOT_COUNT];
-    for (i, a) in out.iter_mut().enumerate() {
-        *a = tuning_view::octave_position(slots[i], C_REF_HZ) * TAU;
-    }
-    out
+    slots
+        .iter()
+        .map(|&hz| tuning_view::octave_position(hz, C_REF_HZ) * TAU)
+        .collect()
 }
 
 /// 12-tone equal temperament slot angles — each slot 100 cents (one
 /// twelfth of the circle) apart. Thin wrapper over [`slot_angles`].
-pub fn tuning_12tet() -> [f32; SLOT_COUNT] {
+pub fn tuning_12tet() -> Vec<f32> {
     slot_angles(TuningKind::TwelveTet)
 }
 
@@ -222,7 +230,7 @@ pub fn tuning_12tet() -> [f32; SLOT_COUNT] {
 /// shuddha Ga ~14 cents flatter than 12-TET E). Thin wrapper over
 /// [`slot_angles`]; the ratios themselves live in the model's
 /// [`TuningKind::HindustaniJust`](domain_ports::music::TuningKind).
-pub fn tuning_hindustani_just() -> [f32; SLOT_COUNT] {
+pub fn tuning_hindustani_just() -> Vec<f32> {
     slot_angles(TuningKind::HindustaniJust)
 }
 
@@ -254,8 +262,8 @@ mod tests {
         // Bilawal on Safed-1 (slot 0) → Sa Re Ga Ma Pa Dha Ni at slots
         // 0, 2, 4, 5, 7, 9, 11. Komal/tivra slots (1, 3, 6, 8, 10) off.
         let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
-        let mask = in_scale_mask(&t);
-        let expected = [
+        let mask = in_scale_mask(&t, 12);
+        let expected = vec![
             true, false, true, false, true, true, false, true, false, true, false, true,
         ];
         assert_eq!(mask, expected);
@@ -267,8 +275,8 @@ mod tests {
         // Same Bilawal shape, Sa on Safed-2 (slot 2 / D): visited slots
         // are 2, 4, 6, 7, 9, 11, 1 → mask shifts by 2.
         let t = Tonality::new(harmonium_key(2.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
-        let mask = in_scale_mask(&t);
-        let expected = [
+        let mask = in_scale_mask(&t, 12);
+        let expected = vec![
             false, true, true, false, true, false, true, true, false, true, false, true,
         ];
         assert_eq!(mask, expected);
@@ -280,7 +288,51 @@ mod tests {
         // to the same mask as slot 2 — the ring shows one octave.
         let high = Tonality::new(harmonium_key(14.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let low = Tonality::new(harmonium_key(2.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
-        assert_eq!(in_scale_mask(&high), in_scale_mask(&low));
+        assert_eq!(in_scale_mask(&high, 12), in_scale_mask(&low, 12));
+    }
+
+    #[test]
+    fn twenty_two_shruti_bilawal_mask_has_22_slots_and_7_lit() {
+        // Bilawal on the 22-shruti grid: widths [3,2,4,4,3,2,4] (in
+        // shrutis), tonic at Sa (slot 0). Cursor walk:
+        //   start  → 0
+        //   +3     → 3
+        //   +2     → 5
+        //   +4     → 9
+        //   +4     → 13
+        //   +3     → 16
+        //   +2     → 18
+        //   +4     → 22 % 22 = 0  (closes the octave, tonic already lit)
+        // Lit slots: 0, 3, 5, 9, 13, 16, 18.
+        let t = Tonality::new(harmonium_key(0.0), &[3.0, 2.0, 4.0, 4.0, 3.0, 2.0, 4.0]);
+        let mask = in_scale_mask(&t, 22);
+        assert_eq!(mask.len(), 22, "mask must cover all 22 shruti slots");
+        assert_eq!(
+            mask.iter().filter(|b| **b).count(),
+            7,
+            "Bilawal lights exactly 7 of the 22 slots"
+        );
+        let lit: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lit, vec![0, 3, 5, 9, 13, 16, 18]);
+        // The 22-shruti angle table must also cover all 22 slots and be
+        // strictly ascending in [0, TAU) (shrutis are ordered by ratio).
+        let angles = slot_angles(TuningKind::TwentyTwoShruti);
+        assert_eq!(angles.len(), 22);
+        assert!(angles[0].abs() < 1e-5, "Sa must sit at angle 0");
+        for i in 1..angles.len() {
+            assert!(
+                angles[i] > angles[i - 1],
+                "shruti angles must be strictly ascending: slot {i} ({}) ≤ slot {} ({})",
+                angles[i],
+                i - 1,
+                angles[i - 1]
+            );
+        }
     }
 
     // --- build_slots (angles from tuning, active from tonality) -------
@@ -291,9 +343,9 @@ mod tests {
         // in-scale mask, and the angles the 12-TET geometry.
         let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let slots = build_slots(TuningKind::TwelveTet, &t);
-        assert_eq!(slots.len(), SLOT_COUNT);
+        assert_eq!(slots.len(), 12);
 
-        let mask = in_scale_mask(&t);
+        let mask = in_scale_mask(&t, 12);
         let angles = tuning_12tet();
         for (i, slot) in slots.iter().enumerate() {
             assert_eq!(slot.active, mask[i], "slot {i} active");
@@ -310,7 +362,7 @@ mod tests {
         let tet = build_slots(TuningKind::TwelveTet, &t);
         let just = build_slots(TuningKind::HindustaniJust, &t);
         assert_ne!(tet[4].angle, just[4].angle, "Ga angle must differ");
-        for i in 0..SLOT_COUNT {
+        for i in 0..12 {
             assert_eq!(tet[i].active, just[i].active, "slot {i} active set");
         }
     }
@@ -410,7 +462,7 @@ mod tests {
     #[test]
     fn tuning_just_slots_strictly_increasing() {
         let slots = tuning_hindustani_just();
-        for i in 1..12 {
+        for i in 1..slots.len() {
             assert!(
                 slots[i] > slots[i - 1],
                 "slot {i} ({}) should be > slot {} ({})",

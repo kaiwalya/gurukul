@@ -410,6 +410,62 @@ mod tests {
     }
 
     #[test]
+    fn list_scales_round_trip() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // ListScales requires a configured tuning to know which octave
+        // division is active. Without ConfigureSession first it returns empty.
+        coach.send_command(Command::ListScales);
+        let events_before = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::ScalesListed { .. }))
+        });
+        let shapes_before = events_before
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::ScalesListed { shapes } => Some(shapes),
+                _ => None,
+            })
+            .expect("ScalesListed (before configure)");
+        assert!(
+            shapes_before.is_empty(),
+            "before ConfigureSession, ScalesListed must be empty (no tuning known)"
+        );
+
+        // Configure a 12-TET session; now ListScales returns 13 shapes.
+        let (tuning, tonality) = bilawal_config();
+        coach.send_command(Command::ConfigureSession { tuning, tonality });
+        coach.send_command(Command::ListScales);
+        let events_after = poll_until(&coach, |evs| {
+            // Wait for a second ScalesListed (the non-empty one).
+            evs.iter()
+                .filter(|e| matches!(e, CoachEvent::ScalesListed { .. }))
+                .count()
+                >= 2
+        });
+        let shapes_after = events_after
+            .iter()
+            .filter_map(|e| match e {
+                CoachEvent::ScalesListed { shapes } => Some(shapes),
+                _ => None,
+            })
+            .last()
+            .expect("second ScalesListed (after configure)");
+        assert_eq!(
+            shapes_after.len(),
+            13,
+            "after 12-TET ConfigureSession, catalogue must have 13 shapes"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
     fn start_then_stop_runs_through_state_machine() {
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));

@@ -34,7 +34,7 @@
 use crate::audio_capture::AudioCapture;
 use crate::audio_devices::{AudioDevices, DeviceId, InputDevice};
 use crate::clock::Clock;
-use crate::music::{Tonality, TuningSpec};
+use crate::music::{ScaleShape, Tonality, TuningSpec};
 use crate::telemetry::Telemetry;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +71,14 @@ pub enum Command {
     /// Enumerate input devices. The coach replies with
     /// [`CoachEvent::DevicesListed`].
     ListDevices,
+
+    /// Enumerate the built-in scale shapes the coach can coach against.
+    /// The coach replies with [`CoachEvent::ScalesListed`].
+    ///
+    /// The response is a flat catalogue of [`ScaleShape`]s — interval
+    /// patterns only, no names. Names are the deferred note-system axis
+    /// (see `docs/MUSIC_MODEL.md`); the coach is vocabulary-free.
+    ListScales,
 
     /// Open the selected device and start a session.
     /// `Idle → Starting → Running` on success;
@@ -199,6 +207,13 @@ pub struct MusicInfo {
 pub enum CoachEvent {
     /// Reply to [`Command::ListDevices`].
     DevicesListed { devices: Vec<InputDevice> },
+
+    /// Reply to [`Command::ListScales`]. Carries the full built-in
+    /// catalogue of [`ScaleShape`]s — interval patterns only, no names.
+    /// Names are the deferred note-system axis (see
+    /// `docs/MUSIC_MODEL.md`); the catalogue here is vocabulary-free
+    /// and stable across any note-system choice.
+    ScalesListed { shapes: Vec<ScaleShape> },
 
     /// The session state machine moved.
     SessionStateChanged { new_state: SessionState },

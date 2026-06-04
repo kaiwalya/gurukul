@@ -173,7 +173,11 @@ pub fn rebuild_settings_list(
 
     if let Ok(list_entity) = tuning_list.single() {
         commands.entity(list_entity).despawn_related::<Children>();
-        for kind in [TuningKind::TwelveTet, TuningKind::HindustaniJust] {
+        for kind in [
+            TuningKind::TwelveTet,
+            TuningKind::HindustaniJust,
+            TuningKind::TwentyTwoShruti,
+        ] {
             spawn_choice_row(
                 &mut commands,
                 list_entity,
@@ -354,6 +358,7 @@ fn tuning_kind_label(s: TuningKind) -> &'static str {
     match s {
         TuningKind::TwelveTet => "12-tone equal temperament",
         TuningKind::HindustaniJust => "Hindustani Just intonation",
+        TuningKind::TwentyTwoShruti => "22-shruti just intonation",
     }
 }
 

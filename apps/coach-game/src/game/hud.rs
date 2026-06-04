@@ -33,8 +33,10 @@ use bevy::prelude::*;
 use domain_ports::app_coach::MusicInfo;
 use domain_ports::music::{tuning_view, InstrumentKey, ScaleNote, Tuning};
 
-/// Marker for the panel container so its row children can be located
-/// and refreshed when the snapshot changes.
+/// Marker for the panel container so its row children can be located,
+/// refreshed when the snapshot changes, and detected as the click target
+/// for the scale picker. The node also carries a [`Button`] component
+/// so Bevy's interaction system tracks hover/press on it.
 #[derive(Component)]
 pub struct HudBadge;
 
@@ -62,12 +64,14 @@ pub fn spawn(mut commands: Commands, mut last: ResMut<LastMusicInfo>) {
         .spawn((
             DespawnOnExit(AppState::InGame),
             HudBadge,
+            Button,
             Node {
                 position_type: PositionType::Absolute,
                 left: px(32),
                 top: px(24),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(4),
+                padding: UiRect::all(px(6)),
                 ..default()
             },
         ))

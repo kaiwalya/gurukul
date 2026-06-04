@@ -27,7 +27,10 @@ pub mod ui;
 pub mod widgets;
 
 use bevy::prelude::*;
-use state::{AppSettings, AppState, HasPausedSession, KnownDevices, SelectedDevice, SongTonality};
+use state::{
+    AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, SelectedDevice,
+    SongTonality,
+};
 
 /// Register the game's state, resources, and systems. Split out of
 /// `main` so headless tests can call it after `MinimalPlugins +
@@ -39,12 +42,14 @@ pub fn build_app(app: &mut App) {
         .init_resource::<SongTonality>()
         .init_resource::<SelectedDevice>()
         .init_resource::<KnownDevices>()
+        .init_resource::<KnownScales>()
         .init_resource::<HasPausedSession>()
         .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
         .init_resource::<game::LastFeatureTs>()
         .init_resource::<game::hud::LastMusicInfo>()
+        .init_resource::<game::scale_picker::ShowingScalePicker>()
         .init_resource::<coach::MusicInfoRes>()
         .init_resource::<coach::LatestFeatures>()
         // Always-on
@@ -114,6 +119,19 @@ pub fn build_app(app: &mut App) {
                 game::dial::update_from_features,
                 game::dial::repaint_slots,
                 game::hud::refresh,
+                // Scale picker: handle_hud_click opens, sync_picker
+                // spawns/despawns, sync_rows repopulates when the
+                // catalogue lands, row/close clicks select or close.
+                // sync_rows uses .chain() so spawn_picker's Commands
+                // flush before sync_rows reads the new ScalePickerRows.
+                (
+                    game::scale_picker::handle_hud_click,
+                    game::scale_picker::sync_picker,
+                )
+                    .chain(),
+                game::scale_picker::sync_rows,
+                game::scale_picker::handle_row_click,
+                game::scale_picker::handle_close_click,
             )
                 // Read this frame's republished resources, not last
                 // frame's: drain_events writes MusicInfoRes / LatestFeatures.

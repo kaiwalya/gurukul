@@ -266,6 +266,23 @@ pub enum TuningKind {
     /// the root. Not symmetric — the `root` of the tuning is
     /// load-bearing here.
     HindustaniJust,
+    /// Bharata's 22-shruti just-intonation grid. `N = 22`, the Shadja-
+    /// grama ratios: slot 0 = root (1/1), slots 1–21 fan upward to just
+    /// below the octave (the 2/1 closes the next Sa, which is slot 0 one
+    /// octave up — not stored here, same as the 12-slot kinds).
+    ///
+    /// **Orthogonality note.** This is the *intonation grid*, independent
+    /// of which notes are in any particular scale. A 7-note raga on this
+    /// grid is expressed as `ScaleShape` widths in *shruti-counts* that
+    /// sum to 22 — e.g. Bilawal `[3,2,4,4,3,2,4]`. The scale selects
+    /// *which* of the 22 slots are home; the tuning decides the Hz each
+    /// slot hits. The finer grid is the whole point: it lets each swara be
+    /// intoned a shruti higher or lower (meend microtonal freedom) in a
+    /// way a 12-equal grid physically cannot represent. Today scales snap
+    /// a swara to its home shruti, so it sounds like 12-TET Bilawal; the
+    /// expressivity is unlocked once raga ornament logic arrives and
+    /// starts placing live pitch between these finer targets.
+    TwentyTwoShruti,
 }
 
 impl TuningKind {
@@ -299,6 +316,53 @@ impl TuningKind {
                     (5.0, 3.0),
                     (9.0, 5.0),
                     (15.0, 8.0),
+                ];
+                RATIOS.iter().map(|(n, d)| root_hz * n / d).collect()
+            }
+            TuningKind::TwentyTwoShruti => {
+                // Bharata's 22-shruti Shadja-grama ratios, ascending from
+                // Sa (1/1) at slot 0 to just below the octave. The 2/1
+                // closes the next Sa and is not stored — same convention
+                // as the 12-slot kinds above.
+                //
+                // Slot ordering (shruti names per Bharata):
+                //   0  Sa      1/1        8  antara Ga   81/64
+                //   1  tivra   256/243    9  Ma          4/3
+                //   2  kumud   16/15      10 ekasruti    27/20
+                //   3  manda   10/9       11 tivra Ma    45/32
+                //   4  chanda  9/8        12 tivra Ma+   729/512
+                //   5  dayavati 32/27     13 Pa           3/2
+                //   6  ranjani  6/5       14 hrsvati     128/81
+                //   7  ratika   5/4       15 komal Dha    8/5
+                //                         16 Dha          5/3
+                //                         17 shodasruti  27/16
+                //                         18 alapa       16/9
+                //                         19 komal Ni     9/5
+                //                         20 karuna      15/8
+                //                         21 tivra Ni   243/128
+                const RATIOS: [(f32, f32); 22] = [
+                    (1.0, 1.0),
+                    (256.0, 243.0),
+                    (16.0, 15.0),
+                    (10.0, 9.0),
+                    (9.0, 8.0),
+                    (32.0, 27.0),
+                    (6.0, 5.0),
+                    (5.0, 4.0),
+                    (81.0, 64.0),
+                    (4.0, 3.0),
+                    (27.0, 20.0),
+                    (45.0, 32.0),
+                    (729.0, 512.0),
+                    (3.0, 2.0),
+                    (128.0, 81.0),
+                    (8.0, 5.0),
+                    (5.0, 3.0),
+                    (27.0, 16.0),
+                    (16.0, 9.0),
+                    (9.0, 5.0),
+                    (15.0, 8.0),
+                    (243.0, 128.0),
                 ];
                 RATIOS.iter().map(|(n, d)| root_hz * n / d).collect()
             }
@@ -511,6 +575,93 @@ impl Tonality {
     /// The widths are whole numbers (the scale invariant) and small, so
     /// they sum *exactly* in `f32` (no rounding below 2^24) — an exact
     /// `== n` compare is correct here, no epsilon needed.
+    pub fn well_formed(&self, n: u8) -> bool {
+        self.widths().iter().map(|w| w.0).sum::<f32>() == n as f32
+    }
+}
+
+/// The **shape** half of the shape/tonic split: a scale's interval
+/// pattern with no tonic and no name.
+///
+/// A [`Tonality`] is a `ScaleShape` *planted on a tonic* —
+/// `Tonality { tonic, widths }` where `widths` holds exactly the same
+/// data as `ScaleShape::widths`. The split makes the shape a
+/// first-class value: it can be catalogued, compared, and listed
+/// without knowing where on the keyboard it will land. The future
+/// `name` field attaches here (e.g. "Bilawal", "Yaman") once the
+/// note-system axis ships; until then the shape is purely numeric.
+///
+/// Storage convention mirrors [`Tonality`]: a fixed-capacity
+/// `[InstrumentKeyInterval; MAX_SCALE_NOTES]` **0-terminated** array.
+/// Flat and `Copy` so it crosses the FFI command boundary directly.
+///
+/// `PartialEq`, not `Eq`: holds `f32` key-widths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScaleShape {
+    /// Key-widths between successive notes, 0-terminated. Same
+    /// semantics as [`Tonality::widths`]: each entry is how many keys
+    /// (semitones) that note-step spans, walking up from the (implicit)
+    /// tonic. `InstrumentKeyInterval(0.0)` is the terminator; a zero
+    /// width is never musically valid, so the sentinel is
+    /// self-validating. (`-0.0 == 0.0` in Rust, so a signed zero also
+    /// terminates.)
+    ///
+    /// **Invariant: every non-zero width is a whole number** — same as
+    /// [`Tonality`]. Consumers may round to an integer slot index,
+    /// relying on this invariant.
+    pub widths: [InstrumentKeyInterval; MAX_SCALE_NOTES],
+}
+
+impl ScaleShape {
+    /// Build a `ScaleShape` from a slice of key-widths (gaps in keys,
+    /// walking up from the implicit tonic). Panics in debug if `widths`
+    /// is longer than [`MAX_SCALE_NOTES`] or contains an interior `0` —
+    /// both are programming errors at the only callers today (the
+    /// built-in catalogue).
+    ///
+    /// Same debug-asserts as [`Tonality::new`]; the sum-to-`N` check is
+    /// not performed here (needs the tuning's slot count — see
+    /// [`well_formed`](Self::well_formed)).
+    pub fn new(widths: &[f32]) -> ScaleShape {
+        debug_assert!(
+            widths.len() <= MAX_SCALE_NOTES,
+            "scale shape has {} widths, cap is {MAX_SCALE_NOTES}",
+            widths.len()
+        );
+        debug_assert!(
+            widths.iter().all(|&w| w != 0.0),
+            "scale shape widths must be non-zero (0 is the terminator)"
+        );
+        let mut buf = [InstrumentKeyInterval(0.0); MAX_SCALE_NOTES];
+        let n = widths.len().min(MAX_SCALE_NOTES);
+        for (slot, &w) in buf[..n].iter_mut().zip(&widths[..n]) {
+            *slot = InstrumentKeyInterval(w);
+        }
+        ScaleShape { widths: buf }
+    }
+
+    /// The key-widths up to (not including) the
+    /// `InstrumentKeyInterval(0.0)` terminator.
+    pub fn widths(&self) -> &[InstrumentKeyInterval] {
+        let end = self
+            .widths
+            .iter()
+            .position(|&w| w == InstrumentKeyInterval(0.0))
+            .unwrap_or(MAX_SCALE_NOTES);
+        &self.widths[..end]
+    }
+
+    /// Notes per octave — the number of widths before the terminator.
+    /// 7 for a heptatonic shape like Bilawal; 5 for a pentatonic shape.
+    pub fn note_count(&self) -> usize {
+        self.widths().len()
+    }
+
+    /// Whether the key-widths (to the terminator) sum to the tuning's
+    /// slot count `n` — the same well-formedness invariant as
+    /// [`Tonality::well_formed`]. Widths are whole numbers and small,
+    /// so the sum is exact in `f32` (no rounding below 2^24); an exact
+    /// `== n` compare is correct, no epsilon needed.
     pub fn well_formed(&self, n: u8) -> bool {
         self.widths().iter().map(|w| w.0).sum::<f32>() == n as f32
     }
@@ -786,6 +937,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn twenty_two_shruti_shape_has_22_slots_root_at_slot_0() {
+        let slots = TuningKind::TwentyTwoShruti.shape(200.0);
+        assert_eq!(
+            slots.len(),
+            22,
+            "TwentyTwoShruti must emit exactly 22 slots"
+        );
+        assert!(
+            (slots[0] - 200.0).abs() < 1e-3,
+            "slot 0 must equal root_hz: {}",
+            slots[0]
+        );
+    }
+
+    #[test]
+    fn twenty_two_shruti_slots_are_strictly_ascending() {
+        let slots = TuningKind::TwentyTwoShruti.shape(200.0);
+        for i in 1..slots.len() {
+            assert!(
+                slots[i] > slots[i - 1],
+                "slot {i} ({}) must be above slot {} ({})",
+                slots[i],
+                i - 1,
+                slots[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn twenty_two_shruti_pa_at_3_over_2() {
+        // Pa is slot 13 in the 22-shruti grid (ratio 3/2).
+        let slots = TuningKind::TwentyTwoShruti.shape(200.0);
+        assert!(
+            (slots[13] - 300.0).abs() < 1e-3,
+            "Pa (slot 13) = 3/2 × 200 = 300, got {}",
+            slots[13]
+        );
+    }
+
     // --- Tonality -----------------------------------------------------
 
     #[test]
@@ -957,7 +1148,11 @@ mod tests {
         // must stay in lock-step: exp2(slots_log2[i]) == slots_linear[i].
         // (Private fields — visible only because this test module is inside
         // the `music` module; the seal holds for everyone outside.)
-        for kind in [TuningKind::TwelveTet, TuningKind::HindustaniJust] {
+        for kind in [
+            TuningKind::TwelveTet,
+            TuningKind::HindustaniJust,
+            TuningKind::TwentyTwoShruti,
+        ] {
             let t = Tuning::new(TuningSpec {
                 root_note_hz: 261.625_56,
                 kind,
@@ -982,5 +1177,51 @@ mod tests {
         assert_copy::<TuningKind>();
         assert_copy::<Tonality>();
         assert_copy::<TuningSpec>();
+        assert_copy::<ScaleShape>();
+    }
+
+    // --- ScaleShape -------------------------------------------------------
+
+    #[test]
+    fn scale_shape_new_terminates_and_reads_back_widths() {
+        let s = ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+        assert_eq!(
+            s.widths(),
+            &[
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0)
+            ]
+        );
+        // Everything past the 7 widths is the 0 terminator.
+        assert_eq!(s.widths[7], InstrumentKeyInterval(0.0));
+    }
+
+    #[test]
+    fn scale_shape_note_count_matches_width_count() {
+        let heptatonic = ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+        assert_eq!(heptatonic.note_count(), 7);
+        let pentatonic = ScaleShape::new(&[2.0, 2.0, 3.0, 2.0, 3.0]);
+        assert_eq!(pentatonic.note_count(), 5);
+    }
+
+    #[test]
+    fn scale_shape_well_formed_true_when_widths_sum_to_n() {
+        let bilawal = ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+        assert!(bilawal.well_formed(12));
+        let pentatonic = ScaleShape::new(&[2.0, 2.0, 3.0, 2.0, 3.0]);
+        assert!(pentatonic.well_formed(12));
+    }
+
+    #[test]
+    fn scale_shape_well_formed_false_when_sum_wrong() {
+        let short = ScaleShape::new(&[2.0, 2.0, 1.0]); // sums to 5
+        assert!(!short.well_formed(12));
+        let over = ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0, 2.0]); // sums to 14
+        assert!(!over.well_formed(12));
     }
 }

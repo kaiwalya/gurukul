@@ -431,7 +431,7 @@ fn new_game_button_shown_when_no_paused_session() {
     let children = q.iter(world).next().expect("NewGameButton spawned");
     let child = children[0];
     let text = world.get::<Text>(child).expect("button has Text child");
-    assert_eq!(text.0, "New Game");
+    assert_eq!(text.0, "Free Practice");
 }
 
 /// Build a minimal `InputDevice` with the given id + name. Stream

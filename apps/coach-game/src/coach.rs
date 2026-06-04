@@ -6,7 +6,7 @@
 //! driven by state transitions; this module only owns construction
 //! and the always-on event drain.
 
-use crate::state::KnownDevices;
+use crate::state::{KnownDevices, KnownScales};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, MusicInfo};
 use domain_ports::clock::Clock;
@@ -83,6 +83,7 @@ pub fn shutdown_on_exit(mut exits: MessageReader<bevy::app::AppExit>, coach: Non
 pub fn drain_events(
     coach: NonSend<Coach>,
     mut known: ResMut<KnownDevices>,
+    mut scales: ResMut<KnownScales>,
     mut music: ResMut<MusicInfoRes>,
     mut features: ResMut<LatestFeatures>,
 ) {
@@ -92,6 +93,9 @@ pub fn drain_events(
         match ev {
             CoachEvent::DevicesListed { devices } => {
                 known.0 = devices;
+            }
+            CoachEvent::ScalesListed { shapes } => {
+                scales.0 = shapes;
             }
             CoachEvent::SessionStateChanged { new_state } => {
                 info!("session state: {new_state:?}");
