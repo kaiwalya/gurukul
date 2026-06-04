@@ -479,9 +479,9 @@ mod tests {
         let tuning = TuningSpec {
             root_note_hz: 261.625_56, // C
             kind: TuningKind::TwelveTet,
-            root: harmonium_key(0),
+            root: harmonium_key(0.0),
         };
-        let tonality = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let tonality = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         (tuning, tonality)
     }
 
@@ -579,7 +579,7 @@ mod tests {
         let (tuning, _) = bilawal_config();
         // A different tonic, to make the swap meaningful.
         let tonality = Tonality {
-            tonic: harmonium_key(2), // Sa on D
+            tonic: harmonium_key(2.0), // Sa on D
             ..bilawal_config().1
         };
         coach.send_command(Command::ConfigureSession { tuning, tonality });

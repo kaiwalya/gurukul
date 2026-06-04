@@ -142,9 +142,18 @@ pub const MAX_SCALE_NOTES: usize = 32;
 /// Being a **point**, an `InstrumentKey` exposes *no* arithmetic of its
 /// own. The only operations are the affine ones below: subtract two keys
 /// to get an [`InstrumentKeyInterval`], or move a key by an `InstrumentKeyInterval`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **`offset` is an `f32`, not an integer.** A key is a position on a
+/// *continuous* line, not a discrete index: a sliding voice (meend /
+/// glissando) sits *between* the keys, e.g. offset `1.4`. Whole-number
+/// offsets are the keyboard's fixed keys; fractional offsets are the
+/// continuum the voice glides through. (Scale space stays discrete — see
+/// [`ScaleNote`] — because a degree-count is combinatorial, not physical.)
+/// Because the field is `f32`, this type is `PartialEq` but **not** `Eq`
+/// (no total order on floats); nothing in the system hashes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstrumentKey {
-    pub offset: u8,
+    pub offset: f32,
 }
 
 /// A signed distance between two [`InstrumentKey`]s, in keys — a
@@ -156,8 +165,15 @@ pub struct InstrumentKey {
 /// a delta into an octave needs a period (`N`), and that comes from the
 /// [`Tuning`] at the point of use ([`tuning_view`]), not from the
 /// interval itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InstrumentKeyInterval(pub i32);
+///
+/// **`f32`, mirroring [`InstrumentKey`].** A distance between two
+/// continuous positions is itself continuous: the slide produces
+/// fractional intervals (1.4 keys above Sa). Whole-number intervals are
+/// the only ones any *authored* scale uses (widths are `2.0`, `1.0`, …);
+/// the fraction appears only when a live, sliding position is involved.
+/// `PartialEq`, not `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InstrumentKeyInterval(pub f32);
 
 impl Add for InstrumentKeyInterval {
     type Output = InstrumentKeyInterval;
@@ -186,7 +202,7 @@ impl Neg for InstrumentKeyInterval {
 impl Sub for InstrumentKey {
     type Output = InstrumentKeyInterval;
     fn sub(self, rhs: InstrumentKey) -> InstrumentKeyInterval {
-        InstrumentKeyInterval(self.offset as i32 - rhs.offset as i32)
+        InstrumentKeyInterval(self.offset - rhs.offset)
     }
 }
 
@@ -200,12 +216,12 @@ impl Sub for InstrumentKey {
 impl Add<InstrumentKeyInterval> for InstrumentKey {
     type Output = InstrumentKey;
     fn add(self, rhs: InstrumentKeyInterval) -> InstrumentKey {
-        let sum = self.offset as i32 + rhs.0;
+        let sum = self.offset + rhs.0;
         debug_assert!(
-            (0..=u8::MAX as i32).contains(&sum),
+            sum.is_finite() && sum >= 0.0,
             "key + interval = {sum} is off the representable keyboard line"
         );
-        InstrumentKey { offset: sum as u8 }
+        InstrumentKey { offset: sum }
     }
 }
 
@@ -224,7 +240,12 @@ impl Add<InstrumentKeyInterval> for InstrumentKey {
 /// (The "12" is the harmonium's keys-per-octave, but it lives in the
 /// *name* of this constructor and in the tuning's slot count — not as a
 /// field on the key. A key is just an offset; see [`InstrumentKey`].)
-pub fn harmonium_key(offset: u8) -> InstrumentKey {
+///
+/// `offset` is an `f32` ([`InstrumentKey`] is continuous), but every
+/// caller today names a *whole* key (`0.0`, `12.0`, `21.0`) — the fixed
+/// keyboard positions. Fractional keys come from the live slide, not from
+/// a named constructor.
+pub fn harmonium_key(offset: f32) -> InstrumentKey {
     InstrumentKey { offset }
 }
 
@@ -369,7 +390,9 @@ impl Add<ScaleNoteInterval> for ScaleNote {
 /// The singer's per-song choice: which physical key is home (Sa), and
 /// the shape of the scale planted on it. Flat and `Copy` — this is the
 /// payload that crosses the `AppCoach` command boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq`, not `Eq`: it holds `f32` widths and an `f32`-offset tonic.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tonality {
     /// The [`InstrumentKey`] the singer calls home (Sa) — a **point**, the
     /// scale-space origin. The same space as a [`Tuning`]'s `root`,
@@ -385,9 +408,18 @@ pub struct Tonality {
     /// so on. This array *is* the scale-space → key-space conversion table.
     ///
     /// Fixed-capacity ([`MAX_SCALE_NOTES`]) and **0-terminated**: read
-    /// widths until the first `InstrumentKeyInterval(0)`. A `0` width is never
+    /// widths until the first `InstrumentKeyInterval(0.0)`. A `0` width is never
     /// musically valid (two scale notes on one key), so the sentinel is
-    /// self-validating.
+    /// self-validating. (`-0.0 == 0.0` in Rust, so a signed zero still
+    /// terminates.)
+    ///
+    /// **Invariant: every width is a whole number** (`2.0`, `1.0`, …).
+    /// The element type is `InstrumentKeyInterval` (`f32`) only so it shares
+    /// the affine vocabulary with the continuous key line; a scale's
+    /// note-steps are always an integral number of keys. The fractional
+    /// freedom of [`InstrumentKeyInterval`] is for the *live slide*, never
+    /// for an authored scale. Consumers that need an integer index (the
+    /// dial's slot mask) round, relying on this invariant.
     pub widths: [InstrumentKeyInterval; MAX_SCALE_NOTES],
 }
 
@@ -402,17 +434,17 @@ impl Tonality {
     /// needs `N` from the *tuning*, which a `Tonality` alone doesn't
     /// have. See [`well_formed`](Self::well_formed), checked at the join
     /// with a [`Tuning`].
-    pub fn new(tonic: InstrumentKey, widths: &[i32]) -> Tonality {
+    pub fn new(tonic: InstrumentKey, widths: &[f32]) -> Tonality {
         debug_assert!(
             widths.len() <= MAX_SCALE_NOTES,
             "scale has {} widths, cap is {MAX_SCALE_NOTES}",
             widths.len()
         );
         debug_assert!(
-            widths.iter().all(|&w| w != 0),
+            widths.iter().all(|&w| w != 0.0),
             "scale widths must be non-zero (0 is the terminator)"
         );
-        let mut buf = [InstrumentKeyInterval(0); MAX_SCALE_NOTES];
+        let mut buf = [InstrumentKeyInterval(0.0); MAX_SCALE_NOTES];
         let n = widths.len().min(MAX_SCALE_NOTES);
         for (slot, &w) in buf[..n].iter_mut().zip(&widths[..n]) {
             *slot = InstrumentKeyInterval(w);
@@ -420,13 +452,13 @@ impl Tonality {
         Tonality { tonic, widths: buf }
     }
 
-    /// The scale key-widths up to (not including) the `InstrumentKeyInterval(0)`
+    /// The scale key-widths up to (not including) the `InstrumentKeyInterval(0.0)`
     /// terminator.
     pub fn widths(&self) -> &[InstrumentKeyInterval] {
         let end = self
             .widths
             .iter()
-            .position(|&w| w == InstrumentKeyInterval(0))
+            .position(|&w| w == InstrumentKeyInterval(0.0))
             .unwrap_or(MAX_SCALE_NOTES);
         &self.widths[..end]
     }
@@ -465,7 +497,7 @@ impl Tonality {
         );
         let from_sa = widths[..d]
             .iter()
-            .fold(InstrumentKeyInterval(0), |acc, &w| acc + w);
+            .fold(InstrumentKeyInterval(0.0), |acc, &w| acc + w);
         self.tonic + from_sa
     }
 
@@ -474,8 +506,11 @@ impl Tonality {
     /// terminator) sum to the tuning's slot count `n`. `n` comes from the
     /// *tuning*, so this is checked at the `Tuning × Tonality` join, not
     /// at construction.
+    /// The widths are whole numbers (the scale invariant) and small, so
+    /// they sum *exactly* in `f32` (no rounding below 2^24) — an exact
+    /// `== n` compare is correct here, no epsilon needed.
     pub fn well_formed(&self, n: u8) -> bool {
-        self.widths().iter().map(|w| w.0).sum::<i32>() == n as i32
+        self.widths().iter().map(|w| w.0).sum::<f32>() == n as f32
     }
 }
 
@@ -497,35 +532,61 @@ pub struct TuningSpec {
 }
 
 /// A frozen tuning: `N` slot frequencies plus the [`InstrumentKey`] slot 0 sits
-/// on. **Coach-internal** — owns a `Vec<f32>`, never crosses the FFI
+/// on. **Coach-internal** — owns its slot arrays, never crosses the FFI
 /// boundary. Built from a [`TuningSpec`] via [`Tuning::new`].
+///
+/// **Opaque.** Its fields are private; the *only* code that sees inside is
+/// [`tuning_view`] (a child module, so it has access). Everyone else holds
+/// a `Tuning` and calls `tuning_view::hz` / `Tuning::n` — they never learn
+/// whether the slots are stored linear, log, or both. That freedom is the
+/// point: the struct can keep **two** parallel representations and the view
+/// picks whichever is cheaper for the job, with no outside coupling.
+///
+/// It keeps both `slots_linear` (Hz) and `slots_log2` (their base-2 logs).
+/// They cannot drift: both are written *once*, together, in [`Tuning::new`]
+/// and never again (private fields + no setter), so storing the
+/// derived-from-the-other shadow doesn't reintroduce a second source of
+/// truth — there is exactly one constructor and it fills both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tuning {
-    /// **One octave** of slot frequencies in **slot space**: `slots[0]
-    /// == root_note_hz`, the rest fan upward by the kind's pattern for
-    /// exactly `N` slots. `slots.len() == N`. The pattern repeats every
-    /// octave, so a key an octave up is `slots[..] × 2`; the array never
-    /// stores more than one octave (see [`tuning_view::hz`]).
-    pub slots: Vec<f32>,
+    /// **One octave** of slot frequencies (linear Hz) in **slot space**:
+    /// `slots_linear[0] == root_note_hz`, the rest fan upward by the kind's
+    /// pattern for exactly `N` slots. `len() == N`. The pattern repeats
+    /// every octave, so a key an octave up is `× 2`; the array never stores
+    /// more than one octave (see [`tuning_view::hz`]).
+    slots_linear: Vec<f32>,
+    /// `log2` of each entry of `slots_linear`, frozen alongside it. The
+    /// pitch-linear view of the same slots: an octave is `+1.0` here, and a
+    /// fractional key between two slots is a plain weighted average of two
+    /// of these (then one `exp2`) — which is how [`tuning_view::hz`]
+    /// interpolates the slide. `exp2(slots_log2[i]) == slots_linear[i]`.
+    slots_log2: Vec<f32>,
     /// The [`InstrumentKey`] that slot 0 sits on — the key the instrument was
     /// tuned from. The bridge between the two spaces (see
     /// [`tuning_view::hz`]).
-    pub root: InstrumentKey,
+    root: InstrumentKey,
 }
 
 impl Tuning {
-    /// Run the kind's shape and freeze it alongside the root key.
-    /// `slots[0] == root_note_hz` — no re-pegging.
+    /// Run the kind's shape and freeze it — both the linear slots and their
+    /// `log2` — alongside the root key. `slots_linear[0] == root_note_hz`,
+    /// no re-pegging. The two slot arrays are filled here together and
+    /// nowhere else, so they stay in lock-step by construction.
     pub fn new(spec: TuningSpec) -> Tuning {
+        let slots_linear = spec.kind.shape(spec.root_note_hz);
+        let slots_log2 = slots_linear.iter().map(|hz| hz.log2()).collect();
         Tuning {
-            slots: spec.kind.shape(spec.root_note_hz),
+            slots_linear,
+            slots_log2,
             root: spec.root,
         }
     }
 
-    /// The slot count `N`.
+    /// The slot count `N`. Representation-neutral (both arrays are length
+    /// `N`), so it stays public — the adapter reads it for the
+    /// `well_formed` check.
     pub fn n(&self) -> usize {
-        self.slots.len()
+        self.slots_linear.len()
     }
 }
 
@@ -569,19 +630,46 @@ pub mod tuning_view {
         (hz / ref_hz).log2().rem_euclid(1.0)
     }
 
-    /// Hz of any key, at any octave, **relative to the root**. `slots`
-    /// holds one octave built up from the root note (`slots[0] ==
-    /// root_note_hz`); a key `delta` keys from the root reads
-    /// `slots[delta mod N] × 2^(delta div N)`. The slot and the octave
-    /// multiplier come from the *same* `delta` and the *same* period `N`,
-    /// so a key below the root lands an octave down (negative `div_euclid`)
-    /// rather than wrapping up into the root's octave — walking a scale
-    /// from a tonic below the root yields an ascending line, no post-hoc
-    /// octave-lifting needed.
+    /// The `log2` of a **whole** key's frequency, `delta` keys from the
+    /// root. `slots_log2` holds one octave (`slots_log2[0] ==
+    /// log2(root_note_hz)`); a key `delta` keys away reads
+    /// `slots_log2[delta mod N] + (delta div N)` — the slot's log-frequency
+    /// plus one `+1.0` per octave. Slot and octave come from the *same*
+    /// `delta` and period `N`, so a key below the root lands an octave down
+    /// (negative `div_euclid`), never wrapping up into the root's octave.
+    /// This is the integer-key projection [`hz`] brackets the slide between.
+    fn slot_log2(t: &Tuning, delta: i32) -> f32 {
+        let n = t.slots_log2.len() as i32;
+        t.slots_log2[delta.rem_euclid(n) as usize] + delta.div_euclid(n) as f32
+    }
+
+    /// Hz of any key, at any octave, **relative to the root** — including a
+    /// *fractional* key (the slide), interpolated between the two whole
+    /// keys bracketing it.
+    ///
+    /// The interpolation is a plain **average in pitch**: take the
+    /// log-frequency of the slot at or below the key (`lo`) and of the next
+    /// slot up (`hi`), lerp them by the fractional part, and exponentiate
+    /// once. Equal steps in `offset` are then equal steps in *cents*, which
+    /// is how the ear hears a glide — a straight average of the two
+    /// frequencies would read sharp. Working from `slots_log2` makes this
+    /// the literal weighted average of two stored numbers (no `log` at call
+    /// time); the octave wrap (slot 11 → slot 0 an octave up) falls out of
+    /// [`slot_log2`] for free.
+    ///
+    /// A **whole** key has `frac == 0`, so `hz` reduces to
+    /// `exp2(slot_log2(d))` — exactly the old `slots[d mod N] × 2^(d div N)`,
+    /// unchanged.
     pub fn hz(t: &Tuning, key: InstrumentKey) -> f32 {
-        let n = t.slots.len() as i32;
         let d = delta(t, key).0;
-        t.slots[d.rem_euclid(n) as usize] * 2f32.powi(d.div_euclid(n))
+        let floor = d.floor();
+        let frac = d - floor;
+        let lo = slot_log2(t, floor as i32);
+        if frac == 0.0 {
+            return lo.exp2();
+        }
+        let hi = slot_log2(t, floor as i32 + 1);
+        (lo + (hi - lo) * frac).exp2()
     }
 }
 
@@ -593,32 +681,42 @@ mod tests {
 
     #[test]
     fn key_minus_key_is_interval() {
-        let d = harmonium_key(14) - harmonium_key(21);
-        assert_eq!(d, InstrumentKeyInterval(-7));
+        let d = harmonium_key(14.0) - harmonium_key(21.0);
+        assert_eq!(d, InstrumentKeyInterval(-7.0));
     }
 
     #[test]
     fn key_plus_interval_moves_the_point() {
-        let p = harmonium_key(12) + InstrumentKeyInterval(9);
-        assert_eq!(p, harmonium_key(21));
+        let p = harmonium_key(12.0) + InstrumentKeyInterval(9.0);
+        assert_eq!(p, harmonium_key(21.0));
     }
 
     #[test]
     fn intervals_compose() {
-        let a = InstrumentKeyInterval(4);
-        let b = InstrumentKeyInterval(3);
-        assert_eq!((a + b).0, 7);
-        assert_eq!((a - b).0, 1);
-        assert_eq!((-a).0, -4);
+        let a = InstrumentKeyInterval(4.0);
+        let b = InstrumentKeyInterval(3.0);
+        assert_eq!((a + b).0, 7.0);
+        assert_eq!((a - b).0, 1.0);
+        assert_eq!((-a).0, -4.0);
+    }
+
+    #[test]
+    fn fractional_key_is_a_distance_in_keys() {
+        // The slide: a key 1.4 above another is InstrumentKeyInterval(1.4).
+        // Whole-number keys still subtract to whole intervals.
+        let d = harmonium_key(13.4) - harmonium_key(12.0);
+        assert!((d.0 - 1.4).abs() < 1e-6);
+        let back = harmonium_key(12.0) + d;
+        assert!((back.offset - 13.4).abs() < 1e-6);
     }
 
     #[test]
     fn scale_note_re_is_one_note_two_keys() {
         // The whole point of two spaces: Sa→Re is *one* ScaleNote apart
         // but *two* KeyIntervals apart, and the Tonality bridges them.
-        let bilawal = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let bilawal = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let re = bilawal.key_of(ScaleNote { offset: 1 });
-        assert_eq!(re - bilawal.tonic, InstrumentKeyInterval(2));
+        assert_eq!(re - bilawal.tonic, InstrumentKeyInterval(2.0));
     }
 
     #[test]
@@ -650,10 +748,10 @@ mod tests {
     fn note_count_is_the_scale_space_period() {
         // Heptatonic: 7 notes per octave (= 7 widths, since the last
         // width closes back onto Sa).
-        let bilawal = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let bilawal = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         assert_eq!(bilawal.note_count(), 7);
         // A pentatonic scale folds at 5.
-        let pentatonic = Tonality::new(harmonium_key(0), &[2, 2, 3, 2, 3]);
+        let pentatonic = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 3.0, 2.0, 3.0]);
         assert_eq!(pentatonic.note_count(), 5);
     }
 
@@ -690,45 +788,48 @@ mod tests {
 
     #[test]
     fn tonality_new_terminates_and_reads_back_widths() {
-        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         assert_eq!(
             t.widths(),
             &[
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(1),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(1)
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0)
             ]
         );
         // Everything past the 7 widths is the 0 terminator.
-        assert_eq!(t.widths[7], InstrumentKeyInterval(0));
+        assert_eq!(t.widths[7], InstrumentKeyInterval(0.0));
     }
 
     #[test]
     fn key_of_walks_the_scale_from_the_tonic() {
         // Bilawal on C octave 1 (offset 12): scale notes land on
         // 12 14 16 17 19 21 23, then the octave Sa at 24.
-        let t = Tonality::new(harmonium_key(12), &[2, 2, 1, 2, 2, 2, 1]);
-        let line: Vec<u8> = (0..=7)
+        let t = Tonality::new(harmonium_key(12.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+        let line: Vec<f32> = (0..=7)
             .map(|d| t.key_of(ScaleNote { offset: d }).offset)
             .collect();
-        assert_eq!(line, vec![12, 14, 16, 17, 19, 21, 23, 24]);
+        assert_eq!(line, vec![12.0, 14.0, 16.0, 17.0, 19.0, 21.0, 23.0, 24.0]);
     }
 
     #[test]
     fn well_formed_true_when_widths_sum_to_n() {
-        let bilawal = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let bilawal = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         assert!(bilawal.well_formed(12));
     }
 
     #[test]
     fn well_formed_false_when_sum_short_or_over() {
-        let short = Tonality::new(harmonium_key(0), &[2, 2, 1]); // sums to 5
+        let short = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0]); // sums to 5
         assert!(!short.well_formed(12));
-        let over = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1, 2]); // 14
+        let over = Tonality::new(
+            harmonium_key(0.0),
+            &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0, 2.0],
+        ); // 14
         assert!(!over.well_formed(12));
     }
 
@@ -740,10 +841,10 @@ mod tests {
         let tuning = Tuning::new(TuningSpec {
             root_note_hz: 440.0,
             kind: TuningKind::TwelveTet,
-            root: harmonium_key(21),
+            root: harmonium_key(21.0),
         });
         // Singer puts Sa on D in octave 1 (offset 14).
-        let sa = harmonium_key(14);
+        let sa = harmonium_key(14.0);
         // Key → Hz: D sits *below* A in the same octave, so the interval
         // is negative (delta = -7 → octave -1): 440 × 2^(5/12) × 2^-1 ≈
         // 293.7 Hz. The slot and the octave come from the same delta, so a
@@ -775,11 +876,56 @@ mod tests {
         let tuning = Tuning::new(TuningSpec {
             root_note_hz: 261.625_56,
             kind: TuningKind::TwelveTet,
-            root: harmonium_key(0),
+            root: harmonium_key(0.0),
         });
-        let c4 = harmonium_key(0); // octave 0
-        let c5 = harmonium_key(12); // octave 1, same fold
+        let c4 = harmonium_key(0.0); // octave 0
+        let c5 = harmonium_key(12.0); // octave 1, same fold
         assert!((tuning_view::hz(&tuning, c5) - 2.0 * tuning_view::hz(&tuning, c4)).abs() < 1e-2);
+    }
+
+    #[test]
+    fn fractional_key_interpolates_in_cents_not_hz() {
+        // The slide. 12-TET, C at slot 0. A key halfway between slot 0 and
+        // slot 1 must sit at the *cents* midpoint (a quarter-tone, +50
+        // cents = ×2^(1/24)), NOT the arithmetic mean of the two
+        // frequencies — which would read sharp.
+        let tuning = Tuning::new(TuningSpec {
+            root_note_hz: 261.625_56,
+            kind: TuningKind::TwelveTet,
+            root: harmonium_key(0.0),
+        });
+        let lo = tuning_view::hz(&tuning, harmonium_key(0.0));
+        let hi = tuning_view::hz(&tuning, harmonium_key(1.0));
+        let mid = tuning_view::hz(&tuning, harmonium_key(0.5));
+
+        let geometric = (lo * hi).sqrt(); // cents midpoint
+        let arithmetic = (lo + hi) / 2.0; // sharp
+        assert!(
+            (mid - geometric).abs() < 1e-2,
+            "got {mid}, want {geometric}"
+        );
+        assert!(
+            (mid - arithmetic).abs() > 0.1,
+            "must NOT be the arithmetic mean {arithmetic}"
+        );
+    }
+
+    #[test]
+    fn fractional_key_interpolates_across_the_octave_wrap() {
+        // A key at 11.5 sits between slot 11 (B) and slot 0 an octave up
+        // (C5). The wrap is handled by slot_log2's +octave, so the result
+        // is the cents midpoint of B4 and C5 — strictly between them and
+        // above B4.
+        let tuning = Tuning::new(TuningSpec {
+            root_note_hz: 261.625_56,
+            kind: TuningKind::TwelveTet,
+            root: harmonium_key(0.0),
+        });
+        let b4 = tuning_view::hz(&tuning, harmonium_key(11.0));
+        let c5 = tuning_view::hz(&tuning, harmonium_key(12.0));
+        let mid = tuning_view::hz(&tuning, harmonium_key(11.5));
+        assert!(b4 < mid && mid < c5, "{b4} < {mid} < {c5}");
+        assert!((mid - (b4 * c5).sqrt()).abs() < 1e-2);
     }
 
     #[test]
@@ -792,15 +938,34 @@ mod tests {
         let tuning = Tuning::new(TuningSpec {
             root_note_hz: 440.0,
             kind: TuningKind::TwelveTet,
-            root: harmonium_key(9),
+            root: harmonium_key(9.0),
         });
-        let line: Vec<i32> = [0u8, 2, 4, 5, 7, 9, 11]
+        let line: Vec<i32> = [0.0f32, 2.0, 4.0, 5.0, 7.0, 9.0, 11.0]
             .iter()
             .map(|&d| tuning_view::hz(&tuning, harmonium_key(d)).round() as i32)
             .collect();
         // Strictly non-decreasing, and a C-major octave from C4.
         assert!(line.windows(2).all(|w| w[1] >= w[0]), "{line:?}");
         assert_eq!(line, vec![262, 294, 330, 349, 392, 440, 494]);
+    }
+
+    #[test]
+    fn tuning_log2_slots_are_the_exp_inverse_of_linear() {
+        // The two stored representations are filled together in `new` and
+        // must stay in lock-step: exp2(slots_log2[i]) == slots_linear[i].
+        // (Private fields — visible only because this test module is inside
+        // the `music` module; the seal holds for everyone outside.)
+        for kind in [TuningKind::TwelveTet, TuningKind::HindustaniJust] {
+            let t = Tuning::new(TuningSpec {
+                root_note_hz: 261.625_56,
+                kind,
+                root: harmonium_key(0.0),
+            });
+            assert_eq!(t.slots_linear.len(), t.slots_log2.len());
+            for (lin, lg) in t.slots_linear.iter().zip(&t.slots_log2) {
+                assert!((lg.exp2() - lin).abs() < 1e-2, "{kind:?}: {lg} vs {lin}");
+            }
+        }
     }
 
     // --- FFI surface: the crossing types are Copy ---------------------

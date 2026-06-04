@@ -160,11 +160,13 @@ fn rows(info: &MusicInfo) -> (String, String, String) {
         .collect();
 
     // The Sa-relative semitone of each note: `key − tonic` (Bilawal →
-    // `0 2 4 5 7 9 11`).
+    // `0 2 4 5 7 9 11`). The keys here are whole (scale notes land on
+    // keyboard keys), so `{:.0}` renders them as plain integers — the
+    // fractional slide never reaches this math view.
     let deg_s = format!(
         "deg {}",
         keys.iter()
-            .map(|&k| (k - tonality.tonic).0.to_string())
+            .map(|&k| format!("{:.0}", (k - tonality.tonic).0))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -172,7 +174,7 @@ fn rows(info: &MusicInfo) -> (String, String, String) {
     let key_s = format!(
         "key {}",
         keys.iter()
-            .map(|k| k.offset.to_string())
+            .map(|k| format!("{:.0}", k.offset))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -203,11 +205,11 @@ mod tests {
                 root_note_hz: 440.0,
                 kind: TuningKind::TwelveTet,
                 // A in octave 1.
-                root: harmonium_key(21),
+                root: harmonium_key(21.0),
             },
             // Bilawal (major) on C in octave 1 — one octave below the
             // root, so the scale lands in the middle register.
-            tonality: Tonality::new(harmonium_key(12), &[2, 2, 1, 2, 2, 2, 1]),
+            tonality: Tonality::new(harmonium_key(12.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]),
         }
     }
 

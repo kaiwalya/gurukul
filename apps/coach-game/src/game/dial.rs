@@ -64,10 +64,15 @@ const SLOT_COUNT: usize = 12;
 /// holds the `Tonality`; the coach is not consulted.
 pub fn in_scale_mask(tonality: &Tonality) -> [bool; SLOT_COUNT] {
     let mut mask = [false; SLOT_COUNT];
-    let mut cursor = tonality.tonic.offset as usize % SLOT_COUNT;
+    // The scale ring is a *discrete* projection — it lights whole slots —
+    // so round the continuous key positions to integer slot indices. Scale
+    // widths and the tonic are whole numbers by the `Tonality` invariant
+    // (only the live slide is fractional), so rounding is exact here, not a
+    // fudge.
+    let mut cursor = tonality.tonic.offset.round() as usize % SLOT_COUNT;
     mask[cursor] = true;
     for width in tonality.widths() {
-        cursor = (cursor + width.0 as usize) % SLOT_COUNT;
+        cursor = (cursor + width.0.round() as usize) % SLOT_COUNT;
         mask[cursor] = true;
     }
     mask
@@ -248,7 +253,7 @@ mod tests {
     fn bilawal_mask_from_root_highlights_seven_slots() {
         // Bilawal on Safed-1 (slot 0) → Sa Re Ga Ma Pa Dha Ni at slots
         // 0, 2, 4, 5, 7, 9, 11. Komal/tivra slots (1, 3, 6, 8, 10) off.
-        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let mask = in_scale_mask(&t);
         let expected = [
             true, false, true, false, true, true, false, true, false, true, false, true,
@@ -261,7 +266,7 @@ mod tests {
     fn bilawal_mask_rotates_with_tonic() {
         // Same Bilawal shape, Sa on Safed-2 (slot 2 / D): visited slots
         // are 2, 4, 6, 7, 9, 11, 1 → mask shifts by 2.
-        let t = Tonality::new(harmonium_key(2), &[2, 2, 1, 2, 2, 2, 1]);
+        let t = Tonality::new(harmonium_key(2.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let mask = in_scale_mask(&t);
         let expected = [
             false, true, true, false, true, false, true, true, false, true, false, true,
@@ -273,8 +278,8 @@ mod tests {
     fn mask_folds_tonic_above_one_octave() {
         // A tonic key an octave up (offset 14 = octave 1, slot 2) folds
         // to the same mask as slot 2 — the ring shows one octave.
-        let high = Tonality::new(harmonium_key(14), &[2, 2, 1, 2, 2, 2, 1]);
-        let low = Tonality::new(harmonium_key(2), &[2, 2, 1, 2, 2, 2, 1]);
+        let high = Tonality::new(harmonium_key(14.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+        let low = Tonality::new(harmonium_key(2.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         assert_eq!(in_scale_mask(&high), in_scale_mask(&low));
     }
 
@@ -284,7 +289,7 @@ mod tests {
     fn build_slots_marks_in_scale_active_and_others_inactive() {
         // Bilawal on Safed-1, 12-TET. The active flags must equal the
         // in-scale mask, and the angles the 12-TET geometry.
-        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let slots = build_slots(TuningKind::TwelveTet, &t);
         assert_eq!(slots.len(), SLOT_COUNT);
 
@@ -301,7 +306,7 @@ mod tests {
     fn build_slots_angles_follow_the_tuning_kind() {
         // Just intonation moves the slot angles (Ga ~14 cents flat) while
         // the active set — a pure tonality projection — stays put.
-        let t = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        let t = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
         let tet = build_slots(TuningKind::TwelveTet, &t);
         let just = build_slots(TuningKind::HindustaniJust, &t);
         assert_ne!(tet[4].angle, just[4].angle, "Ga angle must differ");

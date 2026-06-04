@@ -101,7 +101,10 @@ impl Default for SongTonality {
         // tuning root (`harmonium_key(21)`), so the scale resolves to
         // the middle register (C ≈ 262 Hz) rather than the lowest
         // octave on the line.
-        Self(Tonality::new(harmonium_key(12), &[2, 2, 1, 2, 2, 2, 1]))
+        Self(Tonality::new(
+            harmonium_key(12.0),
+            &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0],
+        ))
     }
 }
 
@@ -119,7 +122,7 @@ impl AppSettings {
         TuningSpec {
             root_note_hz: self.reference_hz,
             kind: self.tuning_kind,
-            root: harmonium_key(21),
+            root: harmonium_key(21.0),
         }
     }
 }
@@ -141,17 +144,17 @@ mod tests {
         let SongTonality(t) = SongTonality::default();
         // Sa on C in octave 1 — one octave below the A=440 root, so the
         // scale resolves to the middle register.
-        assert_eq!(t.tonic, harmonium_key(12));
+        assert_eq!(t.tonic, harmonium_key(12.0));
         assert_eq!(
             t.widths(),
             &[
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(1),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(2),
-                InstrumentKeyInterval(1)
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(2.0),
+                InstrumentKeyInterval(1.0)
             ]
         );
         // Well-formed against a 12-slot tuning.
@@ -164,7 +167,7 @@ mod tests {
         // in octave 1 (offset 21) and root_note_hz is the reference
         // directly.
         let spec = AppSettings::default().tuning_spec();
-        assert_eq!(spec.root, harmonium_key(21));
+        assert_eq!(spec.root, harmonium_key(21.0));
         assert_eq!(spec.root_note_hz, 440.0);
         assert_eq!(spec.kind, TuningKind::TwelveTet);
     }
