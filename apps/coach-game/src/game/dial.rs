@@ -49,24 +49,24 @@ pub struct InGameDial;
 /// slot count rather than a constant.
 const SLOT_COUNT: usize = 12;
 
-/// Walk a [`Tonality`]'s scale intervals to a 12-slot in-scale mask.
+/// Walk a [`Tonality`]'s key-widths to a 12-slot in-scale mask.
 /// Index `i` is `true` iff slot `i` is one of the scale's notes.
 ///
-/// Starts at the tonic's within-octave position (`tonic.fold()`) and
-/// adds each interval modulo [`SLOT_COUNT`], marking every visited slot.
-/// The tonic itself is always lit; the final step lands back on it by
-/// construction (a well-formed scale's intervals sum to the slot count),
-/// so it isn't double-counted.
+/// Starts at the tonic's within-octave position (`tonic.offset %
+/// SLOT_COUNT`) and adds each key-width modulo [`SLOT_COUNT`], marking
+/// every visited slot. The tonic itself is always lit; the final width
+/// lands back on it by construction (a well-formed scale's widths sum to
+/// the slot count), so it isn't double-counted.
 ///
 /// This is the **scale ring** (layer 4) — pure integer projection of the
 /// `Tonality`, tuning-independent. Lives head-side because the head
 /// holds the `Tonality`; the coach is not consulted.
 pub fn in_scale_mask(tonality: &Tonality) -> [bool; SLOT_COUNT] {
     let mut mask = [false; SLOT_COUNT];
-    let mut cursor = (tonality.tonic.fold() as usize) % SLOT_COUNT;
+    let mut cursor = tonality.tonic.offset as usize % SLOT_COUNT;
     mask[cursor] = true;
-    for &step in tonality.steps() {
-        cursor = (cursor + step as usize) % SLOT_COUNT;
+    for width in tonality.widths() {
+        cursor = (cursor + width.0 as usize) % SLOT_COUNT;
         mask[cursor] = true;
     }
     mask
@@ -263,13 +263,7 @@ mod tests {
     fn mask_folds_tonic_above_one_octave() {
         // A tonic key an octave up (offset 14 = octave 1, slot 2) folds
         // to the same mask as slot 2 — the ring shows one octave.
-        let high = Tonality::new(
-            domain_ports::music::InstrumentKey {
-                offset: 14,
-                octave_size: 12,
-            },
-            &[2, 2, 1, 2, 2, 2, 1],
-        );
+        let high = Tonality::new(harmonium_key(14), &[2, 2, 1, 2, 2, 2, 1]);
         let low = Tonality::new(harmonium_key(2), &[2, 2, 1, 2, 2, 2, 1]);
         assert_eq!(in_scale_mask(&high), in_scale_mask(&low));
     }

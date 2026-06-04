@@ -31,7 +31,7 @@ use crate::state::AppState;
 use crate::ui::*;
 use bevy::prelude::*;
 use domain_ports::app_coach::MusicInfo;
-use domain_ports::music::{tuning_view, InstrumentKey, Tuning};
+use domain_ports::music::{tuning_view, InstrumentKey, ScaleNote, Tuning};
 
 /// Marker for the panel container so its row children can be located
 /// and refreshed when the snapshot changes.
@@ -147,40 +147,26 @@ pub fn refresh(
 fn rows(info: &MusicInfo) -> (String, String, String) {
     let tonality = info.tonality;
     let tuning = Tuning::new(info.tuning);
-    let octave_size = tonality.tonic.octave_size;
 
-    // 0-based prefix sum of the scale intervals: the Sa-relative
-    // semitone of each degree. `steps()` holds every interval including
-    // the final one that closes back to Sa an octave up; we drop that
-    // last gap so the row lists one entry per *scale note* (Sa..Ni for
-    // Bilawal → `0 2 4 5 7 9 11`), not a redundant octave Sa.
-    let steps = tonality.steps();
-    let gaps = steps.split_last().map(|(_, head)| head).unwrap_or(steps);
-    let mut deg = 0u8;
-    let degrees: Vec<u8> = std::iter::once(0)
-        .chain(gaps.iter().map(|&step| {
-            deg += step;
-            deg
-        }))
+    // One entry per *scale note*. `widths()` holds every key-width
+    // including the final one that closes back to Sa an octave up; the
+    // notes themselves are `ScaleNote(0)..ScaleNote(n-1)` — Sa..Ni for
+    // Bilawal — so we walk `0..widths.len()`, which drops that redundant
+    // octave Sa.
+    let note_count = tonality.widths().len();
+    let keys: Vec<InstrumentKey> = (0..note_count as u8)
+        .map(|d| tonality.key_of(ScaleNote { offset: d }))
         .collect();
 
+    // The Sa-relative semitone of each note: `key − tonic` (Bilawal →
+    // `0 2 4 5 7 9 11`).
     let deg_s = format!(
         "deg {}",
-        degrees
-            .iter()
-            .map(|d| d.to_string())
+        keys.iter()
+            .map(|&k| (k - tonality.tonic).0.to_string())
             .collect::<Vec<_>>()
             .join(" ")
     );
-
-    // Each degree placed on the keyboard: tonic key + degree semitones.
-    let keys: Vec<InstrumentKey> = degrees
-        .iter()
-        .map(|&d| InstrumentKey {
-            offset: tonality.tonic.offset + d,
-            octave_size,
-        })
-        .collect();
 
     let key_s = format!(
         "key {}",

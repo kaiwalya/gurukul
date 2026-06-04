@@ -127,6 +127,7 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain_ports::music::KeyInterval;
 
     #[test]
     fn app_settings_default_matches_design() {
@@ -141,7 +142,18 @@ mod tests {
         // Sa on C in octave 1 — one octave below the A=440 root, so the
         // scale resolves to the middle register.
         assert_eq!(t.tonic, harmonium_key(12));
-        assert_eq!(t.steps(), &[2, 2, 1, 2, 2, 2, 1]);
+        assert_eq!(
+            t.widths(),
+            &[
+                KeyInterval(2),
+                KeyInterval(2),
+                KeyInterval(1),
+                KeyInterval(2),
+                KeyInterval(2),
+                KeyInterval(2),
+                KeyInterval(1)
+            ]
+        );
         // Well-formed against a 12-slot tuning.
         assert!(t.well_formed(12));
     }

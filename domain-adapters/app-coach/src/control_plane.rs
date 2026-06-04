@@ -319,8 +319,8 @@ impl ControlPlane {
         let tuning = Tuning::new(spec);
         debug_assert!(
             tonality.well_formed(tuning.n() as u8),
-            "tonality scale intervals {:?} do not sum to tuning slot count {}",
-            tonality.steps(),
+            "tonality key-widths {:?} do not sum to tuning slot count {}",
+            tonality.widths(),
             tuning.n(),
         );
         tel_debug!(
