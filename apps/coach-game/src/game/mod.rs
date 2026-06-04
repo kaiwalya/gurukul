@@ -34,7 +34,7 @@ pub fn on_enter(
         sample_rate: None,
         buffer_frames: None,
     }));
-    // Whether we got here from MainMenu (New Game / Continue) or from
+    // Whether we got here from MainMenu (Free Practice / Continue) or from
     // Paused (Resume), a session is now live and there's no separate
     // paused-session to keep around.
     has_paused.0 = false;

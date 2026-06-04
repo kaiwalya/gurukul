@@ -1,9 +1,9 @@
-//! Main menu screen: title + three buttons (New Game / Settings / Quit).
+//! Main menu screen: title + three buttons (Free Practice / Settings / Quit).
 //!
 //! When `HasPausedSession` is set, the start button reads "Continue"
-//! instead of "New Game" — the marker (`NewGameButton`) stays the same,
-//! since both labels lead to InGame and the OnEnter handler clears the
-//! flag either way.
+//! instead of "Free Practice" — the marker (`NewGameButton`) stays the
+//! same, since both labels lead to InGame and the OnEnter handler clears
+//! the flag either way.
 
 use crate::state::{AppState, HasPausedSession};
 use crate::ui::*;
@@ -17,7 +17,7 @@ pub struct SettingsButton;
 pub struct QuitButton;
 
 pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
-    let start_label = if has_paused.0 { "Continue" } else { "New Game" };
+    let start_label = if has_paused.0 { "Continue" } else { "Free Practice" };
     commands.spawn((
         DespawnOnExit(AppState::MainMenu),
         Node {

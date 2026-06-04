@@ -25,7 +25,7 @@ pub enum AppState {
 /// True while there's a paused session the player can resume. Set by
 /// `OnEnter(Paused)`, cleared when the player Quits-to-Main from the
 /// pause overlay (which truly ends the run). Drives the main menu's
-/// Continue/New Game label.
+/// Continue/Free Practice label.
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct HasPausedSession(pub bool);
 
