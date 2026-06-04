@@ -40,7 +40,7 @@
 //!   not a point type. Its "interval" is a multiplicative ratio.
 //! - **Slot space** is an index into a [`Tuning`]'s `slots` array, where
 //!   `slots[0]` is the tuning's root. What the tuning *math* works in.
-//!   The bridge from an [`InstrumentKey`] to a slot is [`tuning_view::slot_of`].
+//!   The bridge from an [`InstrumentKey`] to its Hz is [`tuning_view::hz`].
 //!
 //! The two affine spaces are deliberately *parallel but distinct*: a
 //! [`ScaleNoteInterval`] (a note-count) and an [`InstrumentKeyInterval`]
@@ -509,7 +509,7 @@ pub struct Tuning {
     pub slots: Vec<f32>,
     /// The [`InstrumentKey`] that slot 0 sits on — the key the instrument was
     /// tuned from. The bridge between the two spaces (see
-    /// [`tuning_view::slot_of`]).
+    /// [`tuning_view::hz`]).
     pub root: InstrumentKey,
 }
 
@@ -537,27 +537,36 @@ pub mod tuning_view {
     use super::{InstrumentKey, InstrumentKeyInterval, Tuning};
 
     /// Signed [`InstrumentKeyInterval`] from the tuning's root to `key`. The one
-    /// quantity both [`slot_of`] and [`hz`] derive from — computing slot
-    /// and octave from the *same* delta is what keeps them consistent
-    /// (split origins were the cause of the octave-wrap bug). Just the
-    /// `InstrumentKey − InstrumentKey` subtraction; the period that turns
-    /// this delta into a slot + octave is the tuning's `N`, applied in
-    /// [`slot_of`] / [`hz`] below — **this is the one place that knows the
-    /// period**, which is why a bare key/interval doesn't carry one.
+    /// quantity [`hz`] derives from — computing slot and octave from the
+    /// *same* delta is what keeps them consistent (split origins were the
+    /// cause of the octave-wrap bug). Just the `InstrumentKey −
+    /// InstrumentKey` subtraction; the period that turns this delta into a
+    /// slot + octave is the tuning's `N`, applied in [`hz`] below — **this
+    /// is the one place that knows the period**, which is why a bare
+    /// key/interval doesn't carry one.
     fn delta(t: &Tuning, key: InstrumentKey) -> InstrumentKeyInterval {
         key - t.root
     }
 
-    /// Keyboard space → slot space. Folds the root-relative interval to
-    /// one octave (the slot pattern repeats every octave), so the result
-    /// is always `0..N`. The period is the tuning's slot count `N`
-    /// (`slots.len()`) — the sole authority on keys-per-octave. A key from
-    /// a mismatched keyboard (e.g. a 22-shruti key against a 12-slot
-    /// tuning) simply folds wrong here, at the one seam that has the `N`
-    /// to judge it.
-    pub fn slot_of(t: &Tuning, key: InstrumentKey) -> usize {
-        let n = t.slots.len() as i32;
-        delta(t, key).0.rem_euclid(n) as usize
+    /// Where a frequency sits **within one octave**, as a fraction in
+    /// `[0, 1)`: 0 is the octave start (a power-of-two multiple of the
+    /// reference), 0.5 is a tritone up, approaching 1 wraps back to 0.
+    ///
+    /// This is the log-frequency fold — `log2(hz / ref)` mod 1 — the
+    /// model-side truth about "position around the octave circle",
+    /// independent of how anything draws it. A view that paints a dial
+    /// turns this into an angle by multiplying by its circle's full turn;
+    /// the fold itself (which octaves wrap onto each other) lives here, not
+    /// in the view. Tuning-independent: it places *any* Hz, whether a
+    /// slot's target frequency or a live, sliding voice between slots.
+    ///
+    /// `ref_hz` is the frequency that maps to position 0 (the octave
+    /// anchor). Non-positive `hz` is a caller bug; returns 0.
+    pub fn octave_position(hz: f32, ref_hz: f32) -> f32 {
+        if hz <= 0.0 {
+            return 0.0;
+        }
+        (hz / ref_hz).log2().rem_euclid(1.0)
     }
 
     /// Hz of any key, at any octave, **relative to the root**. `slots`
@@ -735,18 +744,30 @@ mod tests {
         });
         // Singer puts Sa on D in octave 1 (offset 14).
         let sa = harmonium_key(14);
-        // Keyboard → slot: (14 - 21).rem_euclid(12) = 5.
-        assert_eq!(tuning_view::slot_of(&tuning, sa), 5);
-        // Slot → Hz: D sits *below* A in the same octave, so the
-        // interval is negative (delta = -7 → octave -1): 440 × 2^(5/12)
-        // × 2^-1 ≈ 293.7 Hz. The octave comes from the same delta as the
-        // slot, so a key below the root lands an octave down rather than
-        // wrapping up above A.
+        // Key → Hz: D sits *below* A in the same octave, so the interval
+        // is negative (delta = -7 → octave -1): 440 × 2^(5/12) × 2^-1 ≈
+        // 293.7 Hz. The slot and the octave come from the same delta, so a
+        // key below the root lands an octave down rather than wrapping up
+        // above A.
         let hz = tuning_view::hz(&tuning, sa);
         assert!(
             (hz - 293.66).abs() < 0.1,
             "Sa should be ~293.7 Hz, got {hz}"
         );
+    }
+
+    #[test]
+    fn octave_position_folds_to_unit_interval() {
+        let r = 261.625_56; // C
+                            // The reference itself sits at 0.
+        assert!(tuning_view::octave_position(r, r).abs() < 1e-5);
+        // An octave up folds back to 0.
+        assert!(tuning_view::octave_position(r * 2.0, r).abs() < 1e-3);
+        // A tritone (6 semitones) sits at the half-way point.
+        let tritone = r * 2f32.powf(6.0 / 12.0);
+        assert!((tuning_view::octave_position(tritone, r) - 0.5).abs() < 1e-3);
+        // Non-positive Hz is a caller bug → 0.
+        assert_eq!(tuning_view::octave_position(0.0, r), 0.0);
     }
 
     #[test]

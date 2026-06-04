@@ -30,7 +30,7 @@ use crate::state::{AppState, SongTonality};
 use crate::widgets::note_dial::{DialScale, DialSlot, DialState, Needle, NeedleStyle};
 use bevy::prelude::*;
 use domain_ports::app_coach::FeatureSnapshot;
-use domain_ports::music::Tonality;
+use domain_ports::music::{tuning_view, Tonality, TuningKind};
 use std::f32::consts::TAU;
 
 /// Reference frequency for the root (C / Sa) used by [`angle_from_f0`].
@@ -148,83 +148,60 @@ pub fn update_from_features(
     });
 }
 
-/// 12-tone equal temperament: each slot is `TAU/12` apart.
+/// The 12 slot angles for a tuning kind, built from the canonical
+/// frequencies in [`domain_ports::music`].
 ///
-/// Slot 0 = C, slot 1 = C♯, …, slot 11 = B. All slots are exactly
-/// 100 cents apart.
-pub fn tuning_12tet() -> [f32; 12] {
-    let mut out = [0.0; 12];
+/// Each slot's frequency comes from the model's
+/// [`TuningKind::shape`](domain_ports::music::TuningKind::shape) (the one
+/// place the 12-TET spacing and the Just 5-limit ratios are defined), and
+/// the dial only does the *geometry*: turn each slot's
+/// [`octave_position`](domain_ports::music::tuning_view::octave_position)
+/// into a clock angle (`× TAU`). So switching a ratio happens in the model
+/// and the dial follows automatically — no ratio table lives here.
+///
+/// Angles are in `[0, TAU)`, clock convention: 0 = 12 o'clock = C / Sa,
+/// positive radians clockwise. The reference frequency the model is built
+/// from doesn't matter for the *angles* (only ratios survive the
+/// octave-position fold), so we build the shape against [`C_REF_HZ`] and
+/// read positions relative to the same anchor.
+fn slot_angles(kind: TuningKind) -> [f32; SLOT_COUNT] {
+    let slots = kind.shape(C_REF_HZ);
+    let mut out = [0.0; SLOT_COUNT];
     for (i, a) in out.iter_mut().enumerate() {
-        *a = i as f32 * TAU / 12.0;
+        *a = tuning_view::octave_position(slots[i], C_REF_HZ) * TAU;
     }
     out
 }
 
-/// 12 swaras of Hindustani classical music in Just intonation, with
-/// Sa as the root. Ratios are the conventional 5-limit set with komal
-/// Ni at 9/5 (the Hindustani convention, vs the Pythagorean 16/9 used
-/// in some Western Just tables).
-///
-/// Slot order, ratio, Western analogue:
-///
-/// 0  Sa          1/1     C
-/// 1  komal Re    16/15   C♯
-/// 2  shuddha Re   9/8    D
-/// 3  komal Ga     6/5    E♭
-/// 4  shuddha Ga   5/4    E
-/// 5  shuddha Ma   4/3    F
-/// 6  tivra Ma    45/32   F♯
-/// 7  Pa           3/2    G
-/// 8  komal Dha    8/5    A♭
-/// 9  shuddha Dha  5/3    A
-/// 10 komal Ni     9/5    B♭
-/// 11 shuddha Ni  15/8    B
-///
-/// Angle = log2(ratio) * TAU, which places each slot at its true
-/// log-frequency position on the octave circle. Pa (3/2 ≈ 1.5) lands
-/// near 7 o'clock but a touch sharper than the 12-TET G; shuddha Ga
-/// (5/4) sits noticeably flatter than the 12-TET E (about 14 cents).
-pub fn tuning_hindustani_just() -> [f32; 12] {
-    const RATIOS: [(u32, u32); 12] = [
-        (1, 1),
-        (16, 15),
-        (9, 8),
-        (6, 5),
-        (5, 4),
-        (4, 3),
-        (45, 32),
-        (3, 2),
-        (8, 5),
-        (5, 3),
-        (9, 5),
-        (15, 8),
-    ];
-    let mut out = [0.0; 12];
-    for (i, (num, den)) in RATIOS.iter().enumerate() {
-        let ratio = *num as f32 / *den as f32;
-        out[i] = ratio.log2() * TAU;
-    }
-    out
+/// 12-tone equal temperament slot angles — each slot 100 cents (one
+/// twelfth of the circle) apart. Thin wrapper over [`slot_angles`].
+pub fn tuning_12tet() -> [f32; SLOT_COUNT] {
+    slot_angles(TuningKind::TwelveTet)
+}
+
+/// Hindustani Just-intonation slot angles — the 5-limit swaras placed at
+/// their true log-frequency positions (Pa a touch sharper than 12-TET G,
+/// shuddha Ga ~14 cents flatter than 12-TET E). Thin wrapper over
+/// [`slot_angles`]; the ratios themselves live in the model's
+/// [`TuningKind::HindustaniJust`](domain_ports::music::TuningKind).
+pub fn tuning_hindustani_just() -> [f32; SLOT_COUNT] {
+    slot_angles(TuningKind::HindustaniJust)
 }
 
 /// Map a frequency to a dial angle on the log-frequency circle, with
 /// C as the root.
 ///
-/// `log2(hz / C_REF_HZ)` is "how many octaves above C". Multiplied by
-/// `TAU` puts one octave around the full circle; `rem_euclid(TAU)`
-/// folds higher octaves back onto the same circle. Result is in
-/// `[0, TAU)`, clock convention: 0 = 12 o'clock = C, positive radians
-/// clockwise. Non-positive frequencies are caller bugs; the function
-/// returns 0 for them.
+/// The model's [`octave_position`](domain_ports::music::tuning_view::octave_position)
+/// does the log-frequency fold (where the pitch sits *within* an octave,
+/// `[0, 1)`); the dial turns that into a clock angle by `× TAU`. Result is
+/// in `[0, TAU)`, clock convention: 0 = 12 o'clock = C, positive radians
+/// clockwise. Non-positive frequencies fold to 0.
 ///
 /// This is tuning-independent: the needle just shows where the pitch
 /// *actually is* on the log-frequency circle. The tuning's job is to
 /// say where the *targets* are.
 pub fn angle_from_f0(hz: f32) -> f32 {
-    if hz <= 0.0 {
-        return 0.0;
-    }
-    (hz / C_REF_HZ).log2().rem_euclid(1.0) * TAU
+    tuning_view::octave_position(hz, C_REF_HZ) * TAU
 }
 
 #[cfg(test)]
