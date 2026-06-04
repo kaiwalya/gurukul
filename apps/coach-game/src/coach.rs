@@ -8,12 +8,35 @@
 
 use crate::state::KnownDevices;
 use bevy::prelude::*;
-use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent};
+use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, MusicInfo};
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
 use std::sync::Arc;
 
 pub struct Coach(pub Box<dyn AppCoach>);
+
+/// The head-side **read model** for the coach's musical frame of
+/// reference (tuning + tonality). Written *only* by [`drain_events`] in
+/// response to a [`CoachEvent::SessionConfigured`]; read by every UI
+/// system (HUD, dial) via `Res<MusicInfoRes>`.
+///
+/// This is the read side of the CQRS split: UI never holds the
+/// [`Coach`] handle to *read* config — writes go out as `Command`s, the
+/// truth comes back as an event that refreshes this resource. `None`
+/// until the first session is configured (honest absence, like the HUD's
+/// `—` placeholder).
+#[derive(Resource, Default)]
+pub struct MusicInfoRes(pub Option<MusicInfo>);
+
+/// The head-side **read model** for the latest live feature snapshot
+/// (`f0`, onset, breath, vibrato). Polled from the coach every tick by
+/// [`drain_events`] and republished here so UI systems read a plain
+/// `Res<LatestFeatures>` instead of holding the [`Coach`] handle.
+///
+/// Unlike [`MusicInfoRes`] this is a high-rate poll (no per-sample
+/// event), so it refreshes every frame rather than on an event.
+#[derive(Resource, Default)]
+pub struct LatestFeatures(pub Option<FeatureSnapshot>);
 
 pub fn spawn_coach(world: &mut World) {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
@@ -46,10 +69,23 @@ pub fn shutdown_on_exit(mut exits: MessageReader<bevy::app::AppExit>, coach: Non
     }
 }
 
-/// Always-on event drain. Splits `DevicesListed` into the
-/// `KnownDevices` resource so the Settings → Audio screen can render
-/// it; surfaces lifecycle / errors / drops as logs.
-pub fn drain_events(coach: NonSend<Coach>, mut known: ResMut<KnownDevices>) {
+/// Always-on read-side sync: the **single** system that holds the
+/// [`Coach`] handle to *read* from it. Drains events and polls features,
+/// republishing both into resources the UI reads. Confining all reads
+/// here keeps the `!Send` handle off every render system (which can then
+/// run as ordinary `Res` readers).
+///
+/// - `DevicesListed` → [`KnownDevices`] (Settings → Audio screen).
+/// - `SessionConfigured` → refresh [`MusicInfoRes`] from `music_info()`
+///   (the read side of the config CQRS round-trip).
+/// - lifecycle / errors / drops → logs.
+/// - every tick → poll `latest_features()` into [`LatestFeatures`].
+pub fn drain_events(
+    coach: NonSend<Coach>,
+    mut known: ResMut<KnownDevices>,
+    mut music: ResMut<MusicInfoRes>,
+    mut features: ResMut<LatestFeatures>,
+) {
     let mut events = Vec::new();
     coach.0.poll_events(&mut events);
     for ev in events {
@@ -67,12 +103,14 @@ pub fn drain_events(coach: NonSend<Coach>, mut known: ResMut<KnownDevices>) {
                 warn!("events dropped: {count}");
             }
             CoachEvent::DefaultInputChanged { .. } => {}
-            // The musical frame was (re)configured. The HUD reads the
-            // published `music_info` snapshot directly each frame, so
-            // there's nothing to fold here — just trace it.
+            // The musical frame was (re)configured. Pull the fresh
+            // snapshot and republish it for the UI to read.
             CoachEvent::SessionConfigured { tuning, tonality } => {
                 info!("session configured: {tuning:?} / {tonality:?}");
+                music.0 = coach.0.music_info();
             }
         }
     }
+    // Live features have no per-sample event — poll each tick.
+    features.0 = coach.0.latest_features();
 }

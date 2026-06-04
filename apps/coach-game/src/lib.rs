@@ -45,6 +45,8 @@ pub fn build_app(app: &mut App) {
         .init_resource::<menu::settings::MusicSelection>()
         .init_resource::<game::LastFeatureTs>()
         .init_resource::<game::hud::LastMusicInfo>()
+        .init_resource::<coach::MusicInfoRes>()
+        .init_resource::<coach::LatestFeatures>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
