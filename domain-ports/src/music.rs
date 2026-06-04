@@ -27,36 +27,39 @@
 //! There are **two affine point/vector spaces** plus a terminal Hz output:
 //!
 //! - **Scale space** (Roman numerals): [`ScaleNote`] is a **point** —
-//!   Sa=0, Re=1, Ga=2. Distances here count *notes* (Sa→Re = 1). This is
-//!   the gauge-free "which degree" axis; its origin is Sa. (We don't model
-//!   a scale-space *vector* yet — nothing subtracts two `ScaleNote`s
-//!   today; add one when a caller needs it.)
+//!   Sa=0, Re=1, Ga=2 — and [`ScaleNoteInterval`] is its **vector**, a
+//!   signed distance counted in *notes*. `ScaleNote − ScaleNote =
+//!   ScaleNoteInterval`; here Sa→Re = 1 (one note). This is the
+//!   gauge-free "which degree" axis; its origin is Sa.
 //! - **Key space** (semitones): [`InstrumentKey`] is a **point** — a
 //!   position on the keyboard line, the thing the player and singer
-//!   *speak* ("Safed-1", "Kaali-1"). [`KeyInterval`] is its **vector** — a
+//!   *speak* ("Safed-1", "Kaali-1"). [`InstrumentKeyInterval`] is its **vector** — a
 //!   signed *distance* in keys. `InstrumentKey − InstrumentKey =
-//!   KeyInterval`. Here Sa→Re = 2 (two semitones).
+//!   InstrumentKeyInterval`. Here Sa→Re = 2 (two semitones).
 //! - **Hz** is the terminal output ([`tuning_view::hz`]) — a plain `f32`,
 //!   not a point type. Its "interval" is a multiplicative ratio.
-//!
-//! The two spaces meet on [`Tonality`]: a scale is a list of **key-widths**
-//! (`[KeyInterval; N]`, e.g. `[2,2,1,2,2,2,1]` semitones) — how many *keys*
-//! each note-step spans. [`Tonality::key_of`] turns a [`ScaleNote`] into an
-//! [`InstrumentKey`] by summing the first *d* widths from the tonic. That
-//! sum is the scale-space → key-space conversion (1 note ⇒ 2 keys for the
-//! first Bilawal step).
-//!
 //! - **Slot space** is an index into a [`Tuning`]'s `slots` array, where
 //!   `slots[0]` is the tuning's root. What the tuning *math* works in.
 //!   The bridge from an [`InstrumentKey`] to a slot is [`tuning_view::slot_of`].
+//!
+//! The two affine spaces are deliberately *parallel but distinct*: a
+//! [`ScaleNoteInterval`] (a note-count) and an [`InstrumentKeyInterval`]
+//! (a key-count) are different types, so a degree-distance can never be
+//! silently spent as a key-distance. They meet on exactly one type,
+//! [`Tonality`]: a scale is a list of **key-widths**
+//! (`[InstrumentKeyInterval; N]`, e.g. `[2,2,1,2,2,2,1]` semitones) — how
+//! many *keys* each note-step spans. [`Tonality::key_of`] turns a
+//! [`ScaleNote`] into an [`InstrumentKey`] by summing the first *d* widths
+//! from the tonic. That sum is the scale-space → key-space conversion
+//! (1 note ⇒ 2 keys for the first Bilawal step).
 //!
 //! The affine algebra is encoded as operator impls, and the gauge law
 //! (below) is encoded as the operators that *don't* exist:
 //!
 //! ```text
-//! InstrumentKey    − InstrumentKey    = KeyInterval     // the only path to Hz; gauge cancels
-//! InstrumentKey    + KeyInterval = InstrumentKey        // place a degree on the keyboard
-//! KeyInterval ± KeyInterval = KeyInterval     // compose distances
+//! InstrumentKey    − InstrumentKey    = InstrumentKeyInterval     // the only path to Hz; gauge cancels
+//! InstrumentKey    + InstrumentKeyInterval = InstrumentKey        // place a degree on the keyboard
+//! InstrumentKeyInterval ± InstrumentKeyInterval = InstrumentKeyInterval     // compose distances
 //! InstrumentKey    + InstrumentKey    → DOES NOT COMPILE   // adding two gauges is nonsense
 //! ```
 //!
@@ -84,11 +87,11 @@
 //!
 //! **The law: no logic may depend on a gauge.** Concretely: nothing may
 //! depend on an *absolute* [`InstrumentKey`] — only on **differences**
-//! ([`KeyInterval`]s), because a difference is what survives a gauge shift
+//! ([`InstrumentKeyInterval`]s), because a difference is what survives a gauge shift
 //! (`(a+c) − (b+c) = a − b`). The type system enforces this: an
 //! [`InstrumentKey`] is just an `offset` with no arithmetic of its own;
 //! the only way to read an octave or fold to a slot is to first subtract
-//! to a [`KeyInterval`] and then divide by the tuning's period `N` (in
+//! to an [`InstrumentKeyInterval`] and then divide by the tuning's period `N` (in
 //! [`tuning_view`]). So the octave-wrap bug (deriving the octave from two
 //! separately gauge-dependent quantities that don't cancel) becomes
 //! **unrepresentable** — you cannot reach the octave without first
@@ -138,7 +141,7 @@ pub const MAX_SCALE_NOTES: usize = 32;
 ///
 /// Being a **point**, an `InstrumentKey` exposes *no* arithmetic of its
 /// own. The only operations are the affine ones below: subtract two keys
-/// to get a [`KeyInterval`], or move a key by a `KeyInterval`.
+/// to get an [`InstrumentKeyInterval`], or move a key by an `InstrumentKeyInterval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstrumentKey {
     pub offset: u8,
@@ -154,49 +157,49 @@ pub struct InstrumentKey {
 /// [`Tuning`] at the point of use ([`tuning_view`]), not from the
 /// interval itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyInterval(pub i32);
+pub struct InstrumentKeyInterval(pub i32);
 
-impl Add for KeyInterval {
-    type Output = KeyInterval;
-    fn add(self, rhs: KeyInterval) -> KeyInterval {
-        KeyInterval(self.0 + rhs.0)
+impl Add for InstrumentKeyInterval {
+    type Output = InstrumentKeyInterval;
+    fn add(self, rhs: InstrumentKeyInterval) -> InstrumentKeyInterval {
+        InstrumentKeyInterval(self.0 + rhs.0)
     }
 }
 
-impl Sub for KeyInterval {
-    type Output = KeyInterval;
-    fn sub(self, rhs: KeyInterval) -> KeyInterval {
-        KeyInterval(self.0 - rhs.0)
+impl Sub for InstrumentKeyInterval {
+    type Output = InstrumentKeyInterval;
+    fn sub(self, rhs: InstrumentKeyInterval) -> InstrumentKeyInterval {
+        InstrumentKeyInterval(self.0 - rhs.0)
     }
 }
 
-impl Neg for KeyInterval {
-    type Output = KeyInterval;
-    fn neg(self) -> KeyInterval {
-        KeyInterval(-self.0)
+impl Neg for InstrumentKeyInterval {
+    type Output = InstrumentKeyInterval;
+    fn neg(self) -> InstrumentKeyInterval {
+        InstrumentKeyInterval(-self.0)
     }
 }
 
-/// `InstrumentKey − InstrumentKey = KeyInterval` — the difference of two
+/// `InstrumentKey − InstrumentKey = InstrumentKeyInterval` — the difference of two
 /// positions. **The only path from points to the invariant**: every Hz
 /// computation starts here, which is why the gauge cancels structurally.
 impl Sub for InstrumentKey {
-    type Output = KeyInterval;
-    fn sub(self, rhs: InstrumentKey) -> KeyInterval {
-        KeyInterval(self.offset as i32 - rhs.offset as i32)
+    type Output = InstrumentKeyInterval;
+    fn sub(self, rhs: InstrumentKey) -> InstrumentKeyInterval {
+        InstrumentKeyInterval(self.offset as i32 - rhs.offset as i32)
     }
 }
 
-/// `InstrumentKey + KeyInterval = InstrumentKey` — move from a position by a
+/// `InstrumentKey + InstrumentKeyInterval = InstrumentKey` — move from a position by a
 /// distance. Used to place a scale note on the keyboard
 /// (`tonic + Σ widths`). Debug-asserts the result stays on the
 /// representable line (non-negative, fits `u8`).
 ///
 /// Note the *absence* of `impl Add for InstrumentKey` (point + point):
 /// adding two gauges is nonsense, so it deliberately does not compile.
-impl Add<KeyInterval> for InstrumentKey {
+impl Add<InstrumentKeyInterval> for InstrumentKey {
     type Output = InstrumentKey;
-    fn add(self, rhs: KeyInterval) -> InstrumentKey {
+    fn add(self, rhs: InstrumentKeyInterval) -> InstrumentKey {
         let sum = self.offset as i32 + rhs.0;
         debug_assert!(
             (0..=u8::MAX as i32).contains(&sum),
@@ -285,15 +288,82 @@ impl TuningKind {
 /// `ScaleNote(2)`, and so on (Western Roman numerals: I, II, III…).
 ///
 /// This is the gauge-free "which degree" axis. Distances here count
-/// **notes**, not keys: Sa→Re is *one* `ScaleNote` apart, even though it
-/// is *two* [`KeyInterval`] keys apart on the keyboard. The note→key
-/// conversion is the scale's shape, applied by [`Tonality::key_of`].
+/// **notes**, not keys: Sa→Re is *one* [`ScaleNoteInterval`] apart, even
+/// though it is *two* [`InstrumentKeyInterval`] keys apart on the
+/// keyboard. The note→key conversion is the scale's shape, applied by
+/// [`Tonality::key_of`].
 ///
 /// `offset` is a `u8` note index; like [`InstrumentKey`] it is just a
-/// position and carries no period.
+/// position and carries no period. The scale's period (notes per octave)
+/// lives on the scale, as [`Tonality::note_count`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScaleNote {
     pub offset: u8,
+}
+
+/// A signed distance between two [`ScaleNote`]s, counted in **notes** — a
+/// **vector** in scale space. The exact mirror of [`InstrumentKeyInterval`]
+/// one space over: `ScaleNote − ScaleNote = ScaleNoteInterval`, and a
+/// note plus a note-distance is another note.
+///
+/// Counted in notes, *not* keys: Sa→Pa is `ScaleNoteInterval(4)` (four
+/// notes up the scale), which the scale's widths resolve to seven keys.
+/// Kept distinct from [`InstrumentKeyInterval`] precisely so the two can't
+/// be confused — a note-count is not a key-count, and the only bridge
+/// between them is [`Tonality::key_of`].
+///
+/// Like the key-space vector it carries no period; folding a note-distance
+/// into one octave needs the scale's `note_count`, applied at the point of
+/// use, not stored on the vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleNoteInterval(pub i8);
+
+impl Add for ScaleNoteInterval {
+    type Output = ScaleNoteInterval;
+    fn add(self, rhs: ScaleNoteInterval) -> ScaleNoteInterval {
+        ScaleNoteInterval(self.0 + rhs.0)
+    }
+}
+
+impl Sub for ScaleNoteInterval {
+    type Output = ScaleNoteInterval;
+    fn sub(self, rhs: ScaleNoteInterval) -> ScaleNoteInterval {
+        ScaleNoteInterval(self.0 - rhs.0)
+    }
+}
+
+impl Neg for ScaleNoteInterval {
+    type Output = ScaleNoteInterval;
+    fn neg(self) -> ScaleNoteInterval {
+        ScaleNoteInterval(-self.0)
+    }
+}
+
+/// `ScaleNote − ScaleNote = ScaleNoteInterval` — the difference of two
+/// scale positions, in notes. The scale-space mirror of
+/// `InstrumentKey − InstrumentKey`; its gauge (Sa) cancels the same way.
+impl Sub for ScaleNote {
+    type Output = ScaleNoteInterval;
+    fn sub(self, rhs: ScaleNote) -> ScaleNoteInterval {
+        ScaleNoteInterval(self.offset as i8 - rhs.offset as i8)
+    }
+}
+
+/// `ScaleNote + ScaleNoteInterval = ScaleNote` — move from a scale
+/// position by a note-distance. As with [`InstrumentKey`], there is no
+/// `ScaleNote + ScaleNote`: adding two gauges is nonsense and deliberately
+/// does not compile. Debug-asserts the result stays non-negative and fits
+/// `u8`.
+impl Add<ScaleNoteInterval> for ScaleNote {
+    type Output = ScaleNote;
+    fn add(self, rhs: ScaleNoteInterval) -> ScaleNote {
+        let sum = self.offset as i16 + rhs.0 as i16;
+        debug_assert!(
+            (0..=u8::MAX as i16).contains(&sum),
+            "note + interval = {sum} is off the representable scale line"
+        );
+        ScaleNote { offset: sum as u8 }
+    }
 }
 
 /// The singer's per-song choice: which physical key is home (Sa), and
@@ -307,7 +377,7 @@ pub struct Tonality {
     /// roots"). What the singer says: "Kaali-1".
     pub tonic: InstrumentKey,
 
-    /// The scale's shape as **[`KeyInterval`] key-widths between successive
+    /// The scale's shape as **[`InstrumentKeyInterval`] key-widths between successive
     /// notes**, walking up from the tonic. `[2,2,1,2,2,2,1]` for
     /// Bilawal/Major — each entry is how many *keys* (semitones) that
     /// note-step spans. These are *gaps*, not notes: the tonic (Sa) is
@@ -315,10 +385,10 @@ pub struct Tonality {
     /// so on. This array *is* the scale-space → key-space conversion table.
     ///
     /// Fixed-capacity ([`MAX_SCALE_NOTES`]) and **0-terminated**: read
-    /// widths until the first `KeyInterval(0)`. A `0` width is never
+    /// widths until the first `InstrumentKeyInterval(0)`. A `0` width is never
     /// musically valid (two scale notes on one key), so the sentinel is
     /// self-validating.
-    pub widths: [KeyInterval; MAX_SCALE_NOTES],
+    pub widths: [InstrumentKeyInterval; MAX_SCALE_NOTES],
 }
 
 impl Tonality {
@@ -342,23 +412,38 @@ impl Tonality {
             widths.iter().all(|&w| w != 0),
             "scale widths must be non-zero (0 is the terminator)"
         );
-        let mut buf = [KeyInterval(0); MAX_SCALE_NOTES];
+        let mut buf = [InstrumentKeyInterval(0); MAX_SCALE_NOTES];
         let n = widths.len().min(MAX_SCALE_NOTES);
         for (slot, &w) in buf[..n].iter_mut().zip(&widths[..n]) {
-            *slot = KeyInterval(w);
+            *slot = InstrumentKeyInterval(w);
         }
         Tonality { tonic, widths: buf }
     }
 
-    /// The scale key-widths up to (not including) the `KeyInterval(0)`
+    /// The scale key-widths up to (not including) the `InstrumentKeyInterval(0)`
     /// terminator.
-    pub fn widths(&self) -> &[KeyInterval] {
+    pub fn widths(&self) -> &[InstrumentKeyInterval] {
         let end = self
             .widths
             .iter()
-            .position(|&w| w == KeyInterval(0))
+            .position(|&w| w == InstrumentKeyInterval(0))
             .unwrap_or(MAX_SCALE_NOTES);
         &self.widths[..end]
+    }
+
+    /// Notes per octave `n` — the **scale-space period**, the exact
+    /// analogue of a [`Tuning`]'s slot count `N` one space over. 7 for a
+    /// heptatonic scale like Bilawal. This is the modulus any scale-space
+    /// fold divides by (`note.rem_euclid(n)`), just as `slots.len()` is the
+    /// key-space modulus.
+    ///
+    /// It equals `widths().len()` because the widths walk *around* the
+    /// octave: there is one width per step, and the final step closes back
+    /// onto Sa, so the step count and the distinct-note count coincide.
+    /// (A display that wants the octave-Sa as a separate eighth entry adds
+    /// its own `+1`; that is not the period.)
+    pub fn note_count(&self) -> usize {
+        self.widths().len()
     }
 
     /// The [`InstrumentKey`] of [`ScaleNote`] `note` (Sa = `ScaleNote(0)`).
@@ -378,7 +463,9 @@ impl Tonality {
             "scale note {d} out of range (scale has {} widths)",
             widths.len()
         );
-        let from_sa = widths[..d].iter().fold(KeyInterval(0), |acc, &w| acc + w);
+        let from_sa = widths[..d]
+            .iter()
+            .fold(InstrumentKeyInterval(0), |acc, &w| acc + w);
         self.tonic + from_sa
     }
 
@@ -447,9 +534,9 @@ impl Tuning {
 /// Pure functions — state in, number out; they read a `Tuning`, never
 /// own it.
 pub mod tuning_view {
-    use super::{InstrumentKey, KeyInterval, Tuning};
+    use super::{InstrumentKey, InstrumentKeyInterval, Tuning};
 
-    /// Signed [`KeyInterval`] from the tuning's root to `key`. The one
+    /// Signed [`InstrumentKeyInterval`] from the tuning's root to `key`. The one
     /// quantity both [`slot_of`] and [`hz`] derive from — computing slot
     /// and octave from the *same* delta is what keeps them consistent
     /// (split origins were the cause of the octave-wrap bug). Just the
@@ -457,7 +544,7 @@ pub mod tuning_view {
     /// this delta into a slot + octave is the tuning's `N`, applied in
     /// [`slot_of`] / [`hz`] below — **this is the one place that knows the
     /// period**, which is why a bare key/interval doesn't carry one.
-    fn delta(t: &Tuning, key: InstrumentKey) -> KeyInterval {
+    fn delta(t: &Tuning, key: InstrumentKey) -> InstrumentKeyInterval {
         key - t.root
     }
 
@@ -498,19 +585,19 @@ mod tests {
     #[test]
     fn key_minus_key_is_interval() {
         let d = harmonium_key(14) - harmonium_key(21);
-        assert_eq!(d, KeyInterval(-7));
+        assert_eq!(d, InstrumentKeyInterval(-7));
     }
 
     #[test]
     fn key_plus_interval_moves_the_point() {
-        let p = harmonium_key(12) + KeyInterval(9);
+        let p = harmonium_key(12) + InstrumentKeyInterval(9);
         assert_eq!(p, harmonium_key(21));
     }
 
     #[test]
     fn intervals_compose() {
-        let a = KeyInterval(4);
-        let b = KeyInterval(3);
+        let a = InstrumentKeyInterval(4);
+        let b = InstrumentKeyInterval(3);
         assert_eq!((a + b).0, 7);
         assert_eq!((a - b).0, 1);
         assert_eq!((-a).0, -4);
@@ -522,7 +609,43 @@ mod tests {
         // but *two* KeyIntervals apart, and the Tonality bridges them.
         let bilawal = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
         let re = bilawal.key_of(ScaleNote { offset: 1 });
-        assert_eq!(re - bilawal.tonic, KeyInterval(2));
+        assert_eq!(re - bilawal.tonic, InstrumentKeyInterval(2));
+    }
+
+    #[test]
+    fn scale_note_minus_scale_note_counts_in_notes() {
+        // Sa→Pa is four *notes* apart in scale space (Sa Re Ga Ma Pa),
+        // even though it is seven keys apart on the keyboard.
+        let sa = ScaleNote { offset: 0 };
+        let pa = ScaleNote { offset: 4 };
+        assert_eq!(pa - sa, ScaleNoteInterval(4));
+        assert_eq!(sa - pa, ScaleNoteInterval(-4));
+    }
+
+    #[test]
+    fn scale_note_plus_interval_moves_the_point() {
+        let p = ScaleNote { offset: 0 } + ScaleNoteInterval(4);
+        assert_eq!(p, ScaleNote { offset: 4 });
+    }
+
+    #[test]
+    fn scale_note_intervals_compose() {
+        let a = ScaleNoteInterval(3);
+        let b = ScaleNoteInterval(2);
+        assert_eq!((a + b).0, 5);
+        assert_eq!((a - b).0, 1);
+        assert_eq!((-a).0, -3);
+    }
+
+    #[test]
+    fn note_count_is_the_scale_space_period() {
+        // Heptatonic: 7 notes per octave (= 7 widths, since the last
+        // width closes back onto Sa).
+        let bilawal = Tonality::new(harmonium_key(0), &[2, 2, 1, 2, 2, 2, 1]);
+        assert_eq!(bilawal.note_count(), 7);
+        // A pentatonic scale folds at 5.
+        let pentatonic = Tonality::new(harmonium_key(0), &[2, 2, 3, 2, 3]);
+        assert_eq!(pentatonic.note_count(), 5);
     }
 
     // --- TuningKind::shape --------------------------------------------
@@ -562,17 +685,17 @@ mod tests {
         assert_eq!(
             t.widths(),
             &[
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(1),
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(1)
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(1),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(1)
             ]
         );
         // Everything past the 7 widths is the 0 terminator.
-        assert_eq!(t.widths[7], KeyInterval(0));
+        assert_eq!(t.widths[7], InstrumentKeyInterval(0));
     }
 
     #[test]
@@ -665,8 +788,9 @@ mod tests {
     fn ffi_payload_types_are_copy() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<InstrumentKey>();
-        assert_copy::<KeyInterval>();
+        assert_copy::<InstrumentKeyInterval>();
         assert_copy::<ScaleNote>();
+        assert_copy::<ScaleNoteInterval>();
         assert_copy::<TuningKind>();
         assert_copy::<Tonality>();
         assert_copy::<TuningSpec>();

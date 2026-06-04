@@ -127,7 +127,7 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_ports::music::KeyInterval;
+    use domain_ports::music::InstrumentKeyInterval;
 
     #[test]
     fn app_settings_default_matches_design() {
@@ -145,13 +145,13 @@ mod tests {
         assert_eq!(
             t.widths(),
             &[
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(1),
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(2),
-                KeyInterval(1)
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(1),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(2),
+                InstrumentKeyInterval(1)
             ]
         );
         // Well-formed against a 12-slot tuning.
