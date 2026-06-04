@@ -9,7 +9,12 @@ of the model and the reasoning behind the split.
 Source-of-truth split:
 
 - *Why* the model is shaped this way → this doc.
-- *What* the Rust types look like → `apps/coach-game/src/state.rs`.
+- *What* the Rust types look like → `domain-ports/src/music.rs` (the
+  state + view layer), with the head-side resources in
+  `apps/coach-game/src/state.rs`. `music.rs`'s own module docs are the
+  authoritative prose on the affine point/vector model and the gauge law;
+  this doc explains *why* that machinery exists and how it serves the
+  dial.
 
 If you're about to change `AppSettings`, `SongTonality`, the music
 model in `domain-ports/src/music.rs`, the dial widget, or anything
@@ -29,7 +34,7 @@ each independently configurable:
         ┌───┴───┐
        /         \
       │  ┌─────┐  │   1. Compass body — the circle. North fixed.
-      │ /       \ │   2. Needle — live log(f) % 2.
+      │ /       \ │   2. Needle — live, continuous log(f) % 2.
       ││  needle ││   3. Tuning ring — 12 tick marks at tuning positions.
       │ \       / │   4. Scale ring — mask: which ticks are lit.
       │  └─────┘  │   5. Label ring — note names, separately rotatable.
@@ -41,14 +46,20 @@ each independently configurable:
 1. **Compass body (fixed):** the circle itself. North = 12 o'clock =
    `log(f) % 2 == 0` of whatever the root is. Pure geometry.
 2. **Needle:** live `log(f) % 2`, displayed relative to the current
-   root. *Tuning-independent.* (Already in code, working.)
+   root. **Continuous** — it glides smoothly to wherever the voice
+   actually is on the log-frequency circle, landing *between* the ticks
+   when the singer slides (meend / glissando), never snapping. The
+   model-side fold is `tuning_view::octave_position(hz, ref_hz)` (a
+   fraction in `[0, 1)`); the dial turns that into an angle by `× TAU`.
+   *Tuning-independent.* (Already in code, working.)
 3. **Tuning ring:** 12 faint tick marks at log-frequency positions
    set by the **tuning system**. 12-TET → evenly spaced.
    Hindustani Just → uneven. **No labels, no highlights — just where
-   the slots sit.**
+   the slots sit.** These ticks are the discrete *targets* the
+   continuous needle glides between.
 4. **Scale ring:** of those tuning slots, which ones are "in the
    scale". A mask on the tuning ring; renders as lit vs dim ticks.
-   Derived from the `Tonality` (tonic key + scale intervals).
+   Derived from the `Tonality` (tonic key + scale widths).
 5. **Label ring:** carries the note names. **Rotates independently
    to find the right "lock" position.** This is the layer that
    distinguishes Western from Hindustani — not the geometry.
@@ -117,7 +128,7 @@ for Sargam.
 > now modelled as **one domain** with three inputs, because Just
 > intonation is not rotationally symmetric and therefore needs to know
 > *which slot* the reference Hz pegs — a fact the two-axis split could
-> not express. See "Why the peg is required" below.
+> not express. See "Why the two spaces, and why `root` is needed" below.
 
 The tuning domain answers exactly one question: **given the inputs,
 where do the N slots sit in Hz?** It carries **no names and no
@@ -128,44 +139,99 @@ conventions** — names ("A", "Safed-6") are the note-system layer
 here is that two different "which note" indices look identical (both
 small integers). They are not the same space:
 
-- **Keyboard space** — a physical key of the instrument. What the
+- **Key space** — a physical key of the instrument. What the
   harmonium player and singer *speak*: "Safed-1", "Kaali-1". Fixed to
-  the instrument. Modelled by **`InstrumentKey`**.
-- **Slot space** — an index into the tuning's computed `slots` array,
-  where `slots[0]` is the tuning's root note and the rest fan upward.
-  What the tuning *math* works in.
+  the instrument. Modelled by **`InstrumentKey`** (a *point*) and
+  **`InstrumentKeyInterval`** (its *vector* — a signed distance in keys).
+- **Slot space** — an index into the tuning's computed slot array,
+  where slot 0 is the tuning's root note and the rest fan upward.
+  What the tuning *math* works in. Slot space is a plain **array index**,
+  not a point/vector space of its own — the bridge from a key to its slot
+  (and then its Hz) is `tuning_view`, never arithmetic on the index.
+
+(The genuinely affine sibling of key space is **scale space**, introduced
+under axis 4 — degrees counted in *notes* rather than keys. The full
+point/vector picture is in "The affine model" below; for the tuning
+domain, key space and the slot-array index are what matter.)
 
 ```rust
-/// A physical key of an instrument's keyboard. Name-free and `Copy`
-/// (so it crosses the FFI boundary): the *name* ("Safed-1" vs "C") is
-/// derived head-side from `offset` by the note system. `octave_size`
-/// is the keyboard's key count per octave (12 harmonium/piano, 22
-/// shruti); carrying it keeps modular arithmetic self-contained and
-/// makes a 12-key set impossible to mix with a 22-key one.
-struct InstrumentKey { offset: u8, octave_size: u8 }
-// constructors stamp the size: harmonium_key(0) -> { offset: 0, octave_size: 12 }
+/// A position on the keyboard line — a POINT in the affine model.
+/// Name-free and `Copy` (so it crosses the FFI boundary): the *name*
+/// ("Safed-1" vs "C") is derived head-side from `offset` by the note
+/// system, never stored here.
+struct InstrumentKey { offset: f32 }
+// the one licensed constructor stamps the C-origin gauge:
+//   harmonium_key(0.0) -> { offset: 0.0 } == Safed-1 / C, octave 0
 
-impl InstrumentKey {
-    /// Position within one octave: 0..octave_size. The "fold to one
-    /// octave" operation.
-    fn fold(self) -> u8 { self.offset.rem_euclid(self.octave_size) }
-    /// Which octave this key sits in (the part folding discards).
-    fn octave(self) -> i32 {
-        (self.offset as i32).div_euclid(self.octave_size as i32)
-    }
-}
+/// A signed distance between two keys — the VECTOR of key space.
+struct InstrumentKeyInterval(pub f32);
 ```
 
-**`offset` is the whole multi-octave line, `octave_size` splits it.** A
-key's `offset` is one integer on the *absolute* instrument line; the
-octave and the within-octave position are the two halves of one
-`divmod`: `octave = offset.div_euclid(octave_size)` (the part folding
-throws away), `fold = offset.rem_euclid(octave_size)` (0..octave_size).
-So "fold to one octave" and "which octave" are the same operation read
-two ways — no separate octave field, no redundancy to keep in sync. A
-single-octave key is just `offset` already in range; an absolute key
-lets `offset` run past `octave_size` (14 on a 12-key board = octave 1,
-position 2) and recovers both by `divmod`.
+**`offset` is one number on the whole multi-octave line — and it is an
+`f32`, not an integer.** A key is a position on a *continuous* line: the
+whole keys are the keyboard's fixed positions, but a sliding voice sits
+*between* them (offset `1.4`), which is exactly the slide the dial's
+needle traces. `InstrumentKey` is therefore `PartialEq` but **not** `Eq`
+(no total order on floats); nothing hashes it.
+
+**`InstrumentKey` carries no `octave_size` and no methods.** This is the
+key change from earlier drafts. A point doesn't own the keyboard's
+keys-per-octave — that's a fact about the *tuning*, needed only when you
+fold a position into the repeating slot pattern. So there is **no**
+`fold()` and **no** `octave()` on the key. The only operations a point
+exposes are the affine ones: subtract two keys to get an
+`InstrumentKeyInterval`, or move a key by an interval. **The fold/octave
+`divmod` moved into [`tuning_view`](#state-vs-view--two-layers)**, where
+it runs against the tuning's slot count `N`, on the *delta* `key − root`
+— never on an absolute offset. Why that matters is "The gauge law" just
+below.
+
+### The affine model: point vs vector, and the gauge law
+
+The deepest organising idea in the code (and the thing the rings model
+quietly relies on) is that pitch has **affine structure**, and the types
+encode it. There are two affine point/vector spaces plus a terminal Hz
+output:
+
+- **Key space** — `InstrumentKey` is the *point*, `InstrumentKeyInterval`
+  the *vector*. `InstrumentKey − InstrumentKey = InstrumentKeyInterval`
+  (Sa→Re = 2 keys); `InstrumentKey + InstrumentKeyInterval = InstrumentKey`.
+- **Scale space** (axis 4) — `ScaleNote` is the *point*,
+  `ScaleNoteInterval` the *vector*, counted in *notes* (Sa→Re = 1 note).
+- **Hz** is the terminal output of `tuning_view::hz` — a plain `f32`, not
+  a point type; its "interval" is a multiplicative ratio.
+
+The algebra is encoded as operator impls, and the **gauge law** is
+encoded as the operators that *deliberately do not exist*:
+
+```text
+InstrumentKey  − InstrumentKey         = InstrumentKeyInterval   // the only path to Hz
+InstrumentKey  + InstrumentKeyInterval = InstrumentKey           // place a degree on the keyboard
+Interval       ± Interval              = Interval                // compose distances
+InstrumentKey  + InstrumentKey         → DOES NOT COMPILE        // adding two gauges is nonsense
+```
+
+**The law: no logic may depend on a gauge.** Key space is affine — its
+*origin* ("offset 0 = C") is a pure labelling choice, a gauge. Shift
+every offset (keys, roots, tonics) by the same constant and **nothing
+observable changes** (verified: moving the A=440 root from offset 9 to
+21, and the tonic 0→12, left the resolved Hz table byte-for-byte
+identical). So nothing may branch on an *absolute* `InstrumentKey`, only
+on a **difference** (`InstrumentKeyInterval`), because a difference is
+what survives a gauge shift: `(a+c) − (b+c) = a − b`. The type system
+enforces it — an `InstrumentKey` has no arithmetic of its own, so the
+*only* way to reach a slot or an octave is to first subtract to an
+interval and then divide by the period `N` in `tuning_view`. The
+octave-wrap bug (deriving the octave from two separately
+gauge-dependent quantities that don't cancel) becomes
+**unrepresentable**.
+
+This is why `fold()`/`octave()` are gone: they read an *absolute*
+offset, which the gauge law forbids. The licensed gauge pick happens at
+exactly one door — the constructor `harmonium_key` (C-origin). Naming
+that constructor *is* choosing the chart; pick one for the whole system
+and never mix, since the cancellation only works when both operands
+share a gauge.
 
 **Two phases: construct once, then read frozen data.**
 
@@ -199,49 +265,77 @@ impl TuningKind {
     /// The N frequencies of this kind's fixed pattern, built from the
     /// root note `root_hz` at slot 0. 12-TET: each slot ×2^(1/12) from
     /// the last. Just: `root_hz` × each 5-limit ratio. Length == N.
-    fn shape(&self, root_hz: f32) -> Vec<f32> { /* ... */ }
+    /// `self` by value — a `TuningKind` is `Copy`.
+    fn shape(self, root_hz: f32) -> Vec<f32> { /* ... */ }
 }
 ```
 
-`Tuning::new` runs the shape and stores it alongside the `root` key:
+The head hands the coach a flat, `Copy` **`TuningSpec`** carrying those
+three inputs (`root_note_hz`, `kind`, `root`); the coach runs
+`Tuning::new(spec)` — **one argument** — on receipt:
 
 ```rust
+struct TuningSpec { root_note_hz: f32, kind: TuningKind, root: InstrumentKey }
+
+/// A frozen tuning. OPAQUE: its fields are private; the only code that
+/// sees inside is `tuning_view` (a child module). Everyone else holds a
+/// `Tuning` and calls `tuning_view::hz` / `Tuning::n`.
 struct Tuning {
-    /// **One octave** of slot frequencies in **slot space**: `slots[0]
-    /// == root_note_hz`, the rest fan upward by the kind's pattern for
-    /// exactly N slots. `slots.len()` == N (no separate slot_count
-    /// field — it falls out of the vector). The pattern repeats every
-    /// octave, so a key an octave up is `slots[..] × 2`; the array
-    /// never stores more than one octave (see `TuningView::hz`). Feeds
+    /// **One octave** of slot frequencies (linear Hz) in **slot space**:
+    /// `slots_linear[0] == root_note_hz`, the rest fan upward by the
+    /// kind's pattern for exactly N slots. `len() == N`. The pattern
+    /// repeats every octave, so a key an octave up is `× 2`; the array
+    /// never stores more than one octave (see `tuning_view::hz`). Feeds
     /// the dial's tuning ring (layer 3).
-    slots: Vec<f32>,
-    /// The physical key (**keyboard space**) that slot 0 sits on — the
-    /// key the instrument was tuned from. This is the bridge between
-    /// the two spaces: keyboard key `k` maps to slot `(k.offset -
-    /// root.offset).rem_euclid(N)`.
+    slots_linear: Vec<f32>,
+    /// `log2` of each `slots_linear` entry, frozen alongside it — the
+    /// *pitch-linear* view of the same slots. An octave is `+1.0` here,
+    /// and a fractional key between two slots is a plain weighted average
+    /// of two of these followed by one `exp2`: this is the math that
+    /// makes the slide land on a real Hz (see `tuning_view::hz`).
+    slots_log2: Vec<f32>,
+    /// The physical key (**key space**) that slot 0 sits on — the key
+    /// the instrument was tuned from. The bridge between the two spaces:
+    /// every `tuning_view` computation starts by subtracting it.
     root: InstrumentKey,
 }
 
 impl Tuning {
-    fn new(root_note_hz: f32, kind: TuningKind, root: InstrumentKey) -> Tuning {
-        // slot 0 IS the root note; the kind fans upward from it. No
-        // re-pegging — slots[0] == root_note_hz by construction.
-        let slots = kind.shape(root_note_hz);
-        Tuning { slots, root }
+    fn new(spec: TuningSpec) -> Tuning {
+        // slot 0 IS the root note; the kind fans upward from it. The two
+        // slot arrays are filled here together and NOWHERE else, so they
+        // cannot drift — one constructor fills both.
+        let slots_linear = spec.kind.shape(spec.root_note_hz);
+        let slots_log2 = slots_linear.iter().map(|hz| hz.log2()).collect();
+        Tuning { slots_linear, slots_log2, root: spec.root }
     }
+    /// The slot count N. Representation-neutral (both arrays are len N),
+    /// so it stays public — the adapter reads it for `well_formed`.
+    fn n(&self) -> usize { self.slots_linear.len() }
 }
 ```
 
-The *reading* of a `Tuning` — keyboard→slot, slot→Hz — lives in the
-View layer below, not on the struct. The struct owns only its birth
-(`new`) and its data (`slots`, `root`).
+**Why two slot arrays, and why opaque.** The struct keeps both `slots_linear`
+(Hz) and `slots_log2` (their base-2 logs). Storing a derived shadow
+would normally invite drift — but both are written *once, together* in
+the single constructor and never again (private fields, no setter), so
+there is still exactly one source of truth. Opacity is what licenses the
+redundancy: because only `tuning_view` sees inside, the view picks
+whichever representation is cheaper per job (linear for a slot's target
+Hz, log for interpolating the slide) with no outside coupling, and
+callers never learn the slots are stored twice. They hold a `Tuning` and
+ask `tuning_view::hz` / `Tuning::n`.
 
-`root_note_hz` and the kind are absorbed into `slots`; the `root` key
-survives because it bridges keyboard space to slot space. `slots` is a
-*read* value computed inside the coach — not a flat FFI command payload
-— so a kind-defined length is unproblematic here. (`InstrumentKey` and
-the head's three construction inputs *are* flat/`Copy` and do cross the
-wire; the constructed `Tuning` does not.)
+The *reading* of a `Tuning` — key→slot, slot→Hz, the slide interpolation
+— lives in the View layer below, not on the struct. The struct owns only
+its birth (`new`) and its data.
+
+`root_note_hz` and the kind are absorbed into the slot arrays; the
+`root` key survives because it bridges key space to slot space. A
+`Tuning` is a *read* value computed inside the coach — not a flat FFI
+command payload — so its `Vec`s and kind-defined length are unproblematic.
+(`InstrumentKey` and the `TuningSpec` it travels in *are* flat/`Copy` and
+do cross the wire; the constructed `Tuning` does not.)
 
 **Why the two spaces, and why `root` is needed even in 12-TET.** 12-TET
 is rotationally symmetric: the *set* of 12 frequencies is identical no
@@ -257,9 +351,9 @@ frequencies and no idea which harmonium key each one belongs to.
 **Why N is owned by the `TuningKind`.** The slot count is a property of
 the *algorithm*, not a global constant. 12-TET and Hindustani Just
 both emit 12; a future Carnatic 22-shruti kind emits 22. Letting the
-kind declare `N` (and reading it back as `slots.len()`) keeps the
-domain N-agnostic without building the microtonal case now — the extra
-kinds are deferred, but the shape already admits them.
+kind declare `N` (and reading it back as `Tuning::n`) keeps the domain
+N-agnostic without building the microtonal case now — the extra kinds
+are deferred, but the shape already admits them.
 
 **Why it's its own domain (independent of axis 3):** A Sargam user can
 sing in 12-TET (many do, especially keyboard-trained); a Western user
@@ -398,66 +492,96 @@ song?* Two values, one type, because they're meaningless separately:
 
 ```rust
 struct Tonality {
-    /// The physical key the singer calls home (Sa). **Keyboard space**
-    /// — the same space as the tuning's `root` (what the singer says:
-    /// "Kaali-1"). This is the *song* root — the second of the two
-    /// roots, distinct from the tuning's `root` (the key the
-    /// instrument was tuned from). Both are `InstrumentKey`s on the
-    /// same keyboard: one is where the tuner anchored, one is where the
-    /// singer puts Sa.
+    /// The key the singer calls home (Sa) — a POINT, the scale-space
+    /// origin. **Key space** — the same space as the tuning's `root`
+    /// (what the singer says: "Kaali-1"). This is the *song* root — the
+    /// second of the two roots, distinct from the tuning's `root` (the
+    /// key the instrument was tuned from). Both are `InstrumentKey`s on
+    /// the same keyboard: one is where the tuner anchored, one is where
+    /// the singer puts Sa.
     tonic: InstrumentKey,
 
-    /// The scale's shape as **intervals between successive notes** (in
-    /// slot units), walking up from the tonic. `[2,2,1,2,2,2,1]` for
-    /// Bilawal/Major. These are *gaps*, not notes: the tonic (Sa) is
-    /// implicit at the start, `scale_intervals[0]` is the Sa→Re step,
-    /// `[1]` is Re→Ga, and so on. So the number of intervals (to the
-    /// terminator) equals the number of notes, and they sum to N.
+    /// The scale's shape as **key-widths between successive notes** —
+    /// `InstrumentKeyInterval`s (vectors in key space), walking up from
+    /// the tonic. `[2,2,1,2,2,2,1]` for Bilawal/Major: each entry is how
+    /// many *keys* (semitones) that note-step spans. These are *gaps*,
+    /// not notes: the tonic (Sa) is implicit at the start, `widths[0]`
+    /// is the Sa→Re width (2), and so on. So the number of widths (to the
+    /// terminator) equals the number of notes, and they sum to N. **This
+    /// array IS the scale-space → key-space conversion table.**
     ///
-    /// Fixed-capacity and **0-terminated**: read intervals until the
-    /// first `0`. A `0` interval is never musically valid (it would put
-    /// two scale notes on one slot), so the sentinel is self-validating.
-    /// Cap of 32 covers any 12- or 22-slot scale with room. This keeps
-    /// `Tonality` flat and `Copy` so it can cross the FFI command
-    /// boundary directly (unlike `Tuning`, which is coach-internal).
-    scale_intervals: [u8; 32],
+    /// Fixed-capacity (`MAX_SCALE_NOTES`) and **0-terminated**: read
+    /// widths until the first `InstrumentKeyInterval(0.0)`. A `0` width is
+    /// never musically valid (two notes on one key), so the sentinel is
+    /// self-validating. This keeps `Tonality` flat and `Copy` so it can
+    /// cross the FFI command boundary directly (unlike `Tuning`, which is
+    /// coach-internal).
+    ///
+    /// **Invariant: every width is a whole number** (`2.0`, `1.0`, …).
+    /// The element type is `InstrumentKeyInterval` (`f32`) only so a scale
+    /// shares the affine vocabulary with the continuous key line; the
+    /// fractional freedom is for the *live slide*, never an authored
+    /// scale. Consumers needing an integer slot index (the dial mask)
+    /// round, relying on this invariant.
+    widths: [InstrumentKeyInterval; MAX_SCALE_NOTES],
 }
 ```
 
-`scale_intervals` is *tonic-relative* — it describes the scale's shape
-starting at the tonic. `tonic` then says which physical key that shape
-is planted on. The two are genuinely separate: `scale_intervals` is the
-scale's **shape**, `tonic` is **where you plant it**.
+`MAX_SCALE_NOTES` is a named `pub const = 32` (not a bare literal): a
+fixed cap that keeps `Tonality` flat and `Copy`; 32 covers any 12- or
+22-slot scale with room. `Tonality` is `PartialEq` but **not** `Eq` — it
+holds `f32` widths and an `f32`-offset tonic.
 
-**Well-formedness invariant — intervals sum to N.** Walking the
-intervals from the tonic must traverse exactly one octave and land back
-on the tonic. So the intervals (up to the `0` terminator) must sum to
-the tuning's slot count `N`. Sum < N never closes the octave; sum > N
-wraps past it. This is the whole invariant — no interior `0` (the
-`take_while` below enforces that by construction) and no separate
-per-step bound (sum == N with non-negative intervals already caps any
-single interval at N).
+`widths` is *tonic-relative* — it describes the scale's shape starting
+at the tonic. `tonic` then says which physical key that shape is planted
+on. The two are genuinely separate: `widths` is the scale's **shape**,
+`tonic` is **where you plant it**.
 
-Because `N` comes from the *tuning* (`slots.len()`), not from
-`Tonality` alone, the check lives at the **join point** — where a
-`Tonality` meets a `Tuning` (the coach computing `in_scale_mask` /
+**The two spaces meet here.** Key space and scale space (axis 4's
+degree-count line) are deliberately parallel-but-distinct types, so a
+note-distance can never be silently spent as a key-distance. They touch
+on exactly one type — `Tonality` — and exactly one method,
+`Tonality::key_of(ScaleNote) -> InstrumentKey`, which sums the first *d*
+widths up from the tonic (`tonic + Σ widths[0..d]`). That sum *is* the
+scale-space → key-space conversion: 1 note ⇒ its key-width (the first
+Bilawal step, 1 note ⇒ 2 keys), plus the `+tonic` injection that lands
+it on the keyboard. `ScaleNote(0)` (Sa) has an empty sum, recovering the
+tonic. The reading methods are `widths()` (the slice up to the
+terminator), `note_count()` (= `widths().len()`, the scale-space period),
+`key_of()`, and `well_formed(n)`.
+
+**Well-formedness invariant — widths sum to N.** Walking the widths from
+the tonic must traverse exactly one octave and land back on the tonic.
+So the widths (up to the terminator) must sum to the tuning's slot count
+`N`. Sum < N never closes the octave; sum > N wraps past it. This is the
+whole invariant — no interior `0` (`Tonality::new` rejects that by
+construction) and no separate per-step bound (sum == N with non-negative
+widths already caps any single width at N).
+
+Because `N` comes from the *tuning* (`Tuning::n`), not from `Tonality`
+alone, `well_formed` is a **method that takes `n`** and is called at the
+**join point** — where a `Tonality` meets a `Tuning` (the coach
 accepting the config). The same 7-note scale is valid on a 12-slot
 tuning and invalid on a 22-slot one.
 
 ```rust
-fn tonality_well_formed(t: &Tonality, n: u8) -> bool {
-    t.scale_intervals.iter().take_while(|&&s| s != 0)
-        .map(|&s| s as u16).sum::<u16>() == n as u16
+impl Tonality {
+    fn well_formed(&self, n: u8) -> bool {
+        // Widths are whole and small → they sum *exactly* in f32 (no
+        // rounding below 2^24), so `== n` needs no epsilon.
+        self.widths().iter().map(|w| w.0).sum::<f32>() == n as f32
+    }
 }
 ```
 
 **Failure policy (today): construct-time guard.** Only code builds
 `Tonality` right now — there is no per-song picker producing arbitrary
-input — so a bad sum is a *programming bug*, caught by
-`debug_assert!(tonality_well_formed(..))` at the seam. This graduates
-to a runtime **reject** (log + keep the prior/default `Tonality`,
-matching the coach's silent-no-op convention for illegal commands)
-when the picker lands and untrusted input can reach it.
+input — so an interior `0` or over-long list panics in
+`Tonality::new`'s `debug_assert!`, and a bad sum is caught by
+`debug_assert!(t.well_formed(n))` at the join. This graduates to a
+runtime **reject** (log + keep the prior/default `Tonality`, matching
+the coach's silent-no-op convention for illegal commands) when the
+picker lands and untrusted input can reach it.
 
 **Why it's its own axis:** These change per song. Singer's choice,
 not harmonium-maker's. "I'll sing Vande Mataram in D Yaman" → tonic
@@ -467,47 +591,51 @@ scale = Major. The tuning and vocabulary haven't moved.
 **Why tonic is an `InstrumentKey`, not a note name like "D":** Because
 "D" is a Western name. The same data needs to render as "D" for a
 Western user and "Kaali-1" (or whichever harmonium position the key
-corresponds to) for a Sargam user. Storing the *key* (offset + size)
+corresponds to) for a Sargam user. Storing the *key* (a bare `offset`)
 and resolving the *name* at render time via the note system's tonic-
 naming table (Job B above) keeps the storage neutral to vocabulary
 choice.
 
 **The in-scale mask is a head-side render projection** (see "The mask
 is a head-side projection" below). Given a `Tonality`, the mask
-(`[bool; N]` — which slots are in the song) is derived by walking
-`scale_intervals` from the tonic: the walk starts at the tonic's
-within-octave position (`tonality.tonic.fold()`) and adds intervals
-modulo `N`. It is **tuning-independent** — the lit slot set is the same
-integer pattern regardless of whether the tuning is 12-TET or Just (the
-tuning only changes where each slot is *drawn*, not which is lit). So
-the head computes it directly from the `Tonality` it holds; it does not
-cross the port and the coach does not compute it. It feeds the dial's
-scale ring (layer 4).
+(`[bool; N]` — which slots are in the song) is derived by walking the
+`widths()` from the tonic: the walk starts at the tonic's within-octave
+slot — `tonality.tonic.offset.round() as usize % N` — and adds each
+(rounded) width modulo `N`, marking every visited slot. (The round is
+exact: tonic and widths are whole by the `Tonality` invariant; only the
+live slide is fractional.) It is **tuning-independent** — the lit slot
+set is the same integer pattern regardless of whether the tuning is
+12-TET or Just (the tuning only changes where each slot is *drawn*, not
+which is lit). So the head computes it directly from the `Tonality` it
+holds; it does not cross the port and the coach does not compute it. It
+feeds the dial's scale ring (layer 4).
 
-**Worked: what frequency is "Sa"?** The trap is that `scale_intervals`
-plays *no part* in finding Sa — Sa is the tonic, before any interval.
-The intervals only locate Re, Ga, … So the path to Sa's Hz is the
-short one. Example: a 12-key harmonium tuned from A in octave 1
-(`root = { offset: 21, octave_size: 12 }`), the singer puts Sa on the D
-just below it (`tonic = { offset: 14, octave_size: 12 }`):
+**Worked: what frequency is "Sa"?** The trap is that the `widths` play
+*no part* in finding Sa — Sa is the tonic, before any width. The widths
+only locate Re, Ga, … So the path to Sa's Hz is the short one. Example:
+a 12-key harmonium tuned from A in octave 1 (`root = harmonium_key(21.0)`),
+the singer puts Sa on the D just below it (`tonic = harmonium_key(14.0)`):
 
-1. **Keyboard → delta** (subtract the gauge first, the only path to Hz):
-   `delta = tonic.offset − root.offset = 14 − 21 = −7`. Sa sits seven
-   12-TET steps *below* the A we tuned from.
+1. **Key → delta** (subtract the gauge first, the only path to Hz):
+   `delta = tonic − root = InstrumentKeyInterval(14.0 − 21.0) = −7`. Sa
+   sits seven 12-TET steps *below* the A we tuned from.
 2. **Delta → Hz** (slot and octave from the *same* delta, via one
-   divmod): slot = `(−7).rem_euclid(12) = 5`, octave = `(−7).div_euclid(12)
-   = −1`, so `slots[5] × 2^(−1) = 440 × 2^(5/12) × 2^(−1) ≈ 293.7 Hz`
-   (D one octave below the A). That's Sa.
+   divmod): slot = `(−7).rem_euclid(12) = 5`, octave =
+   `(−7).div_euclid(12) = −1`, so `exp2(slots_log2[5] + (−1)) =
+   440 × 2^(5/12) × 2^(−1) ≈ 293.7 Hz` (D one octave below the A). That's
+   Sa. (A *whole* key like this reduces to the old
+   `slots_linear[5] × 2^(−1)` exactly; the log form is what lets a
+   *fractional* key interpolate — see "the slide" below.)
 
-A general scale degree `d` *does* use the intervals — place it on the
-keyboard first (`key_d.offset = tonic.offset + Σ scale_intervals[0..d]`),
-then resolve that key through the same delta-from-root path:
-`hz(key_d)` computes `delta = key_d − root` and folds slot *and* octave
-from that one delta (`slots[delta mod N] × 2^(delta div N)`). Degree 0
-(Sa) has an empty sum (`key_0 = tonic`), recovering the trace above.
-Crucially the octave comes from the *full* delta, not from folding the
-degree into the root's octave — that keeps the scale ascending instead
-of wrapping (the octave-wrap bug we fixed).
+A general scale degree `d` *does* use the widths — `Tonality::key_of`
+places it on the keyboard first (`tonic + Σ widths[0..d]`), then
+`tuning_view::hz` resolves that key through the same delta-from-root
+path: it computes `delta = key − root` and folds slot *and* octave from
+that one delta. Degree 0 (Sa) has an empty sum (`key_of(ScaleNote(0)) ==
+tonic`), recovering the trace above. Crucially the octave comes from the
+*full* delta, not from folding the degree into the root's octave — that
+keeps the scale ascending instead of wrapping (the octave-wrap bug we
+fixed).
 
 ## State vs View — two layers
 
@@ -540,41 +668,81 @@ arithmetic; the rest is index math.
 **A View is a module of free functions** — a named bag of pure
 functions that take the state as plain parameters and return a number.
 No instance, no borrow, no cached state: state in, number out. (In
-Rust, `mod tuning_view { fn slot_of(..) .. }`, called as
-`tuning_view::slot_of(&t, key)`. A module — not an empty struct — is
-the idiomatic Rust way to group pure functions: it confines the
-conversions to one named place per line, the same disambiguation
-`InstrumentKey` gives keyboard-vs-slot, without a never-instantiated
-phantom type.)
+Rust, `mod tuning_view { pub fn hz(..) .. }`, called as
+`tuning_view::hz(&t, key)`. A module — not an empty struct — is the
+idiomatic Rust way to group pure functions: it confines the conversions
+to one named place per line, the same disambiguation `InstrumentKey`
+gives key-vs-slot, without a never-instantiated phantom type. It is a
+*module*, not a `TuningView` struct, everywhere.)
 
 Only **one** View is genuinely shared coach-side: `tuning_view`, the
-Hz↔Instrument map, because it reads a `Tuning` (which only the coach
-holds). The Tonal-line projection that *would* have been a
-`tonality_view` does **not** live here — see "The mask is a head-side
-projection" below.
+Hz↔key map, because it reads a `Tuning` (which only the coach holds).
+The scale-line projection that *would* have been a `tonality_view` does
+**not** live here — see "The mask is a head-side projection" below.
 
 ```rust
-/// The Hz↔Instrument map — the only place real frequencies and
-/// keyboard↔slot arithmetic live. Reads a `Tuning`, never owns it.
+/// The Hz↔key map — the only place real frequencies and key↔slot
+/// arithmetic live. Reads a `Tuning`, never owns it.
 mod tuning_view {
-    /// Keyboard space → slot space. The one bridge between the two
-    /// spaces. Folds to one octave (the slot pattern repeats).
-    fn slot_of(t: &Tuning, key: InstrumentKey) -> usize {
-        let n = t.slots.len() as i32;
-        ((key.offset as i32 - t.root.offset as i32).rem_euclid(n)) as usize
+    /// Where a frequency sits WITHIN one octave, as a fraction in
+    /// `[0, 1)` — the log-frequency fold, `log2(hz / ref_hz) mod 1`.
+    /// `ref_hz` maps to 0. The model-side truth about "position around
+    /// the octave circle"; a dial turns it into an angle by `× TAU`.
+    /// Tuning-independent — it places ANY Hz, a slot's target *or* a
+    /// live sliding voice between slots. THIS is what the continuous
+    /// needle (layer 2) and the slot-angle geometry (layer 3) are built
+    /// from. (Replaces the deleted `slot_of`.)
+    pub fn octave_position(hz: f32, ref_hz: f32) -> f32 {
+        if hz <= 0.0 { return 0.0; }
+        (hz / ref_hz).log2().rem_euclid(1.0)
     }
 
-    /// Hz of any physical key, at any octave. `slots` holds one octave;
-    /// the octave the key sits in is a power-of-two multiplier applied
-    /// after the fold. `octave` is measured from `root`'s octave — there
-    /// is **no** requirement that the root sit in octave 0; this form is
-    /// correct for any `root.octave()`.
-    fn hz(t: &Tuning, key: InstrumentKey) -> f32 {
-        let octave = key.octave() - t.root.octave();
-        t.slots[slot_of(t, key)] * 2f32.powi(octave)
+    /// Hz of any key, at any octave, relative to the root — INCLUDING a
+    /// fractional key (the slide), interpolated between the two whole
+    /// keys bracketing it. The interpolation is a plain **average in
+    /// pitch**: log-frequency of the slot at/below the key, lerped with
+    /// the next slot up by the fractional part, exponentiated once.
+    /// Equal steps in `offset` become equal steps in *cents* — how the
+    /// ear hears a glide; a straight average of frequencies would read
+    /// sharp. Working from `slots_log2` makes this a literal weighted
+    /// average of two stored numbers (no `log` at call time); the octave
+    /// wrap (slot 11 → slot 0 an octave up) falls out for free.
+    ///
+    /// A WHOLE key has `frac == 0`, so this reduces to
+    /// `slots_linear[d mod N] × 2^(d div N)` — the old behaviour exactly.
+    pub fn hz(t: &Tuning, key: InstrumentKey) -> f32 {
+        let d = (key - t.root).0;            // the gauge-invariant delta
+        let floor = d.floor();
+        let frac = d - floor;
+        let lo = slot_log2(t, floor as i32); // log-freq of the slot below
+        if frac == 0.0 { return lo.exp2(); }
+        let hi = slot_log2(t, floor as i32 + 1);
+        (lo + (hi - lo) * frac).exp2()
     }
+
+    // slot_log2(t, delta) = slots_log2[delta mod N] + (delta div N):
+    // the slot's log-frequency plus one +1.0 per octave. Slot and octave
+    // from the SAME delta, so a key below the root lands an octave down.
 }
 ```
+
+`octave_position` is the log-frequency fold the model now exposes as
+first-class truth: the **continuous needle glides** to wherever a live
+Hz lands on the circle (`octave_position(f0, ref) × TAU`), and the same
+function placed against each tuning slot's frequency yields the **tuning
+ring's tick angles**. The needle never snaps; the ticks are the targets
+it glides between.
+
+**The slide, concretely.** `hz` interpolating a *fractional* key is what
+makes a voice sitting between two keyboard keys resolve to a real Hz: it
+is the average-in-cents of the two bracketing ticks (their `slots_log2`
+lerped, then `exp2`). This is the whole reason key space is `f32` and
+the interpolation is done in log space. The asymmetry is deliberate and
+load-bearing: **the needle/key line is continuous** (you slide between
+pitches), **the scale-degree line stays discrete** (you don't slide
+between scale degrees — `ScaleNote` is integer; see axis 4 and "the
+affine model"). A degree-count is combinatorial; a key position is
+physical.
 
 ### The mask is a head-side projection, not a shared View
 
@@ -584,16 +752,17 @@ the `Tonality` the head already holds — and it is **tuning-independent**:
 the lit *slots* are the same integer set whether the tuning is 12-TET or
 Hindustani Just. The asymmetry of Just changes where each tick is
 *drawn* (the tuning ring, layer 3, which is Hz→angle render geometry),
-not *which* ticks are lit. Walking `scale_intervals` is pure integer
-math that needs only the `Tonality` and `N`, never the `Tuning`'s
-frequencies.
+not *which* ticks are lit. Walking the `widths()` is pure integer math
+(the round-to-slot is exact by the whole-width invariant) that needs
+only the `Tonality` and `N`, never the `Tuning`'s frequencies.
 
 So the mask is **not** computed by the coach and **not** a shared
 `tonality_view`. The head holds the `Tonality` (the same flat/`Copy`
 type it sent across the port via `ConfigureSession`) and **the dial
-walks the intervals itself** — sibling to the angle math it already does
-head-side. There is no `MaskSnapshot` type, no mask read-publisher: the
-mask never crosses the port, because the head already has its source.
+walks the widths itself** (`in_scale_mask` in `dial.rs`) — sibling to
+the angle math it already does head-side. There is no `MaskSnapshot`
+type, no mask read-publisher: the mask never crosses the port, because
+the head already has its source.
 
 `Tonality` *does* cross the port — but as the **coach's frame of
 reference for judging pitch** (the eventual scoring), not for the mask.
@@ -604,16 +773,21 @@ singing; the head holds the same `Tonality` to paint the scale ring.
 
 | Function | Layer | Lives in | Why |
 |---|---|---|---|
-| `fold`, `octave` | method | `InstrumentKey` | arithmetic on the key's *own* fields — no external state read, so it's a method, not a view |
+| `Sub`/`Add` on `InstrumentKey`·`InstrumentKeyInterval` (and the `ScaleNote`·`ScaleNoteInterval` mirror) | affine operators | `music.rs` (the point/vector types) | the gauge algebra itself — `key − key = interval`, `key + interval = key`; `key + key` deliberately doesn't compile |
+| `harmonium_key` | gauge constructor | `music.rs` | the one licensed door where a bare number becomes a C-origin `InstrumentKey` |
 | `Tuning::new`, `Tonality::new` | State | the state struct | construction = birth; state owns being born |
-| `tonality_well_formed` | State-join | called at the Tuning×Tonality join (coach), not at `Tonality::new` | needs `N` from the *tuning*, which `Tonality` alone doesn't have |
-| `slot_of`, `hz` | View | `tuning_view` (coach) | the Hz↔Instrument map; reads a `Tuning` |
-| in-scale mask (interval walk) | head render | `dial.rs` (head) | tuning-independent integer projection of the `Tonality` the head holds; sibling to its angle math |
+| `Tonality::widths`, `note_count`, `key_of` | State (read) | `Tonality` | read a scale's *own* fields (the widths, the tonic) — no external state, so methods on the type; `key_of` is the scale-space → key-space bridge |
+| `Tonality::well_formed(n)` | State-join | called at the Tuning×Tonality join (coach), not at `Tonality::new` | needs `N` from the *tuning*, which `Tonality` alone doesn't have |
+| `tuning_view::octave_position`, `tuning_view::hz` | View | `tuning_view` (coach) | the Hz↔key map; `octave_position` is the log-fold the needle/ticks use, `hz` resolves a key (whole or sliding) to Hz; both read a `Tuning` |
+| `dial::in_scale_mask` (width walk) | head render | `dial.rs` (head) | tuning-independent integer projection of the `Tonality` the head holds; sibling to its angle math |
 
-The dividing line: **state = how it's built; View = how it's read as a
-line; render = how the head paints it.** `fold`/`octave` are the one
-apparent View-exception — but they read no *external* state, only the
-key's own two fields, so they stay methods.
+The dividing line: **state = how it's built and read from its own
+fields; View = how it's read against a `Tuning`; render = how the head
+paints it.** The affine operators are not a View-exception — they read
+no *external* state, only the operands' own offsets, so they live with
+the types. There is no longer any `fold`/`octave` method on
+`InstrumentKey`: a key is just a point, and folding a *delta* into a slot
++ octave is `tuning_view`'s job (it needs the tuning's `N`).
 
 ## The two roots — precisely
 
@@ -662,12 +836,12 @@ A Sargam user, A=440 standard, singing Bilawal in D on a 12-TET dial:
 | Tuning reference | 440 Hz | `AppSettings.reference_hz = 440.0` |
 | Tuning system | 12-TET | `AppSettings.tuning_kind = TwelveTet` |
 | Note system | Sargam Latin | *(deferred axis-3 label layer — no `AppSettings` field today)* |
-| Song tonic | D (key 2) | `Tonality.tonic = harmonium_key(2)` |
-| Scale | Bilawal | `Tonality.scale_intervals = [2,2,1,2,2,2,1,0,…]` |
+| Song tonic | D (key 2) | `Tonality.tonic = harmonium_key(2.0)` |
+| Scale | Bilawal | `Tonality.widths = [2,2,1,2,2,2,1,0,…]` (whole-number `InstrumentKeyInterval`s, `0`-terminated) |
 
 The first three axes are head-held `AppSettings`; `tuning_spec()`
 marshals them into the `TuningSpec` that crosses the port (root pegged
-at `harmonium_key(21)` = A in octave 1, `root_note_hz = reference_hz`).
+at `harmonium_key(21.0)` = A in octave 1, `root_note_hz = reference_hz`).
 The tonic +
 scale ride in the head's `SongTonality(Tonality)` resource and cross
 the port as a `Tonality` via `ConfigureSession`.
@@ -675,12 +849,12 @@ the port as a `Tonality` via `ConfigureSession`.
 What the user sees:
 
 - **Tuning ring:** 12 evenly-spaced ticks (12-TET).
-- **Scale ring:** keyboard positions `[2,4,5,7,9,11,1]` highlighted,
+- **Scale ring:** keyboard positions `[2,4,6,7,9,11,1]` highlighted,
   others dim (the in-scale mask, walked head-side from `Tonality`
-  starting at the tonic's `fold()` = 2 and adding each interval mod
-  12). The mask is indexed in keyboard space (0 = C). Tuning-
-  independent: the lit set is the same in 12-TET or Just; only the
-  angles differ.
+  starting at the tonic's within-octave slot `tonic.offset.round() %
+  12 = 2` and adding each width mod 12). The mask is indexed in key
+  space (0 = C). Tuning-independent: the lit set is the same in 12-TET
+  or Just; only the angles differ.
 - **Label ring:** Sargam lock = RelativeToTonic. "Sa" sticker locked
   to north. Slot 2 (the singer's D) is at north. The 5 chromatic
   out-of-scale slots either get no label or get komal/tivra labels at
@@ -746,13 +920,18 @@ and lands alongside the note-system axis.
 ## What's in code today
 
 The musical model lives in `domain-ports/src/music.rs` (the State +
-View layer): `InstrumentKey { offset, octave_size }` with `fold()` /
-`octave()` divmod, `TuningKind`, `TuningSpec`, the coach-internal
-`Tuning { slots, root }` (one octave of Hz), `Tonality { tonic,
-scale_intervals }`, and the `tuning_view` module of free functions
-(`slot_of`, `hz`). The flat/`Copy` types (`InstrumentKey`,
-`TuningKind`, `TuningSpec`, `Tonality`) cross the AppCoach port;
-`Tuning` (owns a `Vec<f32>`) does not.
+View layer): the affine point/vector types `InstrumentKey { offset: f32 }`
+/ `InstrumentKeyInterval(f32)` and their scale-space mirror `ScaleNote
+{ offset: u8 }` / `ScaleNoteInterval(i8)`, the `harmonium_key`
+constructor, `TuningKind`, `TuningSpec`, the opaque coach-internal
+`Tuning { slots_linear, slots_log2, root }` (one octave, two
+representations), `Tonality { tonic, widths }` with `widths()` /
+`note_count()` / `key_of()` / `well_formed()`, the const
+`MAX_SCALE_NOTES = 32`, and the `tuning_view` module of free functions
+(`octave_position`, `hz`). The flat/`Copy` types (`InstrumentKey`,
+`InstrumentKeyInterval`, `ScaleNote`, `ScaleNoteInterval`, `TuningKind`,
+`TuningSpec`, `Tonality`) cross the AppCoach port; `Tuning` (owns its
+`Vec`s) does not.
 
 The coach receives the model via `Command::ConfigureSession { tuning:
 TuningSpec, tonality: Tonality }`, **decoupled from the audio
@@ -778,41 +957,51 @@ In `apps/coach-game/src/state.rs`:
 
 - `AppSettings { reference_hz, tuning_kind: TuningKind }` — axes 1, 2
   only — plus `tuning_spec()`, which pegs the tuning root at
-  `harmonium_key(21)` (A in octave 1) with `root_note_hz = reference_hz`
+  `harmonium_key(21.0)` (A in octave 1) with `root_note_hz = reference_hz`
   and copies `tuning_kind` straight through (no head-side enum). There is
   **no** `note_system` field, no `tonic_label`, no `scale_name`. The root
   sits in octave 1 (not the lowest octave) so a song tonic an octave
   below it lands in the singing register rather than the cellar.
 - `SongTonality(Tonality)` resource — axis 4. Default = Bilawal on
-  `harmonium_key(12)` (C in octave 1, one octave below the A=440 root →
+  `harmonium_key(12.0)` (C in octave 1, one octave below the A=440 root →
   middle register, C ≈ 262 Hz). Written to the coach via
   `ConfigureSession` on InGame entry.
 
 In `apps/coach-game/src/game/dial.rs`:
 
 - `tuning_12tet()`, `tuning_hindustani_just()` — produce `[f32; 12]`
-  slot angles. Drive the tuning ring (layer 3).
+  slot angles by running each kind's `shape` and folding every slot's Hz
+  through `tuning_view::octave_position(.., C_REF_HZ) × TAU`. No ratio
+  table lives in the dial; the spacing comes from the model. Drive the
+  tuning ring (layer 3).
 - `in_scale_mask(tonality: &Tonality) -> [bool; 12]` — the head-side
-  render projection of `Tonality`, walked from the tonic's `fold()`.
-  Tuning-independent; never crosses the port. Drives the scale ring
-  (layer 4).
-- Dial spawn reads `SongTonality` and applies `in_scale_mask` to
-  `DialSlot.active`.
+  render projection of `Tonality`, walked from the tonic's within-octave
+  slot (`tonic.offset.round() % 12`) by rounding each width. Tuning-
+  independent; never crosses the port. Drives the scale ring (layer 4).
+- `angle_from_f0(hz)` turns the live `f0` into the continuous needle
+  angle via the same `octave_position` fold.
+- The dial spawns *empty* and paints its slots from the `MusicInfoRes`
+  read model (the coach's `music_info()` snapshot) — so the slots
+  reflect the singer's real tuning + tonality, not a hardcoded default.
 
 In `apps/coach-game/src/game/hud.rs`:
 
 - Top-left panel shows the **math view** of the current tonality,
   sourced from the coach's `music_info()` snapshot (not the head's own
-  `SongTonality` — reading the snapshot exercises the round-trip). Three
-  rows describe the same scale: `deg` (0-based prefix sum of the scale
-  intervals, e.g. `0 2 4 5 7 9 11`), `key` (those degrees + tonic
-  offset, in `InstrumentKey` space), and `Hz` (each key resolved through
-  the active `Tuning` via `tuning_view::hz`). The Hz row ascends
+  `SongTonality` — reading the snapshot exercises the round-trip). It
+  walks `Tonality::key_of(ScaleNote(0..note_count))` to get one
+  `InstrumentKey` per scale note, then renders three rows of the same
+  scale: `deg` (each key's Sa-relative semitone, `key − tonic`, e.g.
+  `0 2 4 5 7 9 11`), `key` (those keys' `offset`s, in `InstrumentKey`
+  space), and `Hz` (each key resolved through the active `Tuning` via
+  `tuning_view::hz`). The keys are whole, so all three render as plain
+  integers — the fractional slide never reaches this view. The Hz row
+  ascends
   naturally with no octave-lifting at the call site: `hz` derives slot
   *and* octave from the same root-relative delta, so degrees below the
   tuning root simply read an octave down. For Bilawal on C (octave 1,
-  `harmonium_key(12)`) against the A=440 12-TET tuning (root at
-  `harmonium_key(21)`):
+  `harmonium_key(12.0)`) against the A=440 12-TET tuning (root at
+  `harmonium_key(21.0)`):
 
   ```
   deg   0   2   4   5   7   9  11

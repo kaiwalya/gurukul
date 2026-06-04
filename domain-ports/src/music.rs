@@ -209,7 +209,9 @@ impl Sub for InstrumentKey {
 /// `InstrumentKey + InstrumentKeyInterval = InstrumentKey` — move from a position by a
 /// distance. Used to place a scale note on the keyboard
 /// (`tonic + Σ widths`). Debug-asserts the result stays on the
-/// representable line (non-negative, fits `u8`).
+/// representable line (finite and non-negative). Unlike the `ScaleNote`
+/// sibling, there is no `u8` bound: key space is a *continuous* `f32`
+/// line (the slide), so a fractional or large offset is valid.
 ///
 /// Note the *absence* of `impl Add for InstrumentKey` (point + point):
 /// adding two gauges is nonsense, so it deliberately does not compile.
