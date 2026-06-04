@@ -26,7 +26,7 @@
 //! changes (tracked via [`LastMusicInfo`]), including the first frame
 //! it becomes `Some`.
 
-use crate::coach::Coach;
+use crate::coach::MusicInfoRes;
 use crate::state::AppState;
 use crate::ui::*;
 use bevy::prelude::*;
@@ -109,17 +109,18 @@ pub fn spawn(mut commands: Commands, mut last: ResMut<LastMusicInfo>) {
     ));
 }
 
-/// Refresh the three rows from the coach's `music_info` snapshot,
-/// rewriting only when the snapshot changes. Reads the coach each frame
-/// (cheap `ArcSwap` load) and compares against [`LastMusicInfo`].
+/// Refresh the three rows from the [`MusicInfoRes`] read model,
+/// rewriting only when the snapshot changes (compared against
+/// [`LastMusicInfo`]). The coach handle is no longer touched here —
+/// `drain_events` republishes `music_info()` into the resource.
 pub fn refresh(
-    coach: NonSend<Coach>,
+    music: Res<MusicInfoRes>,
     mut last: ResMut<LastMusicInfo>,
     mut deg: Query<&mut Text, (With<HudDegRow>, Without<HudKeyRow>, Without<HudHzRow>)>,
     mut key: Query<&mut Text, (With<HudKeyRow>, Without<HudDegRow>, Without<HudHzRow>)>,
     mut hz: Query<&mut Text, (With<HudHzRow>, Without<HudDegRow>, Without<HudKeyRow>)>,
 ) {
-    let info = coach.0.music_info();
+    let info = music.0;
     if info == last.0 {
         return;
     }

@@ -25,7 +25,7 @@
 //! the [`Tonality`]'s intervals itself rather than asking the coach;
 //! see `docs/MUSIC_MODEL.md` § "The mask is a head-side projection".
 
-use crate::coach::Coach;
+use crate::coach::LatestFeatures;
 use crate::state::{AppState, SongTonality};
 use crate::widgets::note_dial::{DialScale, DialSlot, DialState, Needle, NeedleStyle};
 use bevy::prelude::*;
@@ -117,13 +117,13 @@ pub fn spawn(mut commands: Commands, tonality: Res<SongTonality>) {
 /// triggering `Changed<DialState>` every frame, which would cause
 /// the widget to repaint and respawn needles unnecessarily.
 pub fn update_from_features(
-    coach: NonSend<Coach>,
+    features: Res<LatestFeatures>,
     mut dial: Query<&mut DialState, With<InGameDial>>,
 ) {
     let Ok(mut state) = dial.single_mut() else {
         return;
     };
-    let Some(FeatureSnapshot { f0_hz, .. }) = coach.0.latest_features() else {
+    let Some(FeatureSnapshot { f0_hz, .. }) = features.0 else {
         // No snapshot yet (session just started) → ensure no needle.
         if !state.needles.is_empty() {
             state.needles.clear();

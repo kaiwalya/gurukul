@@ -114,6 +114,9 @@ pub fn build_app(app: &mut App) {
                 game::dial::update_from_features,
                 game::hud::refresh,
             )
+                // Read this frame's republished resources, not last
+                // frame's: drain_events writes MusicInfoRes / LatestFeatures.
+                .after(coach::drain_events)
                 .run_if(in_state(AppState::InGame)),
         )
         // Paused

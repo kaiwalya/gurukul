@@ -5,7 +5,7 @@
 pub mod dial;
 pub mod hud;
 
-use crate::coach::Coach;
+use crate::coach::{Coach, LatestFeatures};
 use crate::state::{AppSettings, AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command, FeatureSnapshot};
@@ -65,7 +65,7 @@ pub fn handle_esc_paused(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextS
     }
 }
 
-pub fn log_features(coach: NonSend<Coach>, mut last: ResMut<LastFeatureTs>) {
+pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureTs>) {
     let Some(FeatureSnapshot {
         f0_hz,
         onset,
@@ -73,7 +73,7 @@ pub fn log_features(coach: NonSend<Coach>, mut last: ResMut<LastFeatureTs>) {
         vibrato_rate,
         vibrato_depth,
         t_ms,
-    }) = coach.0.latest_features()
+    }) = features.0
     else {
         return;
     };
