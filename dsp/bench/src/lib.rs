@@ -344,10 +344,10 @@ impl Captured {
         let mut jumps = 0;
         for &hz in &hops {
             let voiced = hz.is_finite() && hz > 0.0;
-            if let (Some(p), true) = (prev, voiced) {
-                if (1200.0 * (hz / p).log2()).abs() > 600.0 {
-                    jumps += 1;
-                }
+            if let (Some(p), true) = (prev, voiced)
+                && (1200.0 * (hz / p).log2()).abs() > 600.0
+            {
+                jumps += 1;
             }
             prev = if voiced { Some(hz) } else { None };
         }

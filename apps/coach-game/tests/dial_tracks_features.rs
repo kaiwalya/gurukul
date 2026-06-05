@@ -44,6 +44,7 @@ fn voiced_feature_writes_a_primary_needle_at_expected_angle() {
         &fake,
         Some(FeatureSnapshot {
             f0_hz: 440.0, // A4: 9 semitones above C
+            confidence: 0.9,
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
@@ -73,6 +74,7 @@ fn unvoiced_feature_yields_no_needle() {
         &fake,
         Some(FeatureSnapshot {
             f0_hz: 0.0, // unvoiced
+            confidence: 0.0,
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
@@ -98,6 +100,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
         &fake,
         Some(FeatureSnapshot {
             f0_hz: 261.625_56, // C4
+            confidence: 0.9,
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
@@ -113,6 +116,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
         &fake,
         Some(FeatureSnapshot {
             f0_hz: 0.0,
+            confidence: 0.0,
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,

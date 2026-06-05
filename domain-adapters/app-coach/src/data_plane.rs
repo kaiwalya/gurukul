@@ -286,6 +286,7 @@ fn run_worker(args: WorkerArgs) {
         // heads detect "alive but silent" vs "stalled".
         let snapshot = FeatureSnapshot {
             f0_hz: engine.out_port(ports.pitch)[0],
+            confidence: engine.out_port(ports.confidence)[0],
             onset: engine.out_port(ports.onset)[0],
             breath: engine.out_port(ports.breath)[0],
             vibrato_rate: engine.out_port(ports.vibrato_rate)[0],
@@ -301,6 +302,7 @@ fn run_worker(args: WorkerArgs) {
 struct ResolvedPorts {
     mic: InPortHandle,
     pitch: OutPortHandle,
+    confidence: OutPortHandle,
     onset: OutPortHandle,
     breath: OutPortHandle,
     vibrato_rate: OutPortHandle,
@@ -314,6 +316,9 @@ fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
     let pitch = engine
         .resolve_out_port("pitch")
         .map_err(|e| format!("pitch: {e:?}"))?;
+    let confidence = engine
+        .resolve_out_port("confidence")
+        .map_err(|e| format!("confidence: {e:?}"))?;
     let onset = engine
         .resolve_out_port("onset")
         .map_err(|e| format!("onset: {e:?}"))?;
@@ -329,6 +334,7 @@ fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
     Ok(ResolvedPorts {
         mic,
         pitch,
+        confidence,
         onset,
         breath,
         vibrato_rate,

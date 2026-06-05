@@ -6,6 +6,7 @@
   ],
   "out_ports": [
     { "id": "pitch" },
+    { "id": "confidence" },
     { "id": "onset" },
     { "id": "breath" },
     { "id": "vibrato_rate" },
@@ -42,6 +43,7 @@
     { "from": "mic",                "to": "breath_det.audio_in" },
     { "from": "pitch_yin.f0",       "to": "vibrato_det.f0" },
     { "from": "pitch_yin.f0",       "to": "pitch" },
+    { "from": "pitch_yin.confidence", "to": "confidence" },
     { "from": "onset_det.onset",    "to": "onset" },
     { "from": "breath_det.breath",  "to": "breath" },
     { "from": "vibrato_det.rate",   "to": "vibrato_rate" },

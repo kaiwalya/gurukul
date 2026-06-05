@@ -307,6 +307,14 @@ pub struct FeatureSnapshot {
     /// trusts).
     pub f0_hz: f32,
 
+    /// YIN periodicity confidence for this hop, in `0.0..=1.0`
+    /// (`1 - d'` at the chosen lag). Higher means the detector trusts
+    /// the pitch more; low values flag noisy / weakly-voiced frames
+    /// even when `f0_hz` is nonzero. Heads use it as a continuous
+    /// certainty signal (e.g. needle brightness) rather than a hard
+    /// voiced/unvoiced gate.
+    pub confidence: f32,
+
     /// Onset detector output for this hop. Positive values mark a
     /// note attack; `0.0` between attacks. The exact magnitude
     /// encodes attack strength — heads can use it as a transient

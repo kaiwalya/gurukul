@@ -60,6 +60,11 @@ pub struct DialState {
 pub struct Needle {
     pub angle: f32,
     pub style: NeedleStyle,
+    /// Opacity multiplier in `0.0..=1.0`, applied to the needle
+    /// colour's alpha at paint time. Drives "certainty" — a faint
+    /// needle is a low-confidence pitch. Defaults to fully opaque for
+    /// decorative needles that don't carry a confidence signal.
+    pub brightness: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,10 +205,14 @@ pub fn apply_state(
             }
         }
         for needle in &state.needles {
-            let (color, width) = match needle.style {
+            let (base_color, width) = match needle.style {
                 NeedleStyle::Primary => (COLOR_NEEDLE_PRIMARY, NEEDLE_WIDTH_PRIMARY_PX),
                 NeedleStyle::Secondary => (COLOR_NEEDLE_SECONDARY, NEEDLE_WIDTH_SECONDARY_PX),
             };
+            // Scale the style colour's own alpha by the needle's
+            // brightness so confidence ghosts the needle without
+            // changing its hue.
+            let color = base_color.with_alpha(base_color.alpha() * needle.brightness);
             // To anchor the needle's *base* at the dial centre while
             // pivoting around that base, wrap the needle in a zero-size
             // pivot node positioned at the centre and rotated by `angle`.
@@ -336,6 +345,7 @@ mod tests {
             needles: vec![Needle {
                 angle,
                 style: NeedleStyle::Primary,
+                brightness: 1.0,
             }],
         }
     }

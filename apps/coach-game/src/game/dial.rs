@@ -168,7 +168,10 @@ pub fn update_from_features(
     let Ok(mut state) = dial.single_mut() else {
         return;
     };
-    let Some(FeatureSnapshot { f0_hz, .. }) = features.0 else {
+    let Some(FeatureSnapshot {
+        f0_hz, confidence, ..
+    }) = features.0
+    else {
         // No snapshot yet (session just started) → ensure no needle.
         if !state.needles.is_empty() {
             state.needles.clear();
@@ -184,12 +187,19 @@ pub fn update_from_features(
     }
 
     let angle = angle_from_f0(f0_hz);
+    // Map YIN confidence to needle brightness, raised to the 4th so
+    // low (noise-floor) confidence collapses to invisible when not
+    // phonating while confident voice stays solid. No floor — an
+    // untrusted pitch should fade out entirely.
+    let conf = confidence.clamp(0.0, 1.0);
+    let brightness = conf.powi(4);
     // Replace any prior needle. Writing through DerefMut triggers
     // change detection on DialState, which the widget uses to repaint.
     state.needles.clear();
     state.needles.push(Needle {
         angle,
         style: NeedleStyle::Primary,
+        brightness,
     });
 }
 

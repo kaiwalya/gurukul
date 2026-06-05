@@ -39,6 +39,10 @@ pub struct PitchYin {
 
     // Current held f0 estimate (ZOH).
     held_f0: f32,
+    // Current held voicing confidence in [0, 1] (ZOH): `1 - d'` at the chosen
+    // lag, so 1.0 = perfectly periodic, 0.0 = unvoiced. Mirrors `held_f0` —
+    // set to 0.0 whenever f0 is set to the unvoiced sentinel.
+    held_confidence: f32,
 
     // Set true when the node is in an invalid configuration (e.g. block_size > window).
     unhealthy: bool,
@@ -78,6 +82,7 @@ impl PitchYin {
             d: vec![0.0f64; scratch_len],
             dprime: vec![1.0f64; scratch_len],
             held_f0: 0.0,
+            held_confidence: 0.0,
             unhealthy: false,
         }
     }
@@ -166,6 +171,7 @@ impl PitchYin {
         // If the best d' is too high, treat as unvoiced.
         if dprime[chosen_tau] > UNVOICED_DPRIME_THRESHOLD {
             self.held_f0 = 0.0;
+            self.held_confidence = 0.0;
             return;
         }
 
@@ -173,6 +179,7 @@ impl PitchYin {
         // candidate frequency exceeds fmax_hz. Reject it as unvoiced.
         if chosen_tau < tau_min {
             self.held_f0 = 0.0;
+            self.held_confidence = 0.0;
             return;
         }
 
@@ -183,14 +190,19 @@ impl PitchYin {
         // frequency, which displays as a fake low note.
         if chosen_tau >= tau_max {
             self.held_f0 = 0.0;
+            self.held_confidence = 0.0;
             return;
         }
 
         // --- Step 4: parabolic interpolation ---
         let tau_hat = parabolic_interp(dprime, chosen_tau, tau_search_min, tau_max);
 
-        // --- Step 5: f0 ---
+        // --- Step 5: f0 + confidence ---
         self.held_f0 = (self.sample_rate / tau_hat as f32).max(0.0);
+        // Confidence = 1 - d' at the chosen lag, clamped to [0, 1]. d' near 0
+        // means a deep CMNDF dip (strongly periodic); near 1 means weak/no
+        // periodicity. We report the pre-interpolation d' at chosen_tau.
+        self.held_confidence = (1.0 - dprime[chosen_tau] as f32).clamp(0.0, 1.0);
     }
 }
 
@@ -247,6 +259,7 @@ impl Node for PitchYin {
         self.samples_since_analysis = 0;
         self.total_samples = 0;
         self.held_f0 = 0.0;
+        self.held_confidence = 0.0;
 
         let scratch_len = tau_max + 1;
         self.d = vec![0.0f64; scratch_len];
@@ -261,25 +274,35 @@ impl Node for PitchYin {
         self.samples_since_analysis = 0;
         self.total_samples = 0;
         self.held_f0 = 0.0;
+        self.held_confidence = 0.0;
         self.d.fill(0.0);
         self.dprime.fill(1.0);
     }
 
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
-        let out = match outputs.first_mut() {
-            Some(o) => o,
-            None => return,
+        // outputs[0] = f0, outputs[1] = confidence (optional — only filled if
+        // the consumer wired it). Split so we can borrow both mutably.
+        let (f0_out, conf_out) = match outputs {
+            [] => return,
+            [f0] => (&mut **f0, None),
+            [f0, conf, ..] => (&mut **f0, Some(&mut **conf)),
         };
 
         if self.unhealthy {
-            out[..nframes].fill(0.0);
+            f0_out[..nframes].fill(0.0);
+            if let Some(c) = conf_out {
+                c[..nframes].fill(0.0);
+            }
             return;
         }
 
         let input = match inputs.first() {
             Some(s) => s,
             None => {
-                out[..nframes].fill(0.0);
+                f0_out[..nframes].fill(0.0);
+                if let Some(c) = conf_out {
+                    c[..nframes].fill(0.0);
+                }
                 return;
             }
         };
@@ -302,7 +325,10 @@ impl Node for PitchYin {
         }
 
         // ZOH: fill entire output block with current estimate.
-        out[..nframes].fill(self.held_f0);
+        f0_out[..nframes].fill(self.held_f0);
+        if let Some(c) = conf_out {
+            c[..nframes].fill(self.held_confidence);
+        }
     }
 }
 
@@ -313,10 +339,16 @@ pub fn register(registry: &mut NodeRegistry) {
             name: "audio_in",
             ty: PortType::Audio,
         }],
-        vec![PortSpec {
-            name: "f0",
-            ty: PortType::Feature,
-        }],
+        vec![
+            PortSpec {
+                name: "f0",
+                ty: PortType::Feature,
+            },
+            PortSpec {
+                name: "confidence",
+                ty: PortType::Feature,
+            },
+        ],
         vec![
             ParamSpec {
                 name: "window",

@@ -234,8 +234,8 @@ fn print_features(s: &FeatureSnapshot, use_color: bool) {
         cents_str
     };
     println!(
-        "[{:>10} ms]  {}  {:>10.2} Hz  {:>4}  {} cents  {}  {}",
-        s.t_ms, onset_marker, s.f0_hz, note, painted, breath_str, vib_str
+        "[{:>10} ms]  {}  {:>10.2} Hz  {:>4}  {} cents  conf {:>4.2}  {}  {}",
+        s.t_ms, onset_marker, s.f0_hz, note, painted, s.confidence, breath_str, vib_str
     );
 }
 

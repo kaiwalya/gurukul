@@ -69,6 +69,7 @@ pub fn handle_esc_paused(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextS
 pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureTs>) {
     let Some(FeatureSnapshot {
         f0_hz,
+        confidence,
         onset,
         breath,
         vibrato_rate,
@@ -89,6 +90,6 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureT
     };
     let onset_marker = if onset > 0.0 { "•" } else { " " };
     info!(
-        "t={t_ms:>8}ms  f0 {f0_str}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>4.2}st  {onset_marker}"
+        "t={t_ms:>8}ms  f0 {f0_str}  conf {confidence:>4.2}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>4.2}st  {onset_marker}"
     );
 }
