@@ -1,14 +1,12 @@
 $schema: 'https://moonrepo.dev/schemas/workspace.json'
 
 # Project IDs are explicit (map form) because directory leaves are
-# not unique — both `dsp/cli` and `apps/coach-cli` exist. The ID on the
+# not unique — both `dsp/bench` and `apps/coach-cli` exist. The ID on the
 # left matches the Cargo package name for that crate.
 projects:
   # dsp layer
-  dsp-cli: dsp/cli
+  dsp-bench: dsp/bench
   engine: dsp/engine
-  engine-ffi: dsp/engine-ffi
-  node-assert-near: dsp/node-assert-near
   node-breath: dsp/node-breath
   node-gain: dsp/node-gain
   node-mix-sum: dsp/node-mix-sum

@@ -75,21 +75,22 @@ default: 1024). On overflow the control plane drops the oldest
 event(s) and emits a single `CoachEvent::EventsDropped { count }` when
 space frees up. Heads SHOULD drain at ≥10Hz to avoid this.
 
-**FFI translation note (Phase 2 / future concern).** The Rust
-`&mut Vec<CoachEvent>` becomes a caller-allocated buffer + count
-return at the FFI boundary
-(`coach_poll_events(handle, *out_buf, cap) -> count`), matching the
-engine FFI convention. The Rust trait stays idiomatic; the FFI binding
-owns the serialization seam. v1 is Rust-only.
+**FFI translation note (Phase 2 / future concern).** Should a future
+native head ever need a C ABI, the Rust `&mut Vec<CoachEvent>` becomes a
+caller-allocated buffer + count return at the boundary
+(`coach_poll_events(handle, *out_buf, cap) -> count`). The Rust trait
+stays idiomatic; a future FFI binding would own the serialization seam.
+Today's heads link the engine directly as a Rust crate — there is no
+C ABI, and v1 is Rust-only.
 
 **Phase 2 adds `latest_pitch()`.** The pitch snapshot read is a
 fourth trait method that lands when the data plane lands. Designing
 the v1 trait as if `latest_pitch` already existed (i.e. not folding
 pitch into `poll_events`) keeps the Phase 2 addition non-breaking.
 
-Rationale: the engine FFI (`dsp/engine-ffi/include/engine.h`) already
-proved this shape (opaque handle + poll). The Rust trait mirrors it so
-the eventual FFI binding is a translation, not a redesign.
+Rationale: the opaque-handle + poll shape survives a future C ABI
+unchanged, so the eventual (if ever) FFI binding is a translation, not
+a redesign.
 
 **This is a breaking change to today's `trait AppCoach { fn main(...) }`.**
 The one-shot `main` is replaced. Existing call sites in `coach-cli`

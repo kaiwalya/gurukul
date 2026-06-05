@@ -751,8 +751,8 @@ impl Engine {
     /// Lifetime contract: `output_buffers` is sized once during `build` and
     /// never reallocated thereafter — `process_block` writes in place. The
     /// returned slice is therefore valid until the next `process_block`
-    /// (which overwrites the contents) or engine drop. The engine-ffi
-    /// `engine_read_port` function relies on this invariant.
+    /// (which overwrites the contents) or engine drop. Any borrowing
+    /// reader relies on this invariant.
     pub fn peek(&self, node_id: &str, port: &str) -> Result<&[f32], EngineError> {
         let node_idx = self
             .node_index
@@ -778,7 +778,7 @@ impl Engine {
     ///
     /// This is the prescriptive-border read API: the caller owns the
     /// destination buffer, the engine copies into it, and the engine's
-    /// internal storage never escapes through the FFI. Once this call
+    /// internal storage never escapes to the caller. Once this call
     /// returns, the caller's data is independent of subsequent
     /// `process_block` / `reset` / drop activity on the engine.
     ///

@@ -15,12 +15,12 @@ Gurukul is not a tuner. A tuner tells you that you were flat. A coach tells you 
 ## Quick start
 
 ```
-cargo run -p dsp-cli -- --help                       # all commands
-cargo run -p dsp-cli -- list-nodes                   # registered node types
-cargo run -p dsp-cli -- describe-node <name>         # ports and parameters
-cargo run -p dsp-cli -- validate dsp/worlds/hello.json
-cargo run -p dsp-cli -- run dsp/worlds/hello.json --duration 2s --dump-events <port>
-cargo run -p dsp-cli -- render dsp/worlds/hello.json | dot -Tsvg > graph.svg
+cargo run -p dsp-bench -- --help                       # all commands
+cargo run -p dsp-bench -- list-nodes                   # registered node types
+cargo run -p dsp-bench -- describe-node <name>         # ports and parameters
+cargo run -p dsp-bench -- validate dsp/worlds/hello.json
+cargo run -p dsp-bench -- run dsp/worlds/hello.json --duration 2s --dump-events <port>
+cargo run -p dsp-bench -- render dsp/worlds/hello.json | dot -Tsvg > graph.svg
 ```
 
 See [`dsp/worlds/hello.json`](dsp/worlds/hello.json) for the canonical demo graph — hand-edit it to rewire, add, or remove nodes.

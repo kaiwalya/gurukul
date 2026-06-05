@@ -1,8 +1,8 @@
 //! Runtime port enumeration.
 //!
-//! PR 1.4.8.1 surface: `Engine::node_ids` and `Engine::out_port_names` let host
-//! code walk the live graph without re-reading the source World JSON. The
-//! debug pane in the Mac cabinet (PR 1.4.8.5) is the first user.
+//! `Engine::node_ids` and `Engine::out_port_names` let host code walk the
+//! live graph without re-reading the source World JSON — the basis for the
+//! bench's reflection (`describe-node`, `render`) and any debug/inspect pane.
 
 use engine::{BoundaryPort, Connection, Engine, NodeDef, NodeRegistry, World};
 use std::collections::HashMap;

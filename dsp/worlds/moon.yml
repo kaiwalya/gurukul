@@ -3,8 +3,8 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 type: configuration
 language: unknown
 
-# cli is an application layer; moon forbids configuration→application deps.
-# Tasks below invoke cargo directly and must be run after `cargo build -p dsp-cli`.
+# dsp-bench is an application layer; moon forbids configuration→application deps.
+# Tasks below invoke cargo directly and must be run after `cargo build -p dsp-bench`.
 
 tasks:
   # No Cargo crate here — disable the inherited Rust tasks.
@@ -15,8 +15,6 @@ tasks:
 
   test:
     command: 'noop'
-    deps:
-      - '~:test-worlds'
     options:
       runFromWorkspaceRoot: true
 
@@ -31,13 +29,8 @@ tasks:
       runFromWorkspaceRoot: true
 
   validate:
-    command: 'cargo run -p dsp-cli -- validate dsp/worlds/hello.json'
+    command: 'cargo run -p dsp-bench -- validate dsp/worlds/hello.json'
     inputs:
       - 'hello.json'
-    options:
-      runFromWorkspaceRoot: true
-
-  test-worlds:
-    command: 'cargo run -p dsp-cli -- test dsp/worlds/test'
     options:
       runFromWorkspaceRoot: true

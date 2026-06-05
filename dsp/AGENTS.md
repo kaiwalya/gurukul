@@ -7,8 +7,8 @@ what's specific to `dsp/`.
 ## Where information lives
 
 - DSP architecture → [`ARCHITECTURE.md`](ARCHITECTURE.md)
-- Node types, ports, parameters → `cargo run -p dsp-cli -- list-nodes` and `describe-node <name>`
-- CLI commands and flags → `cargo run -p dsp-cli -- --help`. Don't restate semantics in Markdown.
+- Node types, ports, parameters → `cargo run -p dsp-bench -- list-nodes` and `describe-node <name>`
+- CLI commands and flags → `cargo run -p dsp-bench -- --help`. Don't restate semantics in Markdown.
 - World file format → [`schema/world.schema.json`](schema/world.schema.json), derived from Rust types.
 
 ## Rules that aren't obvious from the code

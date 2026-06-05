@@ -2465,14 +2465,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
-name = "dsp-cli"
+name = "dsp-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "engine",
+ "hound",
  "jsonschema",
- "node-assert-near",
  "node-breath",
  "node-gain",
  "node-mix-sum",
@@ -2558,31 +2558,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "engine-ffi"
-version = "0.1.0"
-dependencies = [
- "engine",
- "node-assert-near",
- "node-breath",
- "node-gain",
- "node-mix-sum",
- "node-null-sink",
- "node-onset",
- "node-passthrough",
- "node-pitch-error",
- "node-pitch-yin",
- "node-rms-meter",
- "node-synth-breath",
- "node-synth-onsets",
- "node-synth-pink-noise",
- "node-synth-sine",
- "node-synth-vibrato-sine",
- "node-tracer",
- "node-vibrato",
- "serde_json",
 ]
 
 [[package]]
@@ -3925,13 +3900,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "node-assert-near"
-version = "0.1.0"
-dependencies = [
- "engine",
 ]
 
 [[package]]

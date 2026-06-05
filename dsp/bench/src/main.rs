@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use dsp_bench::build_registry;
 use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
 use schemars::schema_for;
 use std::collections::HashMap;
@@ -7,7 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "gurukul", about = "Gurukul audio engine CLI")]
+#[command(
+    name = "dsp-bench",
+    about = "Gurukul DSP engine bench: inspect nodes, run and test worlds"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -44,7 +48,7 @@ enum Command {
         #[arg(long = "trace", value_name = "PORT_PATH", num_args = 1..)]
         trace: Vec<String>,
 
-        /// Internal node ports to read via the engine's peek API (e.g. yin.f0_hz).
+        /// Internal node ports to read via the engine's peek API (e.g. pitch_yin.f0).
         /// May be repeated. Unlike --trace, --peek does not modify the graph; it
         /// reads internal buffers after each block. CSV rows are written to stdout:
         /// `block,frame,<peek_path_1>,<peek_path_2>,...`
@@ -56,22 +60,6 @@ enum Command {
         sample_rate: u32,
 
         /// Block size in frames.
-        #[arg(long, default_value_t = 512)]
-        block_size: usize,
-    },
-
-    /// Run all world files in a directory (or a single file) and check AssertNear assertions.
-    Test {
-        /// Path to a world file or directory of world files.
-        path: PathBuf,
-
-        /// Duration of simulated audio time (default 1s).
-        #[arg(long, default_value = "1s")]
-        duration: String,
-
-        #[arg(long, default_value_t = 48000)]
-        sample_rate: u32,
-
         #[arg(long, default_value_t = 512)]
         block_size: usize,
     },
@@ -92,28 +80,6 @@ enum Command {
 
     /// Emit the JSON Schema for world files to stdout.
     EmitSchema,
-}
-
-fn build_registry() -> NodeRegistry {
-    let mut registry = NodeRegistry::new();
-    node_synth_sine::register(&mut registry);
-    node_synth_vibrato_sine::register(&mut registry);
-    node_synth_pink_noise::register(&mut registry);
-    node_mix_sum::register(&mut registry);
-    node_rms_meter::register(&mut registry);
-    node_assert_near::register(&mut registry);
-    node_gain::register(&mut registry);
-    node_passthrough::register(&mut registry);
-    node_null_sink::register(&mut registry);
-    node_pitch_error::register(&mut registry);
-    node_pitch_yin::register(&mut registry);
-    node_tracer::register(&mut registry);
-    node_vibrato::register(&mut registry);
-    node_synth_onsets::register(&mut registry);
-    node_onset::register(&mut registry);
-    node_synth_breath::register(&mut registry);
-    node_breath::register(&mut registry);
-    registry
 }
 
 fn load_world(path: &PathBuf) -> Result<World> {
@@ -415,90 +381,6 @@ fn cmd_run(
     Ok(())
 }
 
-struct TestSummary {
-    #[allow(dead_code)]
-    passed: usize,
-    failed: usize,
-}
-
-fn cmd_test(
-    path: &PathBuf,
-    duration_str: &str,
-    sample_rate: u32,
-    block_size: usize,
-    registry: &NodeRegistry,
-) -> Result<TestSummary> {
-    // Collect world files: directory → sorted *.json; file → just that file.
-    let world_files: Vec<PathBuf> = if path.is_dir() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| format!("reading directory {}", path.display()))?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let p = entry.path();
-                if p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("json"))
-                    .unwrap_or(false)
-                {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        files.sort();
-        files
-    } else {
-        vec![path.clone()]
-    };
-
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-
-    for world_path in &world_files {
-        let result = run_test_world(world_path, duration_str, sample_rate, block_size, registry);
-        match result {
-            Ok(()) => passed += 1,
-            Err(e) => {
-                eprintln!("FAILED {}: {e}", world_path.display());
-                failed += 1;
-            }
-        }
-    }
-
-    println!("test summary: {passed} passed, {failed} failed");
-
-    Ok(TestSummary { passed, failed })
-}
-
-fn run_test_world(
-    world_path: &PathBuf,
-    duration_str: &str,
-    sample_rate: u32,
-    block_size: usize,
-    registry: &NodeRegistry,
-) -> Result<()> {
-    let (mut engine, _legend) =
-        build_engine_for_world(world_path, &[], registry, sample_rate, block_size)?;
-
-    let total_samples = parse_duration_samples(duration_str, sample_rate)?;
-    let n_blocks = total_samples.div_ceil(block_size as u64);
-    engine.run_blocks(n_blocks);
-
-    // finish() prints the per-node summary lines; collect any failures.
-    let results = engine.finish();
-    let node_failures: Vec<String> = results
-        .into_iter()
-        .filter_map(|(id, r)| r.err().map(|e| format!("{id}: {e}")))
-        .collect();
-
-    if node_failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("{}", node_failures.join("; "))
-    }
-}
-
 fn cmd_render(
     world_path: &PathBuf,
     registry: &NodeRegistry,
@@ -510,7 +392,7 @@ fn cmd_render(
     // Validate first
     Engine::build(&world, registry, sample_rate, block_size).context("validating world")?;
 
-    println!("digraph gurukul {{");
+    println!("digraph dsp {{");
     println!("  rankdir=LR;");
     println!("  node [shape=box, fontname=\"monospace\"];");
     println!();
@@ -666,16 +548,6 @@ fn main() -> ExitCode {
             *sample_rate,
             *block_size,
         ),
-        Command::Test {
-            path,
-            duration,
-            sample_rate,
-            block_size,
-        } => match cmd_test(path, duration, *sample_rate, *block_size, &registry) {
-            Ok(summary) if summary.failed > 0 => return ExitCode::FAILURE,
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        },
         Command::Render {
             world,
             sample_rate,
@@ -727,7 +599,6 @@ mod tests {
         assert!(types.contains(&"SynthPinkNoise"));
         assert!(types.contains(&"MixSum"));
         assert!(types.contains(&"RmsMeter"));
-        assert!(types.contains(&"AssertNear"));
         assert!(types.contains(&"GainNode"));
         assert!(types.contains(&"Passthrough"));
         assert!(types.contains(&"NullSink"));

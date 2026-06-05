@@ -77,12 +77,28 @@ The synthesis library is itself the hardest thing to get right — a bad synthes
 
 ## Integration with the engine architecture
 
-Because the product uses a plugin-graph engine (see `ARCHITECTURE.md`), tests are natural:
+Because the product uses a plugin-graph engine (see `ARCHITECTURE.md`), tests
+are natural. The unit is a **triple**: `(input, world, expectation)`.
 
-- A **test-mode world** wires `SyntheticSource → Impairments → AnalyzerUnderTest → OracleSink → PassFailReporter`.
-- A synthesiser node and an analyzer node share the same `Node` interface — in opposite directions.
-- Parameter sweeps are authored as graphs, not as test-framework constructs.
-- The AI coding agent writing a new analyzer writes the paired synthesiser *and* the test world on the same day.
+- **input** — a source of samples for the world's boundary in-ports: a
+  recorded WAV, a generator world (`SynthSine`, impairment chain), or a
+  constant. The cabinet drives the in-ports; there is no `FileSource` node.
+- **world** — the graph under test, *unmodified*. The live `coach.json` is
+  tested by the same JSON the app ships, not a test-rigged copy. Throwaway
+  micro-worlds can be inlined as a JSON string.
+- **expectation** — an ordinary Rust `assert!` over the captured wires.
+  Expectations live in code, not in the graph: there is no `OracleSink` /
+  `AssertNear` / `PassFailReporter` node. This keeps the expectation
+  language unbounded (any predicate you can write) without growing a JSON
+  schema, and `cargo test` is the runner — discovery, filtering, CI for free.
+
+The harness is the `Bench` type in `dsp/bench` (`Bench::mount(world)` or
+`Bench::new(inline_json)` → `.bind(port, source)` → `.capture(wire)` →
+`.run(duration)` → `Captured`). A synthesiser node and an analyzer node still
+share the same `Node` interface — in opposite directions — and the agent
+writing a new analyzer writes the paired synthesiser *and* a `#[test]` that
+benches it on the same day. Real-recording cases are `#[ignore]`-gated (the
+WAVs live under a git-ignored `test_data/`).
 
 ## Why this works for AI-driven development
 

@@ -1,14 +1,12 @@
 [workspace]
 members = [
     "dsp/engine",
-    "dsp/engine-ffi",
-    "dsp/cli",
+    "dsp/bench",
     "dsp/node-synth-sine",
     "dsp/node-synth-vibrato-sine",
     "dsp/node-synth-pink-noise",
     "dsp/node-mix-sum",
     "dsp/node-rms-meter",
-    "dsp/node-assert-near",
     "dsp/node-gain",
     "dsp/node-passthrough",
     "dsp/node-null-sink",
