@@ -434,7 +434,7 @@ mod tests {
             "before ConfigureSession, ScalesListed must be empty (no tuning known)"
         );
 
-        // Configure a 12-TET session; now ListScales returns 13 shapes.
+        // Configure a 12-TET session; now ListScales returns 14 shapes.
         let (tuning, tonality) = bilawal_config();
         coach.send_command(Command::ConfigureSession { tuning, tonality });
         coach.send_command(Command::ListScales);
@@ -455,8 +455,8 @@ mod tests {
             .expect("second ScalesListed (after configure)");
         assert_eq!(
             shapes_after.len(),
-            13,
-            "after 12-TET ConfigureSession, catalogue must have 13 shapes"
+            14,
+            "after 12-TET ConfigureSession, catalogue must have 14 shapes"
         );
 
         assert_eq!(

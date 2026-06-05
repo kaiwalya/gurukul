@@ -118,6 +118,8 @@ pub fn build_app(app: &mut App) {
                 game::handle_esc_in_game,
                 game::dial::update_from_features,
                 game::dial::repaint_slots,
+                game::dial::handle_hub_capture,
+                game::dial::sync_hub,
                 game::hud::refresh,
                 // Scale picker: handle_hud_click opens, sync_picker
                 // spawns/despawns, sync_rows repopulates when the

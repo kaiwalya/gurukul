@@ -44,14 +44,15 @@ each independently configurable:
 ```
 
 1. **Compass body (fixed):** the circle itself. North = 12 o'clock =
-   `log(f) % 2 == 0` of whatever the root is. Pure geometry.
-2. **Needle:** live `log(f) % 2`, displayed relative to the current
-   root. **Continuous** — it glides smoothly to wherever the voice
-   actually is on the log-frequency circle, landing *between* the ticks
-   when the singer slides (meend / glissando), never snapping. The
-   model-side fold is `tuning_view::octave_position(hz, ref_hz)` (a
-   fraction in `[0, 1)`); the dial turns that into an angle by `× TAU`.
-   *Tuning-independent.* (Already in code, working.)
+   **the tonic (Sa)** — the dial anchors on the song tonic, so whatever
+   key Sa is on renders at the top. Pure geometry.
+2. **Needle:** live pitch, displayed **relative to Sa**. **Continuous** —
+   it glides smoothly to wherever the voice actually is on the
+   log-frequency circle, landing *between* the ticks when the singer
+   slides (meend / glissando), never snapping. The model-side fold is
+   `tuning_view::octave_position(f0, sa_hz)` (the live `f0` against Sa's
+   resolved Hz, a fraction in `[0, 1)`); the dial turns that into an angle
+   by `× TAU`. *Tuning-independent.* (Already in code, working.)
 3. **Tuning ring:** 12 faint tick marks at log-frequency positions
    set by the **tuning system**. 12-TET → evenly spaced.
    Hindustani Just → uneven. **No labels, no highlights — just where
@@ -60,9 +61,11 @@ each independently configurable:
 4. **Scale ring:** of those tuning slots, which ones are "in the
    scale". A mask on the tuning ring; renders as lit vs dim ticks.
    Derived from the `Tonality` (tonic key + scale widths).
-5. **Label ring:** carries the note names. **Rotates independently
-   to find the right "lock" position.** This is the layer that
-   distinguishes Western from Hindustani — not the geometry.
+5. **Label ring:** carries the note names. The geometry already put
+   the tonic at north, so the ring **doesn't rotate** — its only job is
+   to choose *which vocabulary* lands on each slot (movable Sargam vs
+   absolute Western note-names). This is the layer that distinguishes
+   Western from Hindustani — not the geometry.
 
 The widget itself stays dumb: it takes pre-computed slot angles,
 labels, and highlights, and renders them. All musical semantics live
@@ -72,31 +75,42 @@ above.
 
 The single most important conceptual move from earlier design
 discussion: **the Western/Hindustani difference is not two different
-models. It's one model with two values of "what does the label ring
-lock to?"**
+models. It's one model with two values of "what vocabulary does the
+label ring paint?"**
 
-**Western lock — labels anchored to absolute Hz.**
+> **Note — revised from an earlier draft.** An earlier version of this
+> doc made the *geometry* carry the cultural split: north = C always,
+> and the label ring *rotated* to drag Sa to the top for Hindustani
+> while leaving C on top for Western. The dial now anchors **north on
+> the tonic for everyone** (see "What's in code today" and the worked
+> example). That is strictly cleaner: a Western singer in "D Major" is
+> putting D as their tonic, so D belongs at north for them too. The
+> Western/Hindustani difference collapses entirely into *what the labels
+> say* — it never touches geometry. The lock-mode story below is rewritten
+> around that.
 
-- The "A" sticker lands at `log(440 / reference_hz) % 2`. C, D, E, F♯
-  all sit at fixed absolute angles.
-- Change song tonic from C to D → **the scale ring rotates**, the
-  labels don't move.
-- This is *absolute pitch*: labels anchored to Hz, scale moves.
+**Geometry (all cultures): the tonic is at north.** Change the song
+tonic from C to D → the whole dial re-anchors so D is at the top.
+Nothing about this depends on the note system; it is pure
+tonic-relative geometry (the needle and ticks fold against Sa's Hz).
 
-**Hindustani lock — labels anchored to the tonic.**
+**The label ring's only job is vocabulary.** Two values:
 
-- The "Sa" sticker is locked to north. Whatever Hz the tonic key lands
-  on, that's where Sa renders.
-- Change song tonic from C to D → **nothing rotates visually.** The
-  frequency reference shifts under the labels; the dial looks the
-  same; "Sa" still at the top.
-- This is *relative pitch*: labels anchored to the tonic, scale
-  effectively stays put.
+- **Sargam (movable-do):** paint "Sa" at north, "Re, Ga, …" clockwise.
+  The same labels appear at the same dial positions no matter which key
+  the tonic is on — because the *names* are tonic-relative and the
+  *geometry* already put the tonic at north. "Sa" is always at the top
+  because Sa is always the tonic and the tonic is always at north.
+- **Western (fixed note-names):** paint the absolute note-name of the
+  tonic at north ("D" for D Major), then the rest clockwise. The names
+  are absolute-pitch, but they sit on the same tonic-anchored geometry —
+  so the tonic's name lands at north, and changing key re-letters the
+  ring without rotating the scale highlights.
 
-Same machinery underneath. The only difference is which ring rotates
-when you change key. **Once we get this abstraction right, the
+Same machinery underneath; same geometry. The only difference is the
+*vocabulary* the labels carry. **Once we get this abstraction right, the
 "Western vs Hindustani" distinction stops needing special cases
-elsewhere in the codebase.**
+elsewhere in the codebase** — it lives entirely in the label ring.
 
 A `LabelRing` is therefore:
 
@@ -112,12 +126,15 @@ enum LockMode {
 }
 ```
 
-Plus a function `label_ring_rotation(lock, tonic_hz, reference_hz) ->
-radians` that decides how much to rotate the label ring at render
-time. *Not yet built* — see "What's deferred" below. The current
-`NoteSystem::slot_label` table is a stub that pretends the lock mode
-problem doesn't exist; it works for Western but is structurally wrong
-for Sargam.
+The lock mode now selects **which name lands on each slot**, not how far
+to rotate a ring — the geometry already anchors the tonic at north
+(above). `RelativeToTonic` reads names off a tonic-relative table (slot 0
+of the scale = "Sa"); `AbsoluteHz` reads them off an absolute-pitch table
+(the slot whose Hz is 440 = "A", and the rest follow). Both then render
+on the same tonic-anchored dial. *Not yet built* — see "What's deferred"
+below. This is a simplification of an earlier sketch that had the label
+ring carry a rotation; with tonic-at-north geometry, no rotation is
+needed.
 
 ## The four axes
 
@@ -597,18 +614,23 @@ naming table (Job B above) keeps the storage neutral to vocabulary
 choice.
 
 **The in-scale mask is a head-side render projection** (see "The mask
-is a head-side projection" below). Given a `Tonality`, the mask
-(`[bool; N]` — which slots are in the song) is derived by walking the
-`widths()` from the tonic: the walk starts at the tonic's within-octave
-slot — `tonality.tonic.offset.round() as usize % N` — and adds each
-(rounded) width modulo `N`, marking every visited slot. (The round is
-exact: tonic and widths are whole by the `Tonality` invariant; only the
-live slide is fractional.) It is **tuning-independent** — the lit slot
-set is the same integer pattern regardless of whether the tuning is
-12-TET or Just (the tuning only changes where each slot is *drawn*, not
-which is lit). So the head computes it directly from the `Tonality` it
-holds; it does not cross the port and the coach does not compute it. It
-feeds the dial's scale ring (layer 4).
+is a head-side projection" below). Given a `Tonality` and the tuning's
+`root`, the mask (`[bool; N]` — which slots are in the song) is derived
+by walking the `widths()` from the tonic. The mask is **slot-indexed**:
+slot 0 is the tuning's root key, so it zips directly with the tick-angle
+table (also slot-indexed). The walk starts at the tonic's **slot
+index** — the gauge-clean delta `(tonic − root).0.round() % N`, *not* the
+absolute offset — and adds each (rounded) width modulo `N`, marking every
+visited slot. (The round is exact: tonic and widths are whole by the
+`Tonality` invariant; only the live slide is fractional. Subtracting
+`root` first is the gauge law: the lit set must depend only on the
+*difference* tonic − root, never on an absolute key — see "The affine
+model".) It is **tuning-independent** — the lit slot set is the same
+integer pattern regardless of whether the tuning is 12-TET or Just (the
+tuning only changes where each slot is *drawn*, not which is lit). So the
+head computes it directly from the `Tonality` it holds; it does not cross
+the port and the coach does not compute it. It feeds the dial's scale
+ring (layer 4).
 
 **Worked: what frequency is "Sa"?** The trap is that the `widths` play
 *no part* in finding Sa — Sa is the tonic, before any width. The widths
@@ -778,8 +800,9 @@ singing; the head holds the same `Tonality` to paint the scale ring.
 | `Tuning::new`, `Tonality::new` | State | the state struct | construction = birth; state owns being born |
 | `Tonality::widths`, `note_count`, `key_of` | State (read) | `Tonality` | read a scale's *own* fields (the widths, the tonic) — no external state, so methods on the type; `key_of` is the scale-space → key-space bridge |
 | `Tonality::well_formed(n)` | State-join | called at the Tuning×Tonality join (coach), not at `Tonality::new` | needs `N` from the *tuning*, which `Tonality` alone doesn't have |
-| `tuning_view::octave_position`, `tuning_view::hz` | View | `tuning_view` (coach) | the Hz↔key map; `octave_position` is the log-fold the needle/ticks use, `hz` resolves a key (whole or sliding) to Hz; both read a `Tuning` |
-| `dial::in_scale_mask` (width walk) | head render | `dial.rs` (head) | tuning-independent integer projection of the `Tonality` the head holds; sibling to its angle math |
+| `tuning_view::octave_position`, `tuning_view::hz`, `tuning_view::key_of_hz` | View | `tuning_view` (coach) | the Hz↔key map; `octave_position` is the log-fold the needle uses (live `f0` against Sa's Hz), `hz` resolves a key (whole or sliding) to Hz, `key_of_hz` is its inverse; all read a `Tuning` |
+| `tuning_view::slot_position_from(t, ref_key, i)` | View | `tuning_view` (coach) | the tuning ring's tick geometry — slot `i`'s real Hz folded against `ref_key`'s (the dial passes the tonic, so Sa = north). Hz-based so a non-uniform tuning keeps its uneven spacing; the dial only `× TAU` |
+| `dial::in_scale_mask` (width walk) | head render | `dial.rs` (head) | tuning-independent **slot-space** integer projection (slot 0 = tuning root) of the `Tonality` the head holds; walked from the gauge-clean delta `(tonic − root) % N`; sibling to its angle math |
 
 The dividing line: **state = how it's built and read from its own
 fields; View = how it's read against a `Tuning`; render = how the head
@@ -846,45 +869,62 @@ The tonic +
 scale ride in the head's `SongTonality(Tonality)` resource and cross
 the port as a `Tonality` via `ConfigureSession`.
 
-What the user sees:
+**North = the tonic (Sa), for everyone.** The dial's geometry anchors
+on the song tonic: whatever key the singer planted Sa on renders at 12
+o'clock. This is *tonic-first*, not Hindustani-first — a Western singer
+in "D Major" is putting D as their tonic, so D sits at north for them
+too. "Sa" is simply the Hindustani word for "the tonic"; the geometry
+does not know or care what the labels call it. What differs between
+cultures is **what the labels say** (the deferred label ring), *not*
+where the tonic sits.
 
-- **Tuning ring:** 12 evenly-spaced ticks (12-TET).
-- **Scale ring:** keyboard positions `[2,4,6,7,9,11,1]` highlighted,
-  others dim (the in-scale mask, walked head-side from `Tonality`
-  starting at the tonic's within-octave slot `tonic.offset.round() %
-  12 = 2` and adding each width mod 12). The mask is indexed in key
-  space (0 = C). Tuning-independent: the lit set is the same in 12-TET
-  or Just; only the angles differ.
-- **Label ring:** Sargam lock = RelativeToTonic. "Sa" sticker locked
-  to north. Slot 2 (the singer's D) is at north. The 5 chromatic
-  out-of-scale slots either get no label or get komal/tivra labels at
-  their scale-degree positions; the 7 in-scale slots get Sa, Re, Ga,
-  Ma, Pa, Dha, Ni reading clockwise.
+What the user sees (Sargam, Bilawal, Sa on D = key 14, tuning root A =
+key 21):
+
+- **Tuning ring:** 12 evenly-spaced ticks (12-TET), each placed by
+  `tuning_view::slot_position_from(t, tonic, i)` — slot `i`'s real Hz
+  folded against Sa's Hz. Sa lands at north; the tuning root A rotates
+  to the 7-o'clock (Pa) position.
+- **Scale ring:** slot-space positions `[0,2,4,5,7,9,10]` highlighted
+  (the in-scale mask, walked head-side from `Tonality` starting at the
+  tonic's *slot index* `(tonic − root).round() % 12 = 5` and adding each
+  width mod 12). The mask is **slot-indexed** (slot 0 = the tuning root),
+  the same index space as the tick angles, so they zip by index.
+  Tuning-independent: the lit set is the same in 12-TET or Just; only the
+  drawn angles differ.
+- **Needle:** the live `f0` folded against Sa's Hz
+  (`tuning_view::octave_position(f0, sa_hz) × TAU`) — the same Hz fold
+  the ticks use, so a perfectly-sung Just Pa lands exactly on the uneven
+  Just Pa tick.
+- **Label ring (deferred):** would paint "Sa, Re, Ga, Ma, Pa, Dha, Ni"
+  on the in-scale slots reading clockwise from north, plus komal/tivra
+  forms on the out-of-scale slots. The labels ride *on top of* the
+  already-tonic-anchored geometry; the ring's only job is *what the
+  labels say*, never *which ring rotates*.
 - **HUD badge:** "Safed-2 Bilawal" — "Safed-2" because that's how a
   Sargam user announces their tonic ("my Sa is on Safed-2 / the 2nd
   white key today"); "Bilawal" because that's the school's name for
-  this step vector. Note: the HUD does **not** say "Sa Bilawal" — Sa
-  is always the tonic by definition, so saying "Sa" tells the singer
-  nothing they don't already know; what they want to be reminded of
-  is *which key* their Sa is on today. (The fact that this is "D
-  Major" in Western terms doesn't need to surface to a Hindustani
-  user — and shouldn't, per the UI design.)
+  this step vector. The HUD does **not** say "Sa Bilawal" — Sa is always
+  the tonic by definition.
 
 Switch the same setup to Western note system, A=440, "Major in D":
 
-- **Tuning ring:** identical (tuning is the same).
-- **Scale ring:** identical (same step vector, same tonic key).
-- **Label ring:** Western lock = AbsoluteHz, anchored on the A
-  sticker at 440 Hz. C, D, E, F♯, ... sit at their fixed absolute
-  positions. North = C (because `reference_hz=440` puts A at slot 9,
-  so slot 0 = C is at north). D is at the 2-o'clock position.
-- **HUD badge:** "D Major" — "D" because Western users name their
-  tonic by its absolute pitch; "Major" because that's the school's
-  name for this step vector.
+- **Tuning ring, scale ring, needle:** identical. The geometry is
+  tonic-anchored, so D is at north here too. Same step vector, same
+  tonic key, same lit set, same tick angles.
+- **Label ring (deferred):** the only difference. Western paints
+  absolute note-names — "D" at north, then E, F♯, … clockwise — anchored
+  to absolute Hz rather than movable-do. Same dial face, different
+  stickers.
+- **HUD badge:** "D Major" — "D" because Western users name their tonic
+  by its absolute pitch; "Major" because that's the school's name for
+  this step vector.
 
-Note: the **dial geometry and scale-ring mask are identical** between
-the two cases. Only the label ring's rotation differs. That's the
-abstraction paying off.
+Note: the **dial geometry, scale-ring mask, AND tonic-at-north are
+identical** between the two cases — D sits at the top for both. Only the
+label ring's *vocabulary* differs (movable Sargam vs absolute Western).
+That's the abstraction paying off: the Western/Hindustani split is
+entirely a labelling concern, with no effect on geometry.
 
 ## School-of-music namespaces
 
@@ -969,20 +1009,29 @@ In `apps/coach-game/src/state.rs`:
 
 In `apps/coach-game/src/game/dial.rs`:
 
-- `tuning_12tet()`, `tuning_hindustani_just()` — produce `[f32; 12]`
-  slot angles by running each kind's `shape` and folding every slot's Hz
-  through `tuning_view::octave_position(.., C_REF_HZ) × TAU`. No ratio
-  table lives in the dial; the spacing comes from the model. Drive the
-  tuning ring (layer 3).
-- `in_scale_mask(tonality: &Tonality) -> [bool; 12]` — the head-side
-  render projection of `Tonality`, walked from the tonic's within-octave
-  slot (`tonic.offset.round() % 12`) by rounding each width. Tuning-
-  independent; never crosses the port. Drives the scale ring (layer 4).
-- `angle_from_f0(hz)` turns the live `f0` into the continuous needle
-  angle via the same `octave_position` fold.
+- **North = the tonic (Sa).** No frequency is hardcoded; the anchor is
+  the tonic, which is already in the `Tonality`. The dial does only the
+  render step (`× TAU`); all pitch-math lives in `music.rs`.
+- `build_slots(&MusicInfo)` produces the slot angles by folding every
+  slot's real Hz against Sa's Hz via
+  `tuning_view::slot_position_from(t, tonic, i) × TAU`. So Sa sits at
+  north and a non-uniform tuning (Just) keeps its uneven tick spacing.
+  No ratio table lives in the dial. Drives the tuning ring (layer 3).
+- `in_scale_mask(tonality, root, n) -> Vec<bool>` — the head-side render
+  projection of `Tonality`, **slot-indexed** (slot 0 = the tuning root),
+  walked from the tonic's slot index — the gauge-clean delta
+  `(tonic − root).round() % n` — by rounding each width. Tuning-
+  independent; never crosses the port; zips by index with the tick
+  angles. Drives the scale ring (layer 4).
+- `needle_angle(&MusicInfo, f0)` turns the live `f0` into the needle
+  angle by folding it against Sa's Hz
+  (`tuning_view::octave_position(f0, sa_hz) × TAU`) — the same Hz fold
+  the ticks use, so a perfectly-sung note lands exactly on its tick.
 - The dial spawns *empty* and paints its slots from the `MusicInfoRes`
   read model (the coach's `music_info()` snapshot) — so the slots
   reflect the singer's real tuning + tonality, not a hardcoded default.
+  The needle likewise needs the snapshot (no Sa to measure from without
+  it), so no snapshot → no needle.
 
 In `apps/coach-game/src/game/hud.rs`:
 

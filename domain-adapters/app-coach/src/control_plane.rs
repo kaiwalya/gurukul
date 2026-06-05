@@ -479,9 +479,10 @@ pub(crate) fn scales_for(n: Option<u8>) -> Vec<ScaleShape> {
         .collect()
 }
 
-/// The built-in scale shape catalogue — 14 shapes: 13 summing to 12
-/// (the ten Hindustani thaats, two common pentatonics, and Locrian) plus
-/// one summing to 22 (Bilawal on the 22-shruti grid). Shapes are stored
+/// The built-in scale shape catalogue — 15 shapes: 14 summing to 12
+/// (the ten Hindustani thaats, two common pentatonics, Locrian, and the
+/// 12-note chromatic) plus one summing to 22 (Bilawal on the 22-shruti
+/// grid). Shapes are stored
 /// as key-widths; for 12-slot shapes the unit is semitones, for 22-slot
 /// shapes the unit is shrutis. Author-only labels are code comments;
 /// [`ScaleShape`] has no name field — vocabulary is the deferred
@@ -501,6 +502,7 @@ pub(crate) fn scale_catalogue() -> Vec<ScaleShape> {
         ScaleShape::new(&[1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 2.0]), // Locrian
         ScaleShape::new(&[2.0, 2.0, 3.0, 2.0, 3.0]),           // Major pentatonic
         ScaleShape::new(&[3.0, 2.0, 2.0, 3.0, 2.0]),           // Minor pentatonic
+        ScaleShape::new(&[1.0; 12]),                           // Chromatic (all 12 keys lit)
         // Bilawal in shrutis (22-slot grid) — same swaras as 12-TET Bilawal, widths in shruti-counts
         ScaleShape::new(&[3.0, 2.0, 4.0, 4.0, 3.0, 2.0, 4.0]),
     ]
@@ -512,8 +514,8 @@ mod catalogue_tests {
     use domain_ports::music::{harmonium_key, Tonality, Tuning, TuningKind, TuningSpec};
 
     #[test]
-    fn catalogue_has_14_shapes() {
-        assert_eq!(scale_catalogue().len(), 14);
+    fn catalogue_has_15_shapes() {
+        assert_eq!(scale_catalogue().len(), 15);
     }
 
     #[test]
@@ -536,7 +538,7 @@ mod catalogue_tests {
                 count_22 += 1;
             }
         }
-        assert_eq!(count_12, 13, "expected 13 shapes well-formed for N=12");
+        assert_eq!(count_12, 14, "expected 14 shapes well-formed for N=12");
         assert_eq!(count_22, 1, "expected exactly 1 shape well-formed for N=22");
     }
 
@@ -566,12 +568,12 @@ mod catalogue_tests {
     }
 
     #[test]
-    fn scales_for_12_returns_13_shapes() {
+    fn scales_for_12_returns_14_shapes() {
         let shapes = scales_for(Some(12));
         assert_eq!(
             shapes.len(),
-            13,
-            "12-slot tuning must yield 13 catalogue shapes"
+            14,
+            "12-slot tuning must yield 14 catalogue shapes"
         );
         for (i, s) in shapes.iter().enumerate() {
             assert!(s.well_formed(12), "shape {i} must be well-formed for N=12");
@@ -602,7 +604,7 @@ mod catalogue_tests {
         // Verify that the Tuning::n() → scales_for path works end-to-end
         // for both supported octave sizes.
         let t12 = tuning_with_kind(TuningKind::TwelveTet);
-        assert_eq!(scales_for(Some(t12.n() as u8)).len(), 13);
+        assert_eq!(scales_for(Some(t12.n() as u8)).len(), 14);
 
         let t22 = tuning_with_kind(TuningKind::TwentyTwoShruti);
         assert_eq!(scales_for(Some(t22.n() as u8)).len(), 1);

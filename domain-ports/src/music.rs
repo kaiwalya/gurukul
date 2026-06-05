@@ -748,7 +748,7 @@ impl Tuning {
 /// Pure functions — state in, number out; they read a `Tuning`, never
 /// own it.
 pub mod tuning_view {
-    use super::{InstrumentKey, InstrumentKeyInterval, Tuning};
+    use super::{harmonium_key, InstrumentKey, InstrumentKeyInterval, Tuning, TuningSpec};
 
     /// Signed [`InstrumentKeyInterval`] from the tuning's root to `key`. The one
     /// quantity [`hz`] derives from — computing slot and octave from the
@@ -824,11 +824,175 @@ pub mod tuning_view {
         let hi = slot_log2(t, floor as i32 + 1);
         (lo + (hi - lo) * frac).exp2()
     }
+
+    /// **Inverse of [`hz`]:** resolve a frequency to its position on the
+    /// keyboard line — a *continuous* [`InstrumentKey`], **octave
+    /// included, not folded**. A voice sliding between two keys lands at a
+    /// fractional offset (e.g. `13.4`); a high voice resolves to a high
+    /// key, a low voice to a low one. This is what turns a *real measured
+    /// f0* back into "which key is the singer on", register and all —
+    /// nothing is collapsed into a single octave the way
+    /// [`octave_position`] deliberately does.
+    ///
+    /// Works from a [`TuningSpec`] (the flat, head-held type), not a
+    /// [`Tuning`], so the head can run it from its read-model snapshot
+    /// without the opaque coach-side struct. It rebuilds the same one
+    /// octave of `log2` slot positions [`Tuning::new`] would
+    /// (`spec.kind.shape(spec.root_note_hz)`), so it stays correct for
+    /// **non-uniform** tunings (Just): the target log-pitch is bracketed
+    /// between the two slots it falls between and interpolated, the exact
+    /// mirror of [`hz`]'s `lo`/`hi` lerp. The result is added back onto
+    /// `spec.root` — the licensed key↔slot bridge — so it is gauge-clean
+    /// (no branch on an absolute offset).
+    pub fn key_of_hz(spec: &TuningSpec, hz: f32) -> InstrumentKey {
+        if hz <= 0.0 {
+            return spec.root;
+        }
+        let slots_log2: Vec<f32> = spec
+            .kind
+            .shape(spec.root_note_hz)
+            .iter()
+            .map(|h| h.log2())
+            .collect();
+        let n = slots_log2.len();
+        let root_log2 = slots_log2[0]; // == log2(root_note_hz)
+        let target = hz.log2();
+        // Octaves above the root note (may be negative / fractional).
+        let octaves = target - root_log2;
+        let whole_oct = octaves.floor();
+        // Position WITHIN this octave, in [0, 1): which two slots bracket it.
+        let within = octaves - whole_oct; // [0, 1)
+                                          // Per-slot fractional octave positions of each slot, in [0, 1).
+                                          // slots_log2[i] - root_log2 is i's offset in octaves from slot 0.
+        let mut floor_slot = n - 1;
+        let mut frac = 0.0_f32;
+        for i in 0..n {
+            let lo = slots_log2[i] - root_log2; // octave-fraction of slot i, in [0,1)
+            let hi = if i + 1 < n {
+                slots_log2[i + 1] - root_log2
+            } else {
+                1.0 // wrap: next slot is slot 0 one octave up
+            };
+            if within >= lo && within < hi {
+                floor_slot = i;
+                frac = if hi > lo {
+                    (within - lo) / (hi - lo)
+                } else {
+                    0.0
+                };
+                break;
+            }
+        }
+        // Key offset = root + (whole octaves × N) + slot index + interp frac.
+        let key_steps = whole_oct * n as f32 + floor_slot as f32 + frac;
+        spec.root + InstrumentKeyInterval(key_steps)
+    }
+
+    /// [`key_of_hz`] **snapped to the nearest whole key** — the discrete
+    /// pick a tonic or slot wants (Sa should sit on an actual keyboard
+    /// key, not at offset `13.4`). Rounds the continuous offset, so the
+    /// **octave is preserved** while the within-octave position lands on a
+    /// real key. Thin wrapper over [`key_of_hz`] + the licensed
+    /// [`harmonium_key`] gauge door.
+    pub fn nearest_key_of_hz(spec: &TuningSpec, hz: f32) -> InstrumentKey {
+        let k = key_of_hz(spec, hz);
+        harmonium_key(k.offset.round())
+    }
+
+    /// Where tuning **slot `i`** sits within one octave, as a fraction in
+    /// `[0, 1)`, **measured from `ref_key`** (the dial passes the tonic, so
+    /// Sa lands at 0 = north). This is the tuning ring's tick geometry
+    /// (layer 3): the discrete *targets* the continuous needle glides
+    /// between.
+    ///
+    /// Folds **real Hz** — slot `i`'s actual frequency against `ref_key`'s
+    /// — so a non-uniform tuning's uneven spacing survives: in Just
+    /// intonation Pa (slot 7) lands at `log2(3/2) ≈ 0.585`, *not* the even
+    /// `7/12 ≈ 0.583`. That asymmetry is the whole reason the ticks route
+    /// through Hz and not through key counts. The dial's **needle** folds
+    /// the same way (the live `f0` against Sa's Hz via [`octave_position`]),
+    /// so a perfectly-sung Just Pa lands exactly on this tick. Both
+    /// frequencies come from [`hz`], so the Hz never leaves this view; the
+    /// dial only multiplies the result by its full turn.
+    ///
+    /// Slot `i` is the key `root + i` (slot 0 is the tuning root); `ref_key`
+    /// is any key (the song tonic in practice). Re-anchoring is just moving
+    /// `ref_key`: change the tonic and every tick rotates so the new Sa
+    /// returns to 0.
+    pub fn slot_position_from(t: &Tuning, ref_key: InstrumentKey, i: usize) -> f32 {
+        let slot_key = t.root + InstrumentKeyInterval(i as f32);
+        octave_position(hz(t, slot_key), hz(t, ref_key))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- key_of_hz: the Hz→key inverse (octave preserved) -------------
+
+    fn tet_spec() -> TuningSpec {
+        // A=440 in octave 1 (root at key 21), 12-TET — the head's default.
+        TuningSpec {
+            root_note_hz: 440.0,
+            kind: TuningKind::TwelveTet,
+            root: harmonium_key(21.0),
+        }
+    }
+
+    #[test]
+    fn key_of_hz_inverts_hz_for_whole_keys_across_octaves() {
+        // hz(key) then key_of_hz(hz) must recover the same key, octave and
+        // all — for keys above AND below the root, in 12-TET and Just.
+        for kind in [TuningKind::TwelveTet, TuningKind::HindustaniJust] {
+            let spec = TuningSpec {
+                root_note_hz: 440.0,
+                kind,
+                root: harmonium_key(21.0),
+            };
+            let t = Tuning::new(spec);
+            for off in [0.0, 12.0, 21.0, 23.0, 9.0, 33.0, 2.0] {
+                let key = harmonium_key(off);
+                let f = tuning_view::hz(&t, key);
+                let back = tuning_view::key_of_hz(&spec, f);
+                assert!(
+                    (back.offset - off).abs() < 1e-3,
+                    "{kind:?}: key {off} -> {f:.3} Hz -> key {} (want {off})",
+                    back.offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_of_hz_preserves_register_high_vs_low() {
+        // The whole point: a high voice resolves to a high key, a low
+        // voice to a low key — the octave is NOT folded away. 440 Hz is
+        // the root (key 21); 880 is an octave up (33); 220 an octave down (9).
+        let spec = tet_spec();
+        assert!((tuning_view::key_of_hz(&spec, 440.0).offset - 21.0).abs() < 1e-3);
+        assert!((tuning_view::key_of_hz(&spec, 880.0).offset - 33.0).abs() < 1e-3);
+        assert!((tuning_view::key_of_hz(&spec, 220.0).offset - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn key_of_hz_is_continuous_between_keys() {
+        // A pitch a quarter-semitone above key 21 lands at offset ~21.25,
+        // not snapped — the slide survives.
+        let spec = tet_spec();
+        let quarter_up = 440.0 * 2.0_f32.powf(0.25 / 12.0);
+        let k = tuning_view::key_of_hz(&spec, quarter_up);
+        assert!((k.offset - 21.25).abs() < 1e-2, "got {}", k.offset);
+    }
+
+    #[test]
+    fn nearest_key_of_hz_snaps_to_whole_key() {
+        // The same quarter-up pitch snaps back to key 21.
+        let spec = tet_spec();
+        let quarter_up = 440.0 * 2.0_f32.powf(0.25 / 12.0);
+        let k = tuning_view::nearest_key_of_hz(&spec, quarter_up);
+        assert_eq!(k, harmonium_key(21.0));
+    }
 
     // --- Affine algebra: point/vector operators -----------------------
 
@@ -1223,5 +1387,66 @@ mod tests {
         assert!(!short.well_formed(12));
         let over = ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0, 2.0]); // sums to 14
         assert!(!over.well_formed(12));
+    }
+
+    // --- tuning_view::slot_position_from (the tick's Hz fold) ------------
+
+    #[test]
+    fn slot_position_from_puts_ref_key_at_zero() {
+        // Folding a slot against itself as the reference → 0 (north).
+        let t = Tuning::new(tet_spec());
+        // Slot 0 is the tuning root (key 21); ref = key 21 → 0.
+        let p = tuning_view::slot_position_from(&t, harmonium_key(21.0), 0);
+        assert!(p.abs() < 1e-5 || (p - 1.0).abs() < 1e-5, "got {p}");
+    }
+
+    #[test]
+    fn slot_position_from_12tet_is_even() {
+        // 12-TET: slot i, referenced from the tuning root, lands at i/12.
+        let t = Tuning::new(tet_spec());
+        for i in 0..12 {
+            let p = tuning_view::slot_position_from(&t, harmonium_key(21.0), i);
+            let want = i as f32 / 12.0;
+            assert!((p - want).abs() < 1e-5, "slot {i}: got {p}, want {want}");
+        }
+    }
+
+    #[test]
+    fn slot_position_from_rotates_with_ref_key() {
+        // Re-anchor: reference the tonic D (key 14, = root − 7). Every slot
+        // shifts by +7/12 (the tonic-to-root distance) mod 1, and the slot
+        // that IS the tonic (slot 5 of the root-rooted array, key 19? no —
+        // key 14 is root−7 ⇒ slot index (−7) mod 12 = 5) lands at 0.
+        let t = Tuning::new(tet_spec());
+        let tonic = harmonium_key(14.0);
+        // Slot whose key == tonic: root(21) + i ≡ 14 (mod 12) ⇒ i = 5.
+        let p_sa = tuning_view::slot_position_from(&t, tonic, 5);
+        assert!(
+            p_sa.abs() < 1e-5 || (p_sa - 1.0).abs() < 1e-5,
+            "Sa slot: {p_sa}"
+        );
+        // Slot 0 (the tuning root A) now sits 7/12 round from Sa (it's Pa).
+        let p_root = tuning_view::slot_position_from(&t, tonic, 0);
+        assert!((p_root - 7.0 / 12.0).abs() < 1e-5, "root→Pa: {p_root}");
+    }
+
+    #[test]
+    fn slot_position_from_just_keeps_uneven_spacing() {
+        // Hindustani Just: Pa (slot 7) lands at the true 3/2 ratio, NOT the
+        // even 7/12 — proving ticks route through Hz, not key counts.
+        let spec = TuningSpec {
+            root_note_hz: 440.0,
+            kind: TuningKind::HindustaniJust,
+            root: harmonium_key(21.0),
+        };
+        let t = Tuning::new(spec);
+        let pa = tuning_view::slot_position_from(&t, harmonium_key(21.0), 7);
+        let just = (1.5_f32).log2().rem_euclid(1.0);
+        let even = 7.0 / 12.0;
+        assert!((pa - just).abs() < 1e-5, "Just Pa: got {pa}, want {just}");
+        assert!(
+            (pa - even).abs() > 1e-4,
+            "Just Pa must differ from even 7/12"
+        );
     }
 }

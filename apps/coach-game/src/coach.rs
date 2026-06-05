@@ -110,7 +110,23 @@ pub fn drain_events(
             // The musical frame was (re)configured. Pull the fresh
             // snapshot and republish it for the UI to read.
             CoachEvent::SessionConfigured { tuning, tonality } => {
-                info!("session configured: {tuning:?} / {tonality:?}");
+                // Compact one-liner: the `Tonality` Debug dumps all 32 width
+                // slots (mostly 0-terminator padding), so format the active
+                // ones by hand instead.
+                let widths = tonality
+                    .widths()
+                    .iter()
+                    .map(|w| format!("{:.0}", w.0))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                info!(
+                    "session configured: {:?} {:.0}Hz root={:.0} / tonic={:.0} [{}]",
+                    tuning.kind,
+                    tuning.root_note_hz,
+                    tuning.root.offset,
+                    tonality.tonic.offset,
+                    widths,
+                );
                 music.0 = coach.0.music_info();
             }
         }
