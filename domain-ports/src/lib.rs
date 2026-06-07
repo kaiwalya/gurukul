@@ -71,4 +71,7 @@ pub mod audio_devices;
 pub mod clock;
 pub mod engine_inspect;
 pub mod music;
+pub mod pitch;
+pub mod scale;
 pub mod telemetry;
+pub mod tuning;
