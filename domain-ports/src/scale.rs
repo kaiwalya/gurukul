@@ -136,7 +136,7 @@ impl ScaleIntervals {
 /// `ScaleIntervals` carries no `f32`, `TuningRotated`'s rotation is an integer
 /// cursor, and `octave` is an integer floor — so the whole tonic placement is
 /// clicky and integral, never a continuous slide.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scale {
     /// The tooth pattern — which grooves are degrees.
     intervals: ScaleIntervals,

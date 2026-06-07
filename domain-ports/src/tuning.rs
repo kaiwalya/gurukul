@@ -71,6 +71,12 @@ use crate::pitch::{PitchLog2, PitchLog2Interval};
 /// *has* chosen where it meets the helix, so it may name it.)
 pub const ORIGIN: PitchLog2 = PitchLog2(0.0);
 
+/// The cap on a [`TuningIntervals`]' gap array. A fixed cap keeps the whole
+/// tuning chain flat and `Copy` (so it crosses the command boundary directly,
+/// like the old `music.rs` `Tonality`); 32 covers the system's largest tuning
+/// (22-shruti) with room for finer microtonal grids.
+pub const MAX_TUNING_SLOTS: usize = 32;
+
 /// The rigid shape of a tuning: the **gaps between successive lines** on the
 /// cylinder, each a mantissa in `[0, 1)`, carried as a [`PitchLog2Interval`].
 ///
@@ -85,15 +91,34 @@ pub const ORIGIN: PitchLog2 = PitchLog2(0.0);
 /// Just) hold identical `TuningIntervals` no matter what their reference pitch
 /// is — that difference lives entirely in the `Tuning` rotation, not here.
 ///
-/// The length is the tuning's slot count `N` (12 for 12-TET and Just, more for
-/// microtonal systems), so it is a `Vec`, not a fixed array.
-#[derive(Debug, Clone, PartialEq)]
+/// **Flat and `Copy`.** Storage is a fixed `[PitchLog2Interval; MAX_TUNING_SLOTS]`
+/// with an explicit `len`, not a `Vec` — the slot count `N` (12 for 12-TET and
+/// Just, 22 for shruti) is the `len`, and slots `[len..]` are padding. This is
+/// what lets the whole tuning chain (`TuningAbsolute`, `TuningRotated`, and the
+/// `Scale` above) be `Copy` and cross the command boundary without a heap
+/// allocation.
+///
+/// **Padding is `0.0`, not NaN.** A zero gap is inert in the two operations
+/// that matter: it adds nothing to the sum-to-1 check ([`well_formed`]), and it
+/// compares equal under the derived `PartialEq` (NaN would poison both — a
+/// forgotten `[..len]` would silently sum to NaN and every equality would go
+/// false). So a stray read of the padding is finite-and-wrong, never silently
+/// catastrophic. `len` is the real terminator; `0.0` is not overloaded as one
+/// (unlike a scale's 0-terminated widths, a tuning gap genuinely *could* be a
+/// small value, so the length is explicit).
+///
+/// [`well_formed`]: TuningIntervals::well_formed
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TuningIntervals {
-    /// The gap from each line to the next (prev-relative), in slot order, every
-    /// entry a mantissa in `[0, 1)`. Sums to 1 (one octave). Mantissas by
-    /// construction — [`new`](TuningIntervals::new) folds every input through
+    /// The gap from each line to the next (prev-relative), in slot order, the
+    /// first `len` entries each a mantissa in `[0, 1)` and the rest `0.0`
+    /// padding. The valid gaps sum to 1 (one octave). Mantissas by construction
+    /// — [`new`](TuningIntervals::new) folds every input through
     /// [`fract`](PitchLog2Interval::fract).
-    rotations: Vec<PitchLog2Interval>,
+    rotations: [PitchLog2Interval; MAX_TUNING_SLOTS],
+    /// The slot count `N` — how many of `rotations` are valid gaps. Slots
+    /// `[len..]` are `0.0` padding.
+    len: usize,
 }
 
 impl TuningIntervals {
@@ -101,32 +126,52 @@ impl TuningIntervals {
     /// so the stored values are gaps by construction. Does **not** check the
     /// sum-to-1 well-formedness — that is [`well_formed`](TuningIntervals::well_formed),
     /// run at the join where it matters.
+    ///
+    /// Debug-panics if more than [`MAX_TUNING_SLOTS`] gaps are supplied (a
+    /// programming error: no real tuning exceeds the cap). Excess gaps past the
+    /// cap are dropped in release.
     pub fn new(rotations: impl IntoIterator<Item = PitchLog2Interval>) -> TuningIntervals {
-        TuningIntervals {
-            rotations: rotations
-                .into_iter()
-                .map(PitchLog2Interval::fract)
-                .collect(),
+        let mut buf = [PitchLog2Interval(0.0); MAX_TUNING_SLOTS];
+        let mut len = 0;
+        for gap in rotations {
+            debug_assert!(
+                len < MAX_TUNING_SLOTS,
+                "tuning has more than {MAX_TUNING_SLOTS} slots"
+            );
+            if len >= MAX_TUNING_SLOTS {
+                break;
+            }
+            buf[len] = gap.fract();
+            len += 1;
         }
+        TuningIntervals {
+            rotations: buf,
+            len,
+        }
+    }
+
+    /// The valid gaps — the first `len`, excluding the `0.0` padding.
+    fn gaps(&self) -> &[PitchLog2Interval] {
+        &self.rotations[..self.len]
     }
 
     /// Whether the gaps sum to one octave (within `eps`). Gaps are irrational
     /// `f32`s (`log2` of ratios), so this needs a tolerance — unlike an exact
     /// integer check. A shape that fails this does not close the octave.
     pub fn well_formed(&self, eps: f32) -> bool {
-        let sum: f32 = self.rotations.iter().map(|g| g.0).sum();
+        let sum: f32 = self.gaps().iter().map(|g| g.0).sum();
         (sum - 1.0).abs() <= eps
     }
 
     /// The number of lines, `N`.
     pub fn len(&self) -> usize {
-        self.rotations.len()
+        self.len
     }
 
     /// Whether there are no lines. (Present so `len` reads as a real length;
     /// an empty tuning is not meaningful, but the type does not forbid it.)
     pub fn is_empty(&self) -> bool {
-        self.rotations.is_empty()
+        self.len == 0
     }
 }
 
@@ -135,7 +180,7 @@ impl TuningIntervals {
 /// any rotation returns the bit-identical `f32`. Module-private: it is the
 /// re-basing primitive a [`TuningRotated`] reads through, not public surface.
 fn gap_at(shape: &TuningIntervals, i: usize) -> PitchLog2Interval {
-    shape.rotations[i % shape.rotations.len()]
+    shape.rotations[i % shape.len]
 }
 
 /// The angle from line 0 to line `i`: the sum of the first `i` gaps, **re-summed
@@ -224,7 +269,10 @@ pub trait Tuning {
 /// The owned, authored cylinder: a rigid [`TuningIntervals`] shape plus the one
 /// global rotation, read from line 0. The root of all readings — a
 /// [`TuningRotated`] is just this re-based by an integer cursor.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Flat and `Copy` (its [`TuningIntervals`] is a fixed array), so it crosses the
+/// command boundary directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TuningAbsolute {
     /// The rigid shape — the line-angles, reference-independent.
     intervals: TuningIntervals,
@@ -280,7 +328,7 @@ impl TuningAbsolute {
 
 impl Tuning for TuningAbsolute {
     fn intervals(&self) -> TuningIntervals {
-        self.intervals.clone()
+        self.intervals
     }
 
     fn rotation(&self) -> PitchLog2Interval {
@@ -288,28 +336,31 @@ impl Tuning for TuningAbsolute {
     }
 
     fn shift_up(&self, k: usize) -> TuningRotated {
-        TuningRotated::new(self.clone(), k)
+        TuningRotated::new(*self, k)
     }
 
     fn shift_down(&self, k: usize) -> TuningRotated {
         let n = self.intervals.len();
-        TuningRotated::new(self.clone(), n - k % n)
+        TuningRotated::new(*self, n - k % n)
     }
 }
 
 /// A re-based reading of a [`TuningAbsolute`]: the same authored cylinder, but
 /// with line `start` taken as the root. Owns its [`TuningAbsolute`] (a shift
-/// clones it — the gap `Vec` is tiny and shifts are rare configuration events,
-/// not a hot path) so the view is a self-contained value, free of lifetimes.
+/// copies it — the cylinder is a flat `Copy` value of a few hundred bytes, and
+/// shifts are rare configuration events, not a hot path) so the view is a
+/// self-contained value, free of lifetimes.
 ///
 /// The whole state is one integer cursor. Both the re-based shape and the
 /// re-based rotation are derived from the immutable gaps on each read, so any
 /// number of shifts lands on the same answer as one combined shift with no
 /// floating-point drift.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Flat and `Copy`, so it crosses the command boundary directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TuningRotated {
     /// The authored cylinder, owned. Never mutated; a shift produces a new
-    /// `TuningRotated` over a clone.
+    /// `TuningRotated` over a copy.
     tuning: TuningAbsolute,
     /// Which line of [`tuning`](TuningRotated::tuning) is this view's root,
     /// in `[0, N)`. Folded `mod N` at construction, so `start` and `start + N`
@@ -354,12 +405,12 @@ impl Tuning for TuningRotated {
     fn shift_up(&self, k: usize) -> TuningRotated {
         // Re-base the *authored* cylinder, not self — keeps the cursor a single
         // integer add against the original, never a chain of views.
-        TuningRotated::new(self.tuning.clone(), self.start + k)
+        TuningRotated::new(self.tuning, self.start + k)
     }
 
     fn shift_down(&self, k: usize) -> TuningRotated {
         let n = self.tuning.intervals.len();
-        TuningRotated::new(self.tuning.clone(), self.start + (n - k % n))
+        TuningRotated::new(self.tuning, self.start + (n - k % n))
     }
 }
 
@@ -379,7 +430,7 @@ mod tests {
 
         assert_eq!(t.len(), 12);
         assert!(t.intervals.well_formed(1e-5));
-        for g in &t.intervals.rotations {
+        for g in t.intervals.gaps() {
             assert!((g.0 - 1.0 / 12.0).abs() < 1e-5, "gap {} != 1/12", g.0);
         }
     }
@@ -463,7 +514,7 @@ mod tests {
     }
 
     fn gaps(t: &impl Tuning) -> Vec<f32> {
-        t.intervals().rotations.iter().map(|g| g.0).collect()
+        t.intervals().gaps().iter().map(|g| g.0).collect()
     }
 
     /// The keystone: `shift_up(1)` thrice equals `shift_up(3)` equals the
