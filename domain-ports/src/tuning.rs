@@ -293,10 +293,11 @@ impl TuningAbsolute {
         }
     }
 
-    /// Build from the absolute Hz of each line, **root first**, plus the Hz of
-    /// the line that closes the octave (the root, one floor up) so the final
-    /// gap can be measured. The root's own angle on the cylinder becomes the
-    /// global rotation; the shape is the gaps between successive lines.
+    /// Build from the absolute Hz of the `N` lines, **root first**. The octave
+    /// is implicit: a tuning closes at twice its root, so the closing line need
+    /// not be passed — it is synthesized as the root one floor up. The root's
+    /// own angle on the cylinder becomes the global rotation; the shape is the
+    /// gaps between successive lines.
     ///
     /// **Floating-point discipline.** Each line's angle is measured *once*,
     /// directly from the root (`log2(f[i]) − log2(f[0])`) — never chained
@@ -305,11 +306,14 @@ impl TuningAbsolute {
     /// angle[i]`), **not** re-`fract`ed per gap: fracting each gap would let a
     /// hair-negative step wrap to ≈1.0 and would break the sum. Because the
     /// gaps are successive differences of one angle sequence, their sum
-    /// *telescopes* to `angle[last] − angle[0]`, landing on one octave to
-    /// machine precision — which is what makes
+    /// *telescopes* to `angle[last] − angle[0]`. The closing angle is the exact
+    /// constant `1.0` octave (the root doubled), so the gaps sum to **exactly**
+    /// one octave — even tighter than reading a passed-in `2×root` frequency,
+    /// which would round — which is what makes
     /// [`well_formed`](TuningIntervals::well_formed) pass with a tight `eps`.
     ///
-    /// Pass `n + 1` frequencies for `n` lines (the last closes the octave).
+    /// Pass exactly the `n` line frequencies; the octave that closes them is
+    /// added for you.
     pub fn from_frequencies(hz: impl IntoIterator<Item = f32>) -> TuningAbsolute {
         let pitches: Vec<PitchLog2> = hz.into_iter().map(PitchLog2::from_hz).collect();
         let Some(&root) = pitches.first() else {
@@ -318,9 +322,11 @@ impl TuningAbsolute {
                 PitchLog2Interval(0.0),
             );
         };
-        // Each line's angle, measured once from the root — no chaining.
-        let angles: Vec<PitchLog2Interval> = pitches.iter().map(|&p| p - root).collect();
-        // Gaps are differences of those angles; the sum telescopes exactly.
+        // Each line's angle, measured once from the root — no chaining — then
+        // the synthetic closing angle: the root one octave up, exactly +1.0.
+        let mut angles: Vec<PitchLog2Interval> = pitches.iter().map(|&p| p - root).collect();
+        angles.push(PitchLog2Interval::octaves(1));
+        // Gaps are differences of those angles; the sum telescopes to exactly 1.
         let gaps = angles.windows(2).map(|w| w[1] - w[0]);
         TuningAbsolute::new(TuningIntervals::new(gaps), (root - ORIGIN).fract())
     }
@@ -342,6 +348,142 @@ impl Tuning for TuningAbsolute {
     fn shift_down(&self, k: usize) -> TuningRotated {
         let n = self.intervals.len();
         TuningRotated::new(*self, n - k % n)
+    }
+}
+
+/// A named tuning *system* — the rule for spacing the lines, independent of any
+/// reference pitch. This is the **shape selector**: picking a `TuningKind`
+/// chooses the gaps ([`intervals`](TuningKind::intervals)); a *separate*
+/// reference-frequency choice supplies the rotation, and the two compose into a
+/// placed [`TuningAbsolute`] (see [`intervals`](TuningKind::intervals)).
+///
+/// `Copy` and flat: a `TuningKind` is the user-pickable tag the settings UI
+/// stores and matches on, and it crosses the command boundary by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuningKind {
+    /// 12-tone equal temperament. `N = 12`, each line `×2^(1/12)` from the last
+    /// — every gap `1/12` of an octave. Rotationally symmetric: the shape reads
+    /// the same from any line, so a scale drops in at any of the 12 rotations
+    /// identically.
+    TwelveTet,
+    /// Hindustani Just intonation. `N = 12`, 5-limit ratios fanning from the
+    /// root. **Not** symmetric — the gaps are uneven, so which line is the root
+    /// (the rotation) is musically load-bearing, and a scale realizes different
+    /// intervals at different rotations (Sa→Re is 9/8 from one line, 10/9 from
+    /// another).
+    HindustaniJust,
+    /// Bharata's 22-shruti just-intonation grid. `N = 22`, the Shadja-grama
+    /// ratios: line 0 = root (1/1), lines 1–21 fan upward to just below the
+    /// octave (the 2/1 closes the next Sa, one floor up — implicit, as for the
+    /// 12-line kinds).
+    ///
+    /// **Orthogonality.** This is the *intonation grid*, independent of which
+    /// lines any particular scale selects. A 7-note raga on this grid is a
+    /// [`ScaleIntervals`](crate::scale::ScaleIntervals) mask over the 22 lines
+    /// (Bilawal's widths in shruti-counts sum to 22). The finer grid is the
+    /// point: it lets each swara be intoned a shruti higher or lower (meend
+    /// microtonal freedom) in a way a 12-equal grid cannot represent.
+    TwentyTwoShruti,
+}
+
+impl TuningKind {
+    /// The line ratios over the root (Sa = 1/1), in line order. Length `N`; the
+    /// closing 2/1 is **not** included — it is implicit (one octave up), exactly
+    /// what [`intervals`](TuningKind::intervals) hands to
+    /// [`TuningAbsolute::from_frequencies`], which closes the octave itself.
+    ///
+    /// Reference-free musical data: these ratios *are* the tuning system. With a
+    /// unit root they double as frequencies (`1.0 × ratio = ratio`), which is
+    /// how [`intervals`](TuningKind::intervals) reuses `from_frequencies`.
+    pub fn ratios(self) -> Vec<f32> {
+        match self {
+            TuningKind::TwelveTet => (0..12).map(|i| 2f32.powf(i as f32 / 12.0)).collect(),
+            TuningKind::HindustaniJust => {
+                // 5-limit ratios, Sa at 1/1, komal Ni at 9/5 (the Hindustani
+                // convention). Line order matches the dial's: Sa, komal Re, Re,
+                // komal Ga, Ga, Ma, tivra Ma, Pa, komal Dha, Dha, komal Ni, Ni.
+                const RATIOS: [(f32, f32); 12] = [
+                    (1.0, 1.0),
+                    (16.0, 15.0),
+                    (9.0, 8.0),
+                    (6.0, 5.0),
+                    (5.0, 4.0),
+                    (4.0, 3.0),
+                    (45.0, 32.0),
+                    (3.0, 2.0),
+                    (8.0, 5.0),
+                    (5.0, 3.0),
+                    (9.0, 5.0),
+                    (15.0, 8.0),
+                ];
+                RATIOS.iter().map(|(n, d)| n / d).collect()
+            }
+            TuningKind::TwentyTwoShruti => {
+                // Bharata's 22-shruti Shadja-grama ratios, ascending from Sa
+                // (1/1) at line 0 to just below the octave. The 2/1 closes the
+                // next Sa and is implicit, as for the 12-line kinds.
+                //
+                // Line ordering (shruti names per Bharata):
+                //   0  Sa      1/1        8  antara Ga   81/64
+                //   1  tivra   256/243    9  Ma          4/3
+                //   2  kumud   16/15      10 ekasruti    27/20
+                //   3  manda   10/9       11 tivra Ma    45/32
+                //   4  chanda  9/8        12 tivra Ma+   729/512
+                //   5  dayavati 32/27     13 Pa           3/2
+                //   6  ranjani  6/5       14 hrsvati     128/81
+                //   7  ratika   5/4       15 komal Dha    8/5
+                //                         16 Dha          5/3
+                //                         17 shodasruti  27/16
+                //                         18 alapa       16/9
+                //                         19 komal Ni     9/5
+                //                         20 karuna      15/8
+                //                         21 tivra Ni   243/128
+                const RATIOS: [(f32, f32); 22] = [
+                    (1.0, 1.0),
+                    (256.0, 243.0),
+                    (16.0, 15.0),
+                    (10.0, 9.0),
+                    (9.0, 8.0),
+                    (32.0, 27.0),
+                    (6.0, 5.0),
+                    (5.0, 4.0),
+                    (81.0, 64.0),
+                    (4.0, 3.0),
+                    (27.0, 20.0),
+                    (45.0, 32.0),
+                    (729.0, 512.0),
+                    (3.0, 2.0),
+                    (128.0, 81.0),
+                    (8.0, 5.0),
+                    (5.0, 3.0),
+                    (27.0, 16.0),
+                    (16.0, 9.0),
+                    (9.0, 5.0),
+                    (15.0, 8.0),
+                    (243.0, 128.0),
+                ];
+                RATIOS.iter().map(|(n, d)| n / d).collect()
+            }
+        }
+    }
+
+    /// The reference-free shape of this system: the gaps between successive
+    /// lines, as a [`TuningIntervals`]. This is the **shape selector's** output
+    /// — no reference pitch in it, only the spacing.
+    ///
+    /// Computed by handing the unit-root [`ratios`](TuningKind::ratios) to
+    /// [`TuningAbsolute::from_frequencies`] (ratios *are* frequencies at root 1
+    /// Hz) and keeping only its shape. The rotation that constructor derives is
+    /// the trivial `fract(log2(1)) = 0` and is discarded here; the *real*
+    /// rotation comes from the reference-frequency selector, composed downstream:
+    ///
+    /// ```ignore
+    /// let intervals = kind.intervals();
+    /// let rotation  = (PitchLog2::from_hz(ref_hz) - ORIGIN).fract();
+    /// let tuning    = TuningAbsolute::new(intervals, rotation);
+    /// ```
+    pub fn intervals(self) -> TuningIntervals {
+        TuningAbsolute::from_frequencies(self.ratios()).intervals()
     }
 }
 
@@ -418,12 +560,59 @@ impl Tuning for TuningRotated {
 mod tests {
     use super::*;
 
+    // ── TuningKind: named systems → shape ────────────────────────────────
+
+    /// Each kind yields the right line count and a well-formed (octave-closing)
+    /// shape straight from its named ratios.
+    #[test]
+    fn tuning_kinds_have_the_right_count_and_close_the_octave() {
+        assert_eq!(TuningKind::TwelveTet.intervals().len(), 12);
+        assert_eq!(TuningKind::HindustaniJust.intervals().len(), 12);
+        assert_eq!(TuningKind::TwentyTwoShruti.intervals().len(), 22);
+        for kind in [
+            TuningKind::TwelveTet,
+            TuningKind::HindustaniJust,
+            TuningKind::TwentyTwoShruti,
+        ] {
+            assert!(
+                kind.intervals().well_formed(1e-5),
+                "{kind:?} shape must close the octave"
+            );
+        }
+    }
+
+    /// 12-TET's shape is even — every gap is exactly 1/12 — while Just's is not,
+    /// which is the whole reason the rotation is load-bearing for Just.
+    #[test]
+    fn twelve_tet_is_even_just_is_not() {
+        let tet = TuningKind::TwelveTet.intervals();
+        for g in tet.gaps() {
+            assert!((g.0 - 1.0 / 12.0).abs() < 1e-5, "12-TET gap {} != 1/12", g.0);
+        }
+        let just = TuningKind::HindustaniJust.intervals();
+        let uneven = just.gaps().iter().any(|g| (g.0 - 1.0 / 12.0).abs() > 1e-3);
+        assert!(uneven, "Just intonation must have uneven gaps");
+    }
+
+    /// The shape carries no reference: the kind's `intervals()` is built at a
+    /// unit root, so its rotation washes out to zero — only the downstream
+    /// reference-frequency choice rotates the bundle.
+    #[test]
+    fn kind_intervals_are_reference_free() {
+        // Composing with a real reference Hz rotates without touching the shape.
+        let intervals = TuningKind::HindustaniJust.intervals();
+        let rotation = (PitchLog2::from_hz(440.0) - ORIGIN).fract();
+        let placed = TuningAbsolute::new(intervals, rotation);
+        assert_eq!(placed.intervals(), intervals, "reference must not move shape");
+        assert_eq!(placed.rotation(), rotation);
+    }
+
     /// 12-TET from frequencies: gaps are all equal (1/12) and sum to 1.
     #[test]
     fn twelve_tet_gaps_are_even_and_close_the_octave() {
-        // 13 frequencies = 12 lines + the closing octave (root doubled).
+        // Exactly 12 line frequencies; from_frequencies closes the octave.
         let base = 261.6256_f32; // C4, arbitrary root
-        let hz: Vec<f32> = (0..=12)
+        let hz: Vec<f32> = (0..12)
             .map(|i| base * 2f32.powf(i as f32 / 12.0))
             .collect();
         let t = TuningAbsolute::from_frequencies(hz);
@@ -439,7 +628,7 @@ mod tests {
     /// the true ratios, and the whole shape closes the octave.
     #[test]
     fn just_gaps_sum_to_one_octave() {
-        // 5-limit ratios from the root, then the closing 2/1.
+        // The 12 5-limit ratios from the root; the closing 2/1 is implicit.
         let root = 440.0_f32;
         let ratios = [
             1.0,
@@ -454,7 +643,6 @@ mod tests {
             5.0 / 3.0,
             9.0 / 5.0,
             15.0 / 8.0,
-            2.0,
         ];
         let hz: Vec<f32> = ratios.iter().map(|r| root * r).collect();
         let t = TuningAbsolute::from_frequencies(hz);
@@ -477,7 +665,6 @@ mod tests {
             3.0 / 2.0,
             5.0 / 3.0,
             15.0 / 8.0,
-            2.0,
         ];
         let hz440: Vec<f32> = ratios.iter().map(|r| 440.0 * r).collect();
         let hz441: Vec<f32> = ratios.iter().map(|r| 441.0 * r).collect();
