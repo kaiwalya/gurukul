@@ -1,5 +1,5 @@
 //! InGame scale picker: an overlay that opens when the HUD badge is
-//! clicked, listing one row per [`ScaleShape`] in [`KnownScales`].
+//! clicked, listing one row per [`ScaleIntervals`] in [`KnownScales`].
 //!
 //! # Flow
 //!
@@ -8,12 +8,12 @@
 //!    [`KnownScales`] via the CQRS round-trip) and sets
 //!    [`ShowingScalePicker`] to `true`.
 //! 3. [`sync_picker`] detects the flag flip and spawns the overlay,
-//!    listing one clickable row per shape with the interval widths as
-//!    the label (e.g. `"2 2 1 2 2 2 1"`). A "Close" button closes
-//!    without selecting.
-//! 4. [`handle_row_click`] reads the selected shape, builds a new
-//!    [`Tonality`] from the current tonic + the selected shape's
-//!    widths, writes it to [`SongTonality`], sends
+//!    listing one clickable row per shape with the tooth-widths as the
+//!    label (e.g. `"2 2 1 2 2 2 1"`). A "Close" button closes without
+//!    selecting.
+//! 4. [`handle_row_click`] reads the selected mask, rebuilds the
+//!    [`Scale`] keeping the current Sa rotation + register but swapping
+//!    the tooth pattern, writes it to [`SongTonality`], sends
 //!    `Command::ConfigureSession`, and closes the overlay.
 //! 5. The overlay rows also repaint when [`KnownScales`] changes (the
 //!    `ListScales` reply lands asynchronously). [`sync_rows`] detects
@@ -24,11 +24,12 @@
 //! pause. `ConfigureSession` is decoupled from the audio lifecycle.
 
 use crate::coach::Coach;
-use crate::state::{AppSettings, AppState, KnownScales, SongTonality};
+use crate::state::{AppState, KnownScales, SongTonality};
 use crate::ui::*;
 use bevy::prelude::*;
 use domain_ports::app_coach::Command;
-use domain_ports::music::{ScaleShape, Tonality};
+use domain_ports::scale::{Scale, ScaleIntervals};
+use domain_ports::tuning::Tuning;
 
 /// True while the scale picker overlay is on screen. Flipped by
 /// [`handle_hud_click`] (open) and by row / close clicks (close).
@@ -46,7 +47,7 @@ pub struct ScalePickerRows;
 
 /// Marker on each clickable scale-shape row. Stores the shape index
 /// into [`KnownScales`] so the click handler can look it up without
-/// storing a [`ScaleShape`] in the component (the component just needs
+/// storing a [`ScaleIntervals`] in the component (the component just needs
 /// to be small and `Copy`).
 #[derive(Component)]
 pub struct ScaleRow(pub usize);
@@ -79,6 +80,7 @@ pub fn sync_picker(
     showing: Res<ShowingScalePicker>,
     existing: Query<Entity, With<ScalePickerRoot>>,
     scales: Res<KnownScales>,
+    tonality: Res<SongTonality>,
 ) {
     if !showing.is_changed() {
         return;
@@ -90,7 +92,7 @@ pub fn sync_picker(
     if !showing.0 {
         return;
     }
-    spawn_picker(&mut commands, &scales.0);
+    spawn_picker(&mut commands, &scales.0, tonality.0.tuning().len() as u32);
 }
 
 /// Repopulate the row list when [`KnownScales`] changes while the
@@ -101,6 +103,7 @@ pub fn sync_rows(
     mut commands: Commands,
     showing: Res<ShowingScalePicker>,
     scales: Res<KnownScales>,
+    tonality: Res<SongTonality>,
     rows_q: Query<Entity, With<ScalePickerRows>>,
 ) {
     if !showing.0 || !scales.is_changed() {
@@ -109,23 +112,23 @@ pub fn sync_rows(
     let Ok(rows_entity) = rows_q.single() else {
         return;
     };
+    let n = tonality.0.tuning().len() as u32;
     // Clear existing row children and repopulate from the fresh catalogue.
     commands.entity(rows_entity).despawn_related::<Children>();
     for (i, shape) in scales.0.iter().enumerate() {
-        let label = shape_label(shape);
+        let label = shape_label(*shape, n);
         commands
             .entity(rows_entity)
             .with_child(picker_row(&label, ScaleRow(i)));
     }
 }
 
-/// On a scale row click: build the new `Tonality` (preserve current
-/// tonic, swap the shape), write it to `SongTonality`, send
-/// `ConfigureSession`, and close the overlay.
+/// On a scale row click: rebuild the `Scale` keeping the current Sa
+/// rotation + register but swapping the tooth pattern, write it to
+/// `SongTonality`, send `ConfigureSession`, and close the overlay.
 pub fn handle_row_click(
     q: Query<(&Interaction, &ScaleRow), Changed<Interaction>>,
     scales: Res<KnownScales>,
-    settings: Res<AppSettings>,
     mut tonality: ResMut<SongTonality>,
     mut showing: ResMut<ShowingScalePicker>,
     coach: NonSend<Coach>,
@@ -134,18 +137,17 @@ pub fn handle_row_click(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some(shape) = scales.0.get(*idx) else {
+        let Some(&intervals) = scales.0.get(*idx) else {
             continue;
         };
-        // Preserve the current tonic; only the shape changes.
-        let current_tonic = tonality.0.tonic;
-        let widths_f32: Vec<f32> = shape.widths().iter().map(|w| w.0).collect();
-        let new_tonality = Tonality::new(current_tonic, &widths_f32);
-        tonality.0 = new_tonality;
-        coach.0.send_command(Command::ConfigureSession {
-            tuning: settings.tuning_spec(),
-            tonality: new_tonality,
-        });
+        // Preserve the current Sa (rotated tuning) and register; only the
+        // tooth pattern changes.
+        let current = tonality.0;
+        let new_scale = Scale::new(intervals, *current.tuning(), current.octave());
+        tonality.0 = new_scale;
+        coach
+            .0
+            .send_command(Command::ConfigureSession { scale: new_scale });
         showing.0 = false;
         return; // one selection per frame
     }
@@ -165,21 +167,24 @@ pub fn handle_close_click(
 
 // ----- helpers -------------------------------------------------------
 
-/// Build the width label for a shape: interval widths joined by spaces,
-/// e.g. `"2 2 1 2 2 2 1"`. Each width is rendered as `{:.0}` since
-/// widths are whole numbers by invariant.
-fn shape_label(shape: &ScaleShape) -> String {
+/// Build the label for a shape: its tooth-widths against the tuning's slot
+/// count `n`, joined by spaces, e.g. `"2 2 1 2 2 2 1"` for Bilawal — the
+/// same vocabulary the HUD's int row shows. `n` comes from the active
+/// tuning (all catalogue rows are on its grid, since `scales_for` filtered
+/// by `n`), needed for the closing tooth back to Sa.
+fn shape_label(shape: ScaleIntervals, n: u32) -> String {
     shape
-        .widths()
+        .widths(n)
         .iter()
-        .map(|w| format!("{:.0}", w.0))
+        .map(|w| w.to_string())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
 /// Spawn the overlay tree. The shape rows are placed in a scrollable
-/// child so long catalogues don't overflow the screen.
-fn spawn_picker(commands: &mut Commands, shapes: &[ScaleShape]) {
+/// child so long catalogues don't overflow the screen. `n` is the active
+/// tuning's slot count, used to render each row's tooth-widths.
+fn spawn_picker(commands: &mut Commands, shapes: &[ScaleIntervals], n: u32) {
     let root = commands
         .spawn((
             ScalePickerRoot,
@@ -228,7 +233,7 @@ fn spawn_picker(commands: &mut Commands, shapes: &[ScaleShape]) {
     commands.entity(root).add_child(rows);
 
     for (i, shape) in shapes.iter().enumerate() {
-        let label = shape_label(shape);
+        let label = shape_label(*shape, n);
         commands
             .entity(rows)
             .with_child(picker_row(&label, ScaleRow(i)));

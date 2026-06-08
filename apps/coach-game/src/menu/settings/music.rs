@@ -22,7 +22,7 @@ use super::{spawn_choice_row, SettingsTab, TabContent};
 use crate::state::AppSettings;
 use crate::ui::*;
 use bevy::prelude::*;
-use domain_ports::music::TuningKind;
+use domain_ports::tuning::TuningKind;
 
 /// Which setting's picker the detail pane is currently showing. Pure
 /// UI state, local to the Music tab. Resets to the first row on every

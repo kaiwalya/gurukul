@@ -31,7 +31,8 @@
 //! [`tuning.rs`](super::tuning); the scale layer is purely the integer
 //! selection on top.
 
-use crate::tuning::TuningRotated;
+use crate::pitch::{PitchLog2, PitchLog2Interval};
+use crate::tuning::{Tuning, TuningRotated, ORIGIN};
 
 /// The tooth pattern: which of a tuning's grooves are scale degrees, as a
 /// `u32` bitmask. **Bit 0 is Sa** (the tonic groove, always set); bit `i` set
@@ -118,6 +119,40 @@ impl ScaleIntervals {
         }
         widths
     }
+
+    /// The tuning slots that are degrees, in ascending order: the set-bit
+    /// positions of the mask. Bilawal on 12-TET is `[0, 2, 4, 5, 7, 9, 11]`.
+    /// This is the Sa-relative semitone (more precisely, *ordinal slot*) of
+    /// each degree — the "deg" reading a math view shows, independent of where
+    /// Sa sits on the helix.
+    pub fn degree_slots(self) -> Vec<u32> {
+        (0..u32::BITS)
+            .filter(|&i| self.mask & (1 << i) != 0)
+            .collect()
+    }
+
+    /// The tuning **slot** the `degree`-th tooth lands in: the index of the
+    /// `degree`-th set bit, counting from Sa = degree 0 at bit 0. Bilawal's
+    /// degree 3 (Ma) is slot 5 on 12-TET — the fourth set bit of
+    /// `{0, 2, 4, 5, …}`. This is the ordinal scale degree → ordinal tuning slot
+    /// map, the bridge from the tooth count to the groove index
+    /// [`TuningIntervals::cumulative_rotation_to`] reads.
+    ///
+    /// Degrees past the last fold by octave: `degree == note_count()` returns
+    /// slot `N` (Sa one octave up), `note_count() + 1` the next degree a floor
+    /// higher, and so on — the same carry-the-octave behavior as the layers
+    /// below, so a scale degree may climb without bound.
+    ///
+    /// [`TuningIntervals::cumulative_rotation_to`]: crate::tuning::TuningIntervals::cumulative_rotation_to
+    pub fn slot_of_degree(self, degree: usize, n: u32) -> u32 {
+        let count = self.note_count();
+        let (octaves, rem) = (degree / count, degree % count);
+        let in_octave = (0..n)
+            .filter(|&i| self.mask & (1 << i) != 0)
+            .nth(rem)
+            .expect("rem < note_count so the rem-th set bit exists within N");
+        in_octave + octaves as u32 * n
+    }
 }
 
 /// A scale placed on a concrete tuning at a concrete register: the tooth pattern
@@ -171,6 +206,37 @@ impl Scale {
     pub fn octave(&self) -> i32 {
         self.octave
     }
+
+    /// The concrete pitch of scale degree `i` (Sa = 0, Re = 1, …), resolved
+    /// onto the helix. The degree picks a tuning slot
+    /// ([`ScaleIntervals::slot_of_degree`]), the slot picks a cumulative
+    /// rotation up from the root ([`TuningIntervals::cumulative_rotation_to`]),
+    /// and that angle is added to **Sa**.
+    ///
+    /// `pitch_at(0)` *is* Sa, the tonic: degree 0 maps to slot 0, whose
+    /// cumulative rotation is zero, so it reduces to Sa itself — both motions
+    /// of the tonic resolved onto the helix (`ORIGIN + rotation + octave`, the
+    /// single point that re-attaches the octave the tuning layer drops). Every
+    /// other degree is a cumulative rotation up from there.
+    ///
+    /// Octave-carrying: degrees at or past the note count climb floors (degree
+    /// `n` is Sa one octave up), because both the slot map and the cumulative
+    /// rotation carry octaves rather than wrapping. So this resolves any degree,
+    /// not only the ones in the base octave.
+    ///
+    /// [`ScaleIntervals::slot_of_degree`]: ScaleIntervals::slot_of_degree
+    /// [`TuningIntervals::cumulative_rotation_to`]: crate::tuning::TuningIntervals::cumulative_rotation_to
+    /// [`ORIGIN`]: crate::tuning::ORIGIN
+    pub fn pitch_at(&self, i: usize) -> PitchLog2 {
+        let n = self.tuning.len() as u32;
+        let slot = self.intervals.slot_of_degree(i, n);
+        let angle = self
+            .tuning
+            .intervals()
+            .cumulative_rotation_to(slot as usize);
+        let sa = ORIGIN + self.tuning.rotation() + PitchLog2Interval::octaves(self.octave);
+        sa + angle
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +269,58 @@ mod tests {
         let iv = ScaleIntervals::from_widths(&[2, 2, 3, 2, 3]);
         assert_eq!(iv.note_count(), 5);
         assert_eq!(iv.widths(12).iter().sum::<u32>(), 12);
+    }
+
+    /// Each degree maps to the slot of its set bit, and degrees past the count
+    /// carry the octave: Bilawal degree 7 is Sa one floor up (slot 12).
+    #[test]
+    fn slot_of_degree_walks_set_bits_and_carries_octaves() {
+        let iv = ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]);
+        // Sa Re Ga Ma Pa Dha Ni at slots 0,2,4,5,7,9,11.
+        let slots: Vec<u32> = (0..7).map(|d| iv.slot_of_degree(d, 12)).collect();
+        assert_eq!(slots, [0, 2, 4, 5, 7, 9, 11]);
+        // Degree 7 folds: Sa one octave up.
+        assert_eq!(iv.slot_of_degree(7, 12), 12);
+        // Degree 8 is Re one octave up.
+        assert_eq!(iv.slot_of_degree(8, 12), 14);
+    }
+
+    use crate::tuning::{Tuning, TuningKind};
+
+    /// On 12-TET the resolver reproduces equal-temperament frequencies. The
+    /// rotation carries only the *pitch class* of 440 (its octave-free residue);
+    /// the floor is the integer `octave`, anchored at ORIGIN = 1 Hz. So Sa lands
+    /// on 440 when `octave = floor(log2 440) = 8`, and from there the Bilawal
+    /// degrees are 440 × 2^(k/12) for k in the slots, Sa one octave up is 880.
+    #[test]
+    fn pitch_at_reproduces_twelve_tet_frequencies() {
+        let rotation = (PitchLog2::from_hz(440.0) - crate::tuning::ORIGIN).fract();
+        let tuning =
+            crate::tuning::TuningAbsolute::new(TuningKind::TwelveTet.intervals(), rotation);
+        let bilawal = ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]);
+        let octave = (440f32.log2()).floor() as i32; // 8
+        let scale = Scale::new(bilawal, tuning.shift_up(0), octave);
+
+        // pitch_at(0) is Sa, the tonic.
+        assert!((scale.pitch_at(0).to_hz() - 440.0).abs() < 1e-2);
+        for (degree, slot) in [(0, 0), (1, 2), (2, 4), (3, 5)] {
+            let want = 440.0 * 2f32.powf(slot as f32 / 12.0);
+            assert!((scale.pitch_at(degree).to_hz() - want).abs() < 1e-2);
+        }
+        // Degree 7 is Sa one octave up: 880 Hz.
+        assert!((scale.pitch_at(7).to_hz() - 880.0).abs() < 1e-2);
+    }
+
+    /// The integer octave is a clean register jump: the same scale at octave −1
+    /// halves every resolved frequency.
+    #[test]
+    fn octave_halves_the_register() {
+        let rotation = (PitchLog2::from_hz(440.0) - crate::tuning::ORIGIN).fract();
+        let tuning =
+            crate::tuning::TuningAbsolute::new(TuningKind::TwelveTet.intervals(), rotation);
+        let iv = ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]);
+        let high = Scale::new(iv, tuning.shift_up(0), 0);
+        let low = Scale::new(iv, tuning.shift_up(0), -1);
+        assert!((high.pitch_at(0).to_hz() / low.pitch_at(0).to_hz() - 2.0).abs() < 1e-3);
     }
 }

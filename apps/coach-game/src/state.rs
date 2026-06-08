@@ -6,7 +6,9 @@
 
 use bevy::prelude::*;
 use domain_ports::audio_devices::{DeviceId, InputDevice};
-use domain_ports::music::{harmonium_key, ScaleShape, Tonality, TuningKind, TuningSpec};
+use domain_ports::pitch::PitchLog2;
+use domain_ports::scale::{Scale, ScaleIntervals};
+use domain_ports::tuning::{Tuning, TuningAbsolute, TuningKind};
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[states(scoped_entities)]
@@ -48,7 +50,7 @@ pub struct KnownDevices(pub Vec<InputDevice>);
 /// arrives (honest absence: the picker waits for `KnownScales` to be
 /// non-empty before rendering rows).
 #[derive(Resource, Default)]
-pub struct KnownScales(pub Vec<ScaleShape>);
+pub struct KnownScales(pub Vec<ScaleIntervals>);
 
 /// Calibration layer for the musical UI. Settings the user sets once
 /// and forgets — the harmonium-maker's choices, not the singer's.
@@ -88,58 +90,70 @@ impl Default for AppSettings {
     }
 }
 
-/// The song's musical frame of reference, head-side. Wraps the port's
-/// [`Tonality`] (the singer's Sa key + scale-interval shape) so it can
-/// be a Bevy [`Resource`] — the head holds the same value it sends the
-/// coach via [`Command::ConfigureSession`](domain_ports::app_coach::Command),
-/// and the dial reads it to paint the scale ring.
+/// The song's musical frame, head-side: a fully-placed [`Scale`] (tooth
+/// pattern + rotated tuning carrying Sa + integer octave). The head holds
+/// the same value it sends the coach via
+/// [`Command::ConfigureSession`](domain_ports::app_coach::Command), and the
+/// dial reads it to paint the scale ring.
 ///
-/// The dial's *geometry* (how many slots, where they sit) comes from
-/// [`AppSettings`]; this resource says *which slots are in-scale* and
-/// *where Sa is* for the current song. Today it defaults to Bilawal on
-/// Safed-1 (C) — there's no per-song picker yet. When songs land, this
-/// is what they write to.
+/// The dial's *geometry* (how many slots, where they sit) lives in the
+/// `Scale`'s tuning; the mask says *which slots are in-scale*, and the
+/// tuning's rotation + octave say *where Sa is*. Today it defaults to
+/// Bilawal on C — there's no per-song picker yet. When songs land, this is
+/// what they write to.
 #[derive(Resource, Debug, Clone, Copy)]
-pub struct SongTonality(pub Tonality);
+pub struct SongTonality(pub Scale);
 
 impl Default for SongTonality {
     fn default() -> Self {
-        // Bilawal thaat (Sa Re Ga Ma Pa Dha Ni) on C — same intervals
-        // as the Western major scale (2+2+1+2+2+2+1). Sa sits on C in
-        // octave 1 (`harmonium_key(12)`), one octave below the A=440
-        // tuning root (`harmonium_key(21)`), so the scale resolves to
-        // the middle register (C ≈ 262 Hz) rather than the lowest
-        // octave on the line.
-        Self(Tonality::new(
-            harmonium_key(12.0),
-            &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0],
+        // Bilawal thaat (Sa Re Ga Ma Pa Dha Ni) — same intervals as the
+        // Western major scale (2+2+1+2+2+2+1). Built on the default A=440
+        // 12-TET calibration, with Sa on C one octave below the reference.
+        Self(AppSettings::default().song_scale(
+            ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]),
+            SA_ON_C_SHIFT,
+            SA_ON_C_OCTAVE,
         ))
     }
 }
 
+/// Semitones from the A=440 reference line up to C: A→C is +3 on the
+/// 12-TET circle, so Sa-on-C is `shift_up(3)` of the reference tuning.
+pub const SA_ON_C_SHIFT: usize = 3;
+
+/// The helix floor C sits on, one octave below A=440 (C ≈ 262 Hz, so
+/// `floor(log2 262) = 8`). ORIGIN is 1 Hz, so the register lives in this
+/// integer octave, not in the rotation (which keeps only the pitch class).
+pub const SA_ON_C_OCTAVE: i32 = 8;
+
 impl AppSettings {
-    /// The flat tuning inputs the coach needs to build a
-    /// [`Tuning`](domain_ports::music::Tuning), derived from the user's
-    /// calibration settings.
+    /// The reference-anchored tuning: this calibration's [`TuningKind`]
+    /// shape rotated so its slot 0 is the `reference_hz` pitch class (the
+    /// "A=" line). The rotation carries only the reference's octave-free
+    /// residue; the octave a song sits in is the `Scale`'s integer floor.
     ///
-    /// Convention: `reference_hz` is the "A=" anchor, so the tuning root
-    /// is the A key in octave 1 (`harmonium_key(21)`) and `root_note_hz`
-    /// is `reference_hz` directly — A sits at slot 0. The root lives in
-    /// octave 1 (not the lowest octave) so a song tonic an octave below
-    /// it lands in the singing register rather than the cellar.
-    pub fn tuning_spec(&self) -> TuningSpec {
-        TuningSpec {
-            root_note_hz: self.reference_hz,
-            kind: self.tuning_kind,
-            root: harmonium_key(21.0),
-        }
+    /// This is the bare cylinder a song then re-bases (`shift_up` to put Sa
+    /// on its tonic) and places at a register — see [`song_scale`].
+    ///
+    /// [`song_scale`]: AppSettings::song_scale
+    pub fn tuning_absolute(&self) -> TuningAbsolute {
+        TuningAbsolute::at_reference(
+            self.tuning_kind.intervals(),
+            PitchLog2::from_hz(self.reference_hz),
+        )
+    }
+
+    /// Place a scale on this calibration: the tooth pattern `intervals`
+    /// dropped onto the reference tuning re-based so Sa is `sa_shift` slots
+    /// above the reference line, at register `octave` (helix floor of Sa).
+    pub fn song_scale(&self, intervals: ScaleIntervals, sa_shift: usize, octave: i32) -> Scale {
+        Scale::new(intervals, self.tuning_absolute().shift_up(sa_shift), octave)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_ports::music::InstrumentKeyInterval;
 
     #[test]
     fn app_settings_default_matches_design() {
@@ -149,35 +163,25 @@ mod tests {
     }
 
     #[test]
-    fn song_tonality_default_is_bilawal_on_c_octave_1() {
-        let SongTonality(t) = SongTonality::default();
-        // Sa on C in octave 1 — one octave below the A=440 root, so the
-        // scale resolves to the middle register.
-        assert_eq!(t.tonic, harmonium_key(12.0));
-        assert_eq!(
-            t.widths(),
-            &[
-                InstrumentKeyInterval(2.0),
-                InstrumentKeyInterval(2.0),
-                InstrumentKeyInterval(1.0),
-                InstrumentKeyInterval(2.0),
-                InstrumentKeyInterval(2.0),
-                InstrumentKeyInterval(2.0),
-                InstrumentKeyInterval(1.0)
-            ]
-        );
-        // Well-formed against a 12-slot tuning.
-        assert!(t.well_formed(12));
+    fn song_tonality_default_is_bilawal_on_c() {
+        let SongTonality(scale) = SongTonality::default();
+        // Bilawal degrees on the 12-slot grid.
+        assert_eq!(scale.intervals().degree_slots(), [0, 2, 4, 5, 7, 9, 11]);
+        // 12-TET tuning underneath.
+        assert_eq!(scale.tuning().len(), 12);
+        // Sa resolves to C ≈ 262 Hz (one octave below the A=440 reference).
+        let sa = scale.pitch_at(0).to_hz();
+        assert!((sa - 261.63).abs() < 1.0, "Sa should be middle C, got {sa}");
     }
 
     #[test]
-    fn tuning_spec_pegs_root_at_a_with_reference_hz() {
-        // Default settings: A=440, 12-TET. The tuning root is the A key
-        // in octave 1 (offset 21) and root_note_hz is the reference
-        // directly.
-        let spec = AppSettings::default().tuning_spec();
-        assert_eq!(spec.root, harmonium_key(21.0));
-        assert_eq!(spec.root_note_hz, 440.0);
-        assert_eq!(spec.kind, TuningKind::TwelveTet);
+    fn tuning_absolute_pegs_slot_zero_at_reference_hz() {
+        // Default settings: A=440, 12-TET. Slot 0 of the reference tuning
+        // is the A=440 pitch class.
+        let t = AppSettings::default().tuning_absolute();
+        assert_eq!(t.len(), 12);
+        // Resolving 440 Hz lands on slot 0.
+        let (slot, _oct) = t.resolve(PitchLog2::from_hz(440.0));
+        assert_eq!(slot, 0, "the reference Hz must sit on slot 0");
     }
 }

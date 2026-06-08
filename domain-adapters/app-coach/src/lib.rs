@@ -2,7 +2,7 @@
 //!
 //! # Architecture
 //!
-//! Implements the two-plane shape from `docs/SPEC-AppCoach.md` §7.
+//! Two planes, split by who owns the state:
 //!
 //! - **Control plane**: a single owned thread that drains an MPSC of
 //!   [`Input`](control_plane::Input) values. Every session-state
@@ -250,8 +250,10 @@ mod tests {
         Transport,
     };
     use domain_ports::clock::{Clock, TestClock};
-    use domain_ports::music::{harmonium_key, Tonality, TuningKind, TuningSpec};
+    use domain_ports::pitch::PitchLog2;
+    use domain_ports::scale::{Scale, ScaleIntervals};
     use domain_ports::telemetry::TestTelemetry;
+    use domain_ports::tuning::{Tuning, TuningAbsolute, TuningKind};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // ---- fakes ----
@@ -435,8 +437,9 @@ mod tests {
         );
 
         // Configure a 12-TET session; now ListScales returns 15 shapes.
-        let (tuning, tonality) = bilawal_config();
-        coach.send_command(Command::ConfigureSession { tuning, tonality });
+        coach.send_command(Command::ConfigureSession {
+            scale: bilawal_scale(0),
+        });
         coach.send_command(Command::ListScales);
         let events_after = poll_until(&coach, |evs| {
             // Wait for a second ScalesListed (the non-empty one).
@@ -451,7 +454,7 @@ mod tests {
                 CoachEvent::ScalesListed { shapes } => Some(shapes),
                 _ => None,
             })
-            .last()
+            .next_back()
             .expect("second ScalesListed (after configure)");
         assert_eq!(
             shapes_after.len(),
@@ -529,16 +532,20 @@ mod tests {
         );
     }
 
-    /// A 12-TET, A=440 tuning with Bilawal (Sa Re Ga Ma Pa Dha Ni) on
-    /// slot 0 — the default musical frame for these tests.
-    fn bilawal_config() -> (TuningSpec, Tonality) {
-        let tuning = TuningSpec {
-            root_note_hz: 261.625_56, // C
-            kind: TuningKind::TwelveTet,
-            root: harmonium_key(0.0),
-        };
-        let tonality = Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
-        (tuning, tonality)
+    /// A 12-TET, A=440 Bilawal scale (Sa Re Ga Ma Pa Dha Ni) with Sa
+    /// rotated `shift` slots up from the A=440 reference line — the default
+    /// musical frame for these tests. `shift = 0` puts Sa on the reference;
+    /// `shift = 2` puts it two semitones up (Sa on B).
+    fn bilawal_scale(shift: usize) -> Scale {
+        let tuning = TuningAbsolute::at_reference(
+            TuningKind::TwelveTet.intervals(),
+            PitchLog2::from_hz(440.0),
+        );
+        let intervals = ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]);
+        // Sa sits on the reference's pitch class; the integer octave is the
+        // helix floor that carries 440 (ORIGIN = 1 Hz keeps only the class).
+        let octave = (440f32.log2()).floor() as i32;
+        Scale::new(intervals, tuning.shift_up(shift), octave)
     }
 
     /// Drain the coach once past a known reply (a `DevicesListed` from a
@@ -569,8 +576,8 @@ mod tests {
         // Before any configure, the snapshot is None.
         assert!(coach.music_info().is_none());
 
-        let (tuning, tonality) = bilawal_config();
-        coach.send_command(Command::ConfigureSession { tuning, tonality });
+        let scale = bilawal_scale(0);
+        coach.send_command(Command::ConfigureSession { scale });
 
         // Configure causes no *audio* state change, but it does emit a
         // SessionConfigured event. Sandwich it before a ListDevices and
@@ -590,14 +597,13 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CoachEvent::SessionConfigured { tonality: t, .. } if *t == tonality
+                CoachEvent::SessionConfigured { scale: s } if *s == scale
             )),
-            "ConfigureSession must emit SessionConfigured with the new tonality",
+            "ConfigureSession must emit SessionConfigured with the new scale",
         );
         // And published the sticky snapshot — readable now, in Idle.
         let info = coach.music_info().expect("snapshot set after configure");
-        assert_eq!(info.tonality, tonality);
-        assert_eq!(info.tuning, tuning);
+        assert_eq!(info.scale, scale);
         // It also must not have opened any audio device.
         assert_eq!(opens.load(Ordering::SeqCst), 0);
 
@@ -632,13 +638,9 @@ mod tests {
 
         // Reconfigure mid-session. Decoupled: no *audio* state change,
         // but it does emit SessionConfigured + update the snapshot.
-        let (tuning, _) = bilawal_config();
-        // A different tonic, to make the swap meaningful.
-        let tonality = Tonality {
-            tonic: harmonium_key(2.0), // Sa on D
-            ..bilawal_config().1
-        };
-        coach.send_command(Command::ConfigureSession { tuning, tonality });
+        // A different tonic (Sa two slots up), to make the swap meaningful.
+        let scale = bilawal_scale(2);
+        coach.send_command(Command::ConfigureSession { scale });
 
         let events = drain_past_list_devices(&coach);
         assert!(
@@ -648,7 +650,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CoachEvent::SessionConfigured { tonality: t, .. } if *t == tonality
+                CoachEvent::SessionConfigured { scale: s } if *s == scale
             )),
             "reconfigure must emit SessionConfigured with the new tonic",
         );
@@ -660,7 +662,7 @@ mod tests {
             "still Running after reconfigure",
         );
         // Snapshot reflects the latest configure.
-        assert_eq!(coach.music_info().unwrap().tonality, tonality);
+        assert_eq!(coach.music_info().unwrap().scale, scale);
 
         coach.send_command(Command::StopSession);
         let _ = poll_until(&coach, |evs| {
@@ -678,8 +680,8 @@ mod tests {
         // audio_info which clears to None.
         assert!(coach.audio_info().is_none(), "audio_info clears on stop",);
         assert_eq!(
-            coach.music_info().unwrap().tonality,
-            tonality,
+            coach.music_info().unwrap().scale,
+            scale,
             "music_info is sticky across stop",
         );
 

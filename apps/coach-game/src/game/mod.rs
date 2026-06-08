@@ -6,10 +6,10 @@ pub mod dial;
 pub mod hud;
 pub mod scale_picker;
 
-use crate::coach::{Coach, LatestFeatures};
-use crate::state::{AppSettings, AppState, HasPausedSession, SelectedDevice, SongTonality};
+use crate::coach::{Coach, Features, LatestFeatures};
+use crate::state::{AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
-use domain_ports::app_coach::{AudioConfig, Command, FeatureSnapshot};
+use domain_ports::app_coach::{AudioConfig, Command};
 
 #[derive(Resource, Default)]
 pub struct LastFeatureTs(u64);
@@ -17,19 +17,16 @@ pub struct LastFeatureTs(u64);
 pub fn on_enter(
     coach: NonSend<Coach>,
     selected: Res<SelectedDevice>,
-    settings: Res<AppSettings>,
     tonality: Res<SongTonality>,
     mut has_paused: ResMut<HasPausedSession>,
 ) {
     // Configure the musical frame of reference *before* starting audio,
-    // so the coach holds the tuning + tonality the moment a session is
-    // live. The two are decoupled (configure causes no state change),
-    // but configuring first means the reference is never momentarily
-    // absent while Running.
-    coach.0.send_command(Command::ConfigureSession {
-        tuning: settings.tuning_spec(),
-        tonality: tonality.0,
-    });
+    // so the coach holds the scale the moment a session is live. The two
+    // are decoupled (configure causes no state change), but configuring
+    // first means the reference is never momentarily absent while Running.
+    coach
+        .0
+        .send_command(Command::ConfigureSession { scale: tonality.0 });
     coach.0.send_command(Command::StartSession(AudioConfig {
         device_id: selected.0.clone(),
         sample_rate: None,
@@ -67,8 +64,8 @@ pub fn handle_esc_paused(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextS
 }
 
 pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureTs>) {
-    let Some(FeatureSnapshot {
-        f0_hz,
+    let Some(Features {
+        pitch,
         confidence,
         onset,
         breath,
@@ -83,10 +80,11 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureT
         return;
     }
     last.0 = t_ms;
-    let f0_str = if f0_hz > 0.0 {
-        format!("{f0_hz:7.2} Hz")
-    } else {
-        "    --    ".to_string()
+    // Debug log renders Hz for human eyes — the one place the game prints a
+    // frequency. `pitch` is already a PitchLog2; `None` is unvoiced.
+    let f0_str = match pitch {
+        Some(p) => format!("{:7.2} Hz", p.to_hz()),
+        None => "    --    ".to_string(),
     };
     let onset_marker = if onset > 0.0 { "•" } else { " " };
     info!(

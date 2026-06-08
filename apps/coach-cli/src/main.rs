@@ -4,9 +4,8 @@
 //! into an [`AppCoach`], translates subcommands into [`Command`]s,
 //! drains [`CoachEvent`]s, and prints one line per feature snapshot.
 //! Real product behaviour (state machine, session lifecycle,
-//! telemetry) lives in `adapter-app-coach`.
-//!
-//! See `docs/SPEC-AppCoach.md` for the boundary contract.
+//! telemetry) lives in `adapter-app-coach`. The boundary contract is
+//! the [`AppCoach`] trait's own module docs.
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{

@@ -72,8 +72,8 @@ use crate::pitch::{PitchLog2, PitchLog2Interval};
 pub const ORIGIN: PitchLog2 = PitchLog2(0.0);
 
 /// The cap on a [`TuningIntervals`]' gap array. A fixed cap keeps the whole
-/// tuning chain flat and `Copy` (so it crosses the command boundary directly,
-/// like the old `music.rs` `Tonality`); 32 covers the system's largest tuning
+/// tuning chain flat and `Copy` (so it crosses the command boundary directly);
+/// 32 covers the system's largest tuning
 /// (22-shruti) with room for finer microtonal grids.
 pub const MAX_TUNING_SLOTS: usize = 32;
 
@@ -173,6 +173,28 @@ impl TuningIntervals {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The cumulative rotation from the root line (line 0) to line `i`: the sum
+    /// of the first `i` gaps, **re-summed fresh** from the immutable array each
+    /// call. `cumulative_rotation_to(0)` is zero (the root itself);
+    /// `cumulative_rotation_to(N)` is one whole octave (`+1.0`), unfolded.
+    ///
+    /// This is the slot → angle map the layers above slide along: line `i`'s
+    /// angle on the cylinder, root-relative. Lines are read **cyclically**
+    /// (`i mod N`), so an `i` past `N` keeps climbing octaves — the same
+    /// integer/leftover divmod as everywhere, the octaves carried not wrapped.
+    /// Because it sums the stored gaps anew rather than carrying a running
+    /// total, no shift accumulates floating-point error.
+    ///
+    /// Root-relative by design: a [`TuningRotated`] already re-bases its gap
+    /// array so its line 0 is *its* root, so one root-relative method serves
+    /// both views — the rotated view's `cumulative_rotation_to(i)` is measured
+    /// from its own root, not the authored one.
+    pub fn cumulative_rotation_to(&self, i: usize) -> PitchLog2Interval {
+        (0..i)
+            .map(|k| gap_at(self, k))
+            .fold(PitchLog2Interval(0.0), |acc, g| acc + g)
+    }
 }
 
 /// The gap at line `i`, read **cyclically** (`i mod N`). A pure array read of a
@@ -181,16 +203,6 @@ impl TuningIntervals {
 /// re-basing primitive a [`TuningRotated`] reads through, not public surface.
 fn gap_at(shape: &TuningIntervals, i: usize) -> PitchLog2Interval {
     shape.rotations[i % shape.len]
-}
-
-/// The angle from line 0 to line `i`: the sum of the first `i` gaps, **re-summed
-/// fresh** from the immutable array. Unfolded — `angle_to(N)` is one whole
-/// octave. Module-private: the prefix-sum a [`TuningRotated`] derives its
-/// rotation from, recomputed each call so no shift accumulates error.
-fn angle_to(shape: &TuningIntervals, i: usize) -> PitchLog2Interval {
-    (0..i)
-        .map(|k| gap_at(shape, k))
-        .fold(PitchLog2Interval(0.0), |acc, g| acc + g)
 }
 
 /// A readable cylinder: the rigid [`TuningIntervals`] shape and the one global
@@ -293,6 +305,22 @@ impl TuningAbsolute {
         }
     }
 
+    /// Place a shape so that `reference` lands on slot 0 — the named form of
+    /// "this pitch is the A=440 line." The global rotation is the reference's
+    /// octave-free residue from [`ORIGIN`]: `(reference − ORIGIN).fract()`.
+    ///
+    /// This is the door for the common two-choice construction — pick a shape
+    /// ([`TuningKind::intervals`]) and a reference pitch — without any caller
+    /// naming [`ORIGIN`] or the fold itself. Only the *pitch class* of
+    /// `reference` is kept (the fold drops its octave); the register a tuning
+    /// is read at is the [`Scale`](crate::scale::Scale)'s integer floor, not a
+    /// property of the cylinder.
+    ///
+    /// [`TuningKind::intervals`]: TuningKind::intervals
+    pub fn at_reference(intervals: TuningIntervals, reference: PitchLog2) -> TuningAbsolute {
+        TuningAbsolute::new(intervals, reference - ORIGIN)
+    }
+
     /// Build from the absolute Hz of the `N` lines, **root first**. The octave
     /// is implicit: a tuning closes at twice its root, so the closing line need
     /// not be passed — it is synthesized as the root one floor up. The root's
@@ -328,7 +356,52 @@ impl TuningAbsolute {
         angles.push(PitchLog2Interval::octaves(1));
         // Gaps are differences of those angles; the sum telescopes to exactly 1.
         let gaps = angles.windows(2).map(|w| w[1] - w[0]);
-        TuningAbsolute::new(TuningIntervals::new(gaps), (root - ORIGIN).fract())
+        TuningAbsolute::at_reference(TuningIntervals::new(gaps), root)
+    }
+
+    /// Resolve a concrete pitch to the **nearest line**, register and all:
+    /// `(slot, octave)` where `slot ∈ [0, N)` is the closest groove and
+    /// `octave` is the helix floor (signed) it sits on, anchored at [`ORIGIN`].
+    ///
+    /// The inverse of placing a line: where [`cumulative_rotation_to`] +
+    /// [`shift_up`] turn a slot into a pitch, this turns a pitch back into the
+    /// slot it is closest to. Capture-Sa uses it — a live `f0` resolves to the
+    /// groove the singer is nearest, which becomes the new Sa
+    /// (`shift_up(slot)`) at register `octave`.
+    ///
+    /// Snaps to the *nearest* line by within-octave angle (a voice between two
+    /// grooves rounds to the closer one), and folds a wrap past the last line
+    /// back onto line 0 one floor up — so the returned `octave` already
+    /// accounts for rounding across the octave seam. An empty tuning resolves
+    /// to `(0, 0)`.
+    ///
+    /// [`cumulative_rotation_to`]: TuningIntervals::cumulative_rotation_to
+    /// [`shift_up`]: Tuning::shift_up
+    pub fn resolve(&self, pitch: PitchLog2) -> (usize, i32) {
+        let n = self.intervals.len();
+        if n == 0 {
+            return (0, 0);
+        }
+        // Distance from the absolute root (ORIGIN turned by the rotation),
+        // split into floor (register) + within-octave residue.
+        let from_root = pitch - (ORIGIN + self.rotation);
+        let octave = from_root.full_octaves();
+        let within = from_root.mantissa();
+        // Nearest line: the slot whose cumulative angle is closest to `within`,
+        // also considering the closing line (slot N = slot 0 one octave up).
+        let mut best_slot = 0usize;
+        let mut best_dist = f32::INFINITY;
+        let mut wrapped = false;
+        for i in 0..=n {
+            let angle = self.intervals.cumulative_rotation_to(i).0;
+            let dist = (within - angle).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_slot = i % n;
+                wrapped = i == n;
+            }
+        }
+        (best_slot, octave + wrapped as i32)
     }
 }
 
@@ -540,7 +613,7 @@ impl Tuning for TuningRotated {
     /// base octave. Re-summed fresh from the gaps each call — never carried
     /// across shifts, so no error accumulates.
     fn rotation(&self) -> PitchLog2Interval {
-        let walked = angle_to(&self.tuning.intervals, self.start);
+        let walked = self.tuning.intervals.cumulative_rotation_to(self.start);
         (self.tuning.rotation + walked).fract()
     }
 
@@ -587,7 +660,11 @@ mod tests {
     fn twelve_tet_is_even_just_is_not() {
         let tet = TuningKind::TwelveTet.intervals();
         for g in tet.gaps() {
-            assert!((g.0 - 1.0 / 12.0).abs() < 1e-5, "12-TET gap {} != 1/12", g.0);
+            assert!(
+                (g.0 - 1.0 / 12.0).abs() < 1e-5,
+                "12-TET gap {} != 1/12",
+                g.0
+            );
         }
         let just = TuningKind::HindustaniJust.intervals();
         let uneven = just.gaps().iter().any(|g| (g.0 - 1.0 / 12.0).abs() > 1e-3);
@@ -603,7 +680,11 @@ mod tests {
         let intervals = TuningKind::HindustaniJust.intervals();
         let rotation = (PitchLog2::from_hz(440.0) - ORIGIN).fract();
         let placed = TuningAbsolute::new(intervals, rotation);
-        assert_eq!(placed.intervals(), intervals, "reference must not move shape");
+        assert_eq!(
+            placed.intervals(),
+            intervals,
+            "reference must not move shape"
+        );
         assert_eq!(placed.rotation(), rotation);
     }
 
@@ -612,9 +693,7 @@ mod tests {
     fn twelve_tet_gaps_are_even_and_close_the_octave() {
         // Exactly 12 line frequencies; from_frequencies closes the octave.
         let base = 261.6256_f32; // C4, arbitrary root
-        let hz: Vec<f32> = (0..12)
-            .map(|i| base * 2f32.powf(i as f32 / 12.0))
-            .collect();
+        let hz: Vec<f32> = (0..12).map(|i| base * 2f32.powf(i as f32 / 12.0)).collect();
         let t = TuningAbsolute::from_frequencies(hz);
 
         assert_eq!(t.len(), 12);
@@ -767,6 +846,34 @@ mod tests {
         assert!(
             (step1 - step2).abs() > 0.1,
             "an uneven tuning has uneven steps"
+        );
+    }
+
+    /// `resolve` inverts placement: a slot's own pitch resolves back to that
+    /// slot, register preserved; a pitch between slots snaps to the nearer one;
+    /// a pitch just under the octave wraps to slot 0 one floor up.
+    #[test]
+    fn resolve_snaps_to_nearest_line_with_register() {
+        // 12-TET rooted so A=440 is the absolute root.
+        let rotation = (PitchLog2::from_hz(440.0) - ORIGIN).fract();
+        let t = TuningAbsolute::new(TuningKind::TwelveTet.intervals(), rotation);
+        let a_oct = 440f32.log2().floor() as i32; // 8
+
+        // The root A=440 resolves to slot 0 at its own octave.
+        assert_eq!(t.resolve(PitchLog2::from_hz(440.0)), (0, a_oct));
+        // A semitone up (≈466) → slot 1, same octave.
+        assert_eq!(
+            t.resolve(PitchLog2::from_hz(440.0 * 2f32.powf(1.0 / 12.0))),
+            (1, a_oct)
+        );
+        // 880 = A one octave up → slot 0, octave+1.
+        assert_eq!(t.resolve(PitchLog2::from_hz(880.0)), (0, a_oct + 1));
+        // 220 = A one octave down → slot 0, octave−1.
+        assert_eq!(t.resolve(PitchLog2::from_hz(220.0)), (0, a_oct - 1));
+        // A hair under the next A wraps up to slot 0, not slot 11.
+        assert_eq!(
+            t.resolve(PitchLog2::from_hz(880.0 * 2f32.powf(-0.1 / 12.0))),
+            (0, a_oct + 1)
         );
     }
 

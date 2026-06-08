@@ -18,8 +18,8 @@ use domain_ports::app_coach::{
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
-use domain_ports::music::ScaleShape;
-use domain_ports::music::{Tonality, Tuning, TuningSpec};
+use domain_ports::scale::{Scale, ScaleIntervals};
+use domain_ports::tuning::Tuning;
 use domain_ports::{tel_debug, tel_info, tel_warn};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -64,15 +64,14 @@ pub(crate) struct ControlPlane {
     inspect: Arc<InspectShared>,
 
     state: SessionState,
-    /// The musical frame of reference — the built [`Tuning`] and the
-    /// [`Tonality`] the singer is in — set by
-    /// [`Command::ConfigureSession`]. `None` until the head first
+    /// The musical frame of reference — the [`Scale`] the singer is in —
+    /// set by [`Command::ConfigureSession`]. `None` until the head first
     /// configures. Decoupled from the audio lifecycle: it is *not*
     /// cleared by start/stop, only by shutdown. The data plane does not
     /// consume it yet (pitch *scoring* against the scale is a later
     /// phase); today it is held so the head's reads stay coherent and
     /// the seam exists for scoring to plug into.
-    session_model: Option<(Tuning, Tonality)>,
+    session_model: Option<Scale>,
     /// Set when an [`AudioConfig`] has been accepted and the cpal
     /// stream is open. `None` in `Idle` / `Error`. Lives on this
     /// thread — `CaptureSession` is `!Send`.
@@ -163,8 +162,8 @@ impl ControlPlane {
             Input::FromHead(Command::ListScales) => self.do_list_scales(),
             Input::FromHead(Command::StartSession(cfg)) => self.do_start_session(cfg),
             Input::FromHead(Command::StopSession) => self.do_stop_session(),
-            Input::FromHead(Command::ConfigureSession { tuning, tonality }) => {
-                self.do_configure_session(tuning, tonality)
+            Input::FromHead(Command::ConfigureSession { scale }) => {
+                self.do_configure_session(scale)
             }
         }
     }
@@ -176,7 +175,7 @@ impl ControlPlane {
 
     fn do_list_scales(&mut self) {
         self.push_event(CoachEvent::ScalesListed {
-            shapes: scales_for(self.session_model.as_ref().map(|(t, _)| t.n() as u8)),
+            shapes: scales_for(self.session_model.as_ref().map(|s| s.tuning().len())),
         });
     }
 
@@ -312,44 +311,37 @@ impl ControlPlane {
         }
     }
 
-    /// Set the musical frame of reference. Builds the [`Tuning`] from
-    /// the spec and stores it with the [`Tonality`]. Valid in any state;
-    /// no [`SessionState`] change, no event — the musical lifecycle is
-    /// decoupled from the audio one.
+    /// Set the musical frame of reference: hold the [`Scale`] the head
+    /// configured. Valid in any state; no [`SessionState`] change — the
+    /// musical lifecycle is decoupled from the audio one.
     ///
-    /// The well-formedness invariant (scale intervals sum to the
-    /// tuning's slot count) is checked here, at the `Tuning × Tonality`
-    /// join — the only place both halves are in hand. Today only code
-    /// constructs the payload, so a bad sum is a programming bug caught
-    /// by `debug_assert`; this graduates to a runtime reject (keep the
-    /// prior model) when an untrusted picker can reach it.
-    fn do_configure_session(&mut self, spec: TuningSpec, tonality: Tonality) {
-        let tuning = Tuning::new(spec);
+    /// The `Scale` arrives already placed (the head resolved both motions
+    /// of the tonic), so there is nothing to build coach-side; the coach
+    /// just stores it. Its degrees fit the tuning by construction — the
+    /// head builds the mask against the same tuning's slot count.
+    fn do_configure_session(&mut self, scale: Scale) {
         debug_assert!(
-            tonality.well_formed(tuning.n() as u8),
-            "tonality key-widths {:?} do not sum to tuning slot count {}",
-            tonality.widths(),
-            tuning.n(),
+            scale
+                .intervals()
+                .degree_slots()
+                .iter()
+                .all(|&s| (s as usize) < scale.tuning().len()),
+            "scale degrees {:?} exceed tuning slot count {}",
+            scale.intervals().degree_slots(),
+            scale.tuning().len(),
         );
         tel_debug!(
             &*self.deps.telemetry,
             "app-coach: session configured",
-            slots = tuning.n() as u32,
-            tonic = tonality.tonic.offset as u32,
+            slots = scale.tuning().len() as u32,
+            degrees = scale.intervals().note_count() as u32,
         );
-        self.session_model = Some((tuning, tonality));
+        self.session_model = Some(scale);
         // Publish the snapshot *before* the event so a head reacting to
-        // `SessionConfigured` reads a coherent `music_info()`. The
-        // snapshot carries the flat `TuningSpec` (not the built
-        // `Tuning`), mirroring the event payload.
-        self.music_info_publisher.store(Arc::new(Some(MusicInfo {
-            tuning: spec,
-            tonality,
-        })));
-        self.push_event(CoachEvent::SessionConfigured {
-            tuning: spec,
-            tonality,
-        });
+        // `SessionConfigured` reads a coherent `music_info()`.
+        self.music_info_publisher
+            .store(Arc::new(Some(MusicInfo { scale })));
+        self.push_event(CoachEvent::SessionConfigured { scale });
     }
 
     /// Drop the capture (stops RT callback, drops the ring producer),
@@ -462,57 +454,66 @@ impl ControlPlane {
 
 /// Filter the scale catalogue by the tuning's slot count `n`.
 ///
-/// `n = Some(slot_count)` — return every catalogue shape whose widths
-/// sum to `slot_count` (i.e. `shape.well_formed(n)`).
+/// `n = Some(slot_count)` — return every catalogue entry authored for an
+/// `slot_count`-slot grid (its widths sum to `slot_count`), as a flat
+/// [`ScaleIntervals`] mask.
 ///
 /// `n = None` — no configured tuning yet, so the coach can't know which
 /// octave division is active. Returns an empty `Vec` rather than guessing
 /// 12: honest absence is preferable to silently assuming a 12-slot world
 /// when the head has not yet sent `ConfigureSession`.
-pub(crate) fn scales_for(n: Option<u8>) -> Vec<ScaleShape> {
+pub(crate) fn scales_for(n: Option<usize>) -> Vec<ScaleIntervals> {
     let Some(slot_count) = n else {
         return Vec::new();
     };
     scale_catalogue()
         .into_iter()
-        .filter(|s| s.well_formed(slot_count))
+        .filter(|(_, grid)| *grid == slot_count as u32)
+        .map(|(iv, _)| iv)
         .collect()
 }
 
-/// The built-in scale shape catalogue — 16 shapes: 15 summing to 12
+/// The built-in scale catalogue — 16 entries: 15 on the 12-slot grid
 /// (the ten Hindustani thaats, Kirwani/harmonic-minor, two common
-/// pentatonics, Locrian, and the 12-note chromatic) plus one summing to
-/// 22 (Bilawal on the 22-shruti grid). Shapes are stored
-/// as key-widths; for 12-slot shapes the unit is semitones, for 22-slot
-/// shapes the unit is shrutis. Author-only labels are code comments;
-/// [`ScaleShape`] has no name field — vocabulary is the deferred
+/// pentatonics, Locrian, and the 12-note chromatic) plus one on the
+/// 22-shruti grid (Bilawal). Each entry is authored as tooth-widths —
+/// semitones on the 12-grid, shrutis on the 22-grid — and paired with the
+/// grid it closes (the widths' sum) so [`scales_for`] can filter by the
+/// active tuning's slot count. Author-only labels are code comments;
+/// [`ScaleIntervals`] has no name field — vocabulary is the deferred
 /// note-system axis.
-pub(crate) fn scale_catalogue() -> Vec<ScaleShape> {
-    vec![
-        ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0]), // Bilawal (= Major)
-        ScaleShape::new(&[2.0, 2.0, 1.0, 2.0, 2.0, 1.0, 2.0]), // Khamaj
-        ScaleShape::new(&[2.0, 1.0, 2.0, 2.0, 2.0, 1.0, 2.0]), // Kafi
-        ScaleShape::new(&[2.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0]), // Asavari
-        ScaleShape::new(&[1.0, 2.0, 2.0, 2.0, 1.0, 2.0, 2.0]), // Bhairavi
-        ScaleShape::new(&[1.0, 3.0, 1.0, 2.0, 1.0, 3.0, 1.0]), // Bhairav
-        ScaleShape::new(&[2.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.0]), // Kalyan (= Lydian)
-        ScaleShape::new(&[1.0, 3.0, 2.0, 2.0, 1.0, 2.0, 1.0]), // Marwa
-        ScaleShape::new(&[1.0, 3.0, 2.0, 1.0, 1.0, 3.0, 1.0]), // Purvi
-        ScaleShape::new(&[1.0, 2.0, 3.0, 1.0, 1.0, 3.0, 1.0]), // Todi
-        ScaleShape::new(&[1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 2.0]), // Locrian
-        ScaleShape::new(&[2.0, 1.0, 2.0, 2.0, 1.0, 3.0, 1.0]), // Kirwani (= harmonic minor: komal Ga & Dha, shuddh Ni)
-        ScaleShape::new(&[2.0, 2.0, 3.0, 2.0, 3.0]),           // Major pentatonic
-        ScaleShape::new(&[3.0, 2.0, 2.0, 3.0, 2.0]),           // Minor pentatonic
-        ScaleShape::new(&[1.0; 12]),                           // Chromatic (all 12 keys lit)
-        // Bilawal in shrutis (22-slot grid) — same swaras as 12-TET Bilawal, widths in shruti-counts
-        ScaleShape::new(&[3.0, 2.0, 4.0, 4.0, 3.0, 2.0, 4.0]),
-    ]
+fn scale_catalogue() -> Vec<(ScaleIntervals, u32)> {
+    // (tooth-widths, the grid N they close). from_widths drops the closing
+    // width, so we keep N alongside to filter on the active tuning.
+    const ENTRIES: &[&[u32]] = &[
+        &[2, 2, 1, 2, 2, 2, 1], // Bilawal (= Major)
+        &[2, 2, 1, 2, 2, 1, 2], // Khamaj
+        &[2, 1, 2, 2, 2, 1, 2], // Kafi
+        &[2, 1, 2, 2, 1, 2, 2], // Asavari
+        &[1, 2, 2, 2, 1, 2, 2], // Bhairavi
+        &[1, 3, 1, 2, 1, 3, 1], // Bhairav
+        &[2, 2, 2, 1, 2, 2, 1], // Kalyan (= Lydian)
+        &[1, 3, 2, 2, 1, 2, 1], // Marwa
+        &[1, 3, 2, 1, 1, 3, 1], // Purvi
+        &[1, 2, 3, 1, 1, 3, 1], // Todi
+        &[1, 2, 2, 1, 2, 2, 2], // Locrian
+        &[2, 1, 2, 2, 1, 3, 1], // Kirwani (= harmonic minor: komal Ga & Dha, shuddh Ni)
+        &[2, 2, 3, 2, 3],       // Major pentatonic
+        &[3, 2, 2, 3, 2],       // Minor pentatonic
+        &[1; 12],               // Chromatic (all 12 slots lit)
+        // Bilawal in shrutis (22-slot grid) — same swaras as 12-TET Bilawal.
+        &[3, 2, 4, 4, 3, 2, 4],
+    ];
+    ENTRIES
+        .iter()
+        .map(|w| (ScaleIntervals::from_widths(w), w.iter().sum()))
+        .collect()
 }
 
 #[cfg(test)]
 mod catalogue_tests {
     use super::*;
-    use domain_ports::music::{harmonium_key, Tonality, Tuning, TuningKind, TuningSpec};
+    use domain_ports::tuning::{TuningKind, ORIGIN};
 
     #[test]
     fn catalogue_has_16_shapes() {
@@ -522,50 +523,34 @@ mod catalogue_tests {
     #[test]
     fn catalogue_shapes_fit_their_respective_octave_divisions() {
         let cat = scale_catalogue();
-        let mut count_12 = 0usize;
-        let mut count_22 = 0usize;
-        for (i, shape) in cat.iter().enumerate() {
-            let fits_12 = shape.well_formed(12);
-            let fits_22 = shape.well_formed(22);
+        let count_12 = cat.iter().filter(|(_, n)| *n == 12).count();
+        let count_22 = cat.iter().filter(|(_, n)| *n == 22).count();
+        for (i, (_, n)) in cat.iter().enumerate() {
             assert!(
-                fits_12 || fits_22,
-                "shape {i} widths {:?} fits neither 12 nor 22",
-                shape.widths()
+                *n == 12 || *n == 22,
+                "entry {i} grid {n} is neither 12 nor 22"
             );
-            if fits_12 {
-                count_12 += 1;
-            }
-            if fits_22 {
-                count_22 += 1;
-            }
         }
-        assert_eq!(count_12, 15, "expected 15 shapes well-formed for N=12");
-        assert_eq!(count_22, 1, "expected exactly 1 shape well-formed for N=22");
+        assert_eq!(count_12, 15, "expected 15 shapes on the 12-slot grid");
+        assert_eq!(count_22, 1, "expected exactly 1 shape on the 22-slot grid");
     }
 
     #[test]
     fn catalogue_shapes_are_all_distinct() {
+        // Distinct within a grid: two different grids may share a mask
+        // (Bilawal's 12-mask differs from its 22-mask, but in general the
+        // (mask, grid) pair is the identity).
         let cat = scale_catalogue();
         for i in 0..cat.len() {
             for j in (i + 1)..cat.len() {
-                assert_ne!(
-                    cat[i], cat[j],
-                    "shapes {i} and {j} are identical (dedup violation)"
-                );
+                assert_ne!(cat[i], cat[j], "entries {i} and {j} are identical");
             }
         }
     }
 
-    fn tuning_with_kind(kind: TuningKind) -> Tuning {
-        Tuning::new(TuningSpec {
-            root_note_hz: 261.625_56,
-            kind,
-            root: harmonium_key(0.0),
-        })
-    }
-
-    fn bilawal_tonality() -> Tonality {
-        Tonality::new(harmonium_key(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0, 2.0, 1.0])
+    /// The slot count `n` a kind yields, via its intervals.
+    fn n_of(kind: TuningKind) -> usize {
+        kind.intervals().len()
     }
 
     #[test]
@@ -576,9 +561,6 @@ mod catalogue_tests {
             15,
             "12-slot tuning must yield 15 catalogue shapes"
         );
-        for (i, s) in shapes.iter().enumerate() {
-            assert!(s.well_formed(12), "shape {i} must be well-formed for N=12");
-        }
     }
 
     #[test]
@@ -589,7 +571,6 @@ mod catalogue_tests {
             1,
             "22-slot tuning must yield exactly 1 catalogue shape"
         );
-        assert!(shapes[0].well_formed(22));
     }
 
     #[test]
@@ -602,15 +583,11 @@ mod catalogue_tests {
 
     #[test]
     fn scales_for_reads_n_from_tuning() {
-        // Verify that the Tuning::n() → scales_for path works end-to-end
-        // for both supported octave sizes.
-        let t12 = tuning_with_kind(TuningKind::TwelveTet);
-        assert_eq!(scales_for(Some(t12.n() as u8)).len(), 15);
-
-        let t22 = tuning_with_kind(TuningKind::TwentyTwoShruti);
-        assert_eq!(scales_for(Some(t22.n() as u8)).len(), 1);
-
-        // Tonality is well-formed against its own tuning — sanity check.
-        assert!(bilawal_tonality().well_formed(t12.n() as u8));
+        // The kind → slot-count → scales_for path works for both grids.
+        assert_eq!(scales_for(Some(n_of(TuningKind::TwelveTet))).len(), 15);
+        assert_eq!(scales_for(Some(n_of(TuningKind::TwentyTwoShruti))).len(), 1);
+        // Sanity: ORIGIN is reachable (keeps the import meaningful for the
+        // resolve-based capture path the head exercises).
+        let _ = ORIGIN;
     }
 }

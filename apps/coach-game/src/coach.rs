@@ -8,9 +8,11 @@
 
 use crate::state::{KnownDevices, KnownScales};
 use bevy::prelude::*;
-use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, MusicInfo};
+use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, MusicInfo};
 use domain_ports::clock::Clock;
+use domain_ports::pitch::PitchLog2;
 use domain_ports::telemetry::Telemetry;
+use domain_ports::tuning::Tuning;
 use std::sync::Arc;
 
 pub struct Coach(pub Box<dyn AppCoach>);
@@ -28,15 +30,40 @@ pub struct Coach(pub Box<dyn AppCoach>);
 #[derive(Resource, Default)]
 pub struct MusicInfoRes(pub Option<MusicInfo>);
 
-/// The head-side **read model** for the latest live feature snapshot
-/// (`f0`, onset, breath, vibrato). Polled from the coach every tick by
+/// The game-side live features: the port's `FeatureSnapshot` with `f0`
+/// already lifted out of raw Hz into a [`PitchLog2`] (`None` = unvoiced,
+/// retiring the port's `f0_hz == 0.0` sentinel). The Hz→pitch conversion
+/// happens **once**, at the poll seam in [`drain_events`], so no game
+/// system below ever touches a raw frequency — they read a `PitchLog2`
+/// and feed it straight into the scale geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Features {
+    /// The detected pitch, or `None` when the frame is unvoiced (silence,
+    /// breath, noise — the port's `f0_hz <= 0.0`).
+    pub pitch: Option<PitchLog2>,
+    /// YIN periodicity confidence, `0.0..=1.0` (carried through verbatim).
+    pub confidence: f32,
+    /// Onset detector output (positive on attack).
+    pub onset: f32,
+    /// Breath / aspiration energy estimate.
+    pub breath: f32,
+    /// Vibrato rate in Hz over the recent window.
+    pub vibrato_rate: f32,
+    /// Vibrato depth in semitones.
+    pub vibrato_depth: f32,
+    /// Snapshot timestamp in ms (for de-duping repeats between polls).
+    pub t_ms: u64,
+}
+
+/// The head-side **read model** for the latest live [`Features`] (`pitch`,
+/// onset, breath, vibrato). Polled from the coach every tick by
 /// [`drain_events`] and republished here so UI systems read a plain
 /// `Res<LatestFeatures>` instead of holding the [`Coach`] handle.
 ///
 /// Unlike [`MusicInfoRes`] this is a high-rate poll (no per-sample
 /// event), so it refreshes every frame rather than on an event.
 #[derive(Resource, Default)]
-pub struct LatestFeatures(pub Option<FeatureSnapshot>);
+pub struct LatestFeatures(pub Option<Features>);
 
 pub fn spawn_coach(world: &mut World) {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
@@ -109,28 +136,31 @@ pub fn drain_events(
             CoachEvent::DefaultInputChanged { .. } => {}
             // The musical frame was (re)configured. Pull the fresh
             // snapshot and republish it for the UI to read.
-            CoachEvent::SessionConfigured { tuning, tonality } => {
-                // Compact one-liner: the `Tonality` Debug dumps all 32 width
-                // slots (mostly 0-terminator padding), so format the active
-                // ones by hand instead.
-                let widths = tonality
-                    .widths()
-                    .iter()
-                    .map(|w| format!("{:.0}", w.0))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            CoachEvent::SessionConfigured { scale } => {
+                // Compact one-liner: log Sa's pitch, the slot count, and the
+                // in-scale degrees rather than dumping the whole `Scale`.
                 info!(
-                    "session configured: {:?} {:.0}Hz root={:.0} / tonic={:.0} [{}]",
-                    tuning.kind,
-                    tuning.root_note_hz,
-                    tuning.root.offset,
-                    tonality.tonic.offset,
-                    widths,
+                    "session configured: Sa={:.0}Hz on {}-slot grid, degrees {:?}",
+                    scale.pitch_at(0).to_hz(),
+                    scale.tuning().len(),
+                    scale.intervals().degree_slots(),
                 );
                 music.0 = coach.0.music_info();
             }
         }
     }
-    // Live features have no per-sample event — poll each tick.
-    features.0 = coach.0.latest_features();
+    // Live features have no per-sample event — poll each tick. This is the
+    // one seam where the game lifts f0 out of raw Hz: the port's snapshot
+    // carries `f0_hz` (DSP's native unit), and we convert to PitchLog2 here
+    // so no system below ever sees a frequency. The `f0_hz <= 0.0`
+    // unvoiced sentinel becomes `pitch: None`.
+    features.0 = coach.0.latest_features().map(|s| Features {
+        pitch: (s.f0_hz > 0.0).then(|| PitchLog2::from_hz(s.f0_hz)),
+        confidence: s.confidence,
+        onset: s.onset,
+        breath: s.breath,
+        vibrato_rate: s.vibrato_rate,
+        vibrato_depth: s.vibrato_depth,
+        t_ms: s.t_ms,
+    });
 }

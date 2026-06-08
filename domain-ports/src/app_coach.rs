@@ -22,8 +22,6 @@
 //!
 //! The boundary is deliberately FFI-friendly.
 //!
-//! See `docs/SPEC-AppCoach.md` for the full design context.
-//!
 //! # Sealed subsystem
 //!
 //! Once constructed, the coach is sealed: it owns its internal
@@ -34,7 +32,7 @@
 use crate::audio_capture::AudioCapture;
 use crate::audio_devices::{AudioDevices, DeviceId, InputDevice};
 use crate::clock::Clock;
-use crate::music::{ScaleShape, Tonality, TuningSpec};
+use crate::scale::{Scale, ScaleIntervals};
 use crate::telemetry::Telemetry;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +73,7 @@ pub enum Command {
     /// Enumerate the built-in scale shapes the coach can coach against.
     /// The coach replies with [`CoachEvent::ScalesListed`].
     ///
-    /// The response is a flat catalogue of [`ScaleShape`]s — interval
+    /// The response is a flat catalogue of [`ScaleIntervals`] — tooth
     /// patterns only, no names. Names are the deferred note-system axis
     /// (see `docs/MUSIC_MODEL.md`); the coach is vocabulary-free.
     ListScales,
@@ -93,10 +91,16 @@ pub enum Command {
     /// `Starting → Stopping → Idle` with no spurious `Running` flash.
     StopSession,
 
-    /// Set the *musical* frame of reference: how the instrument is tuned
-    /// and which scale the singer is in. The coach builds a
-    /// [`Tuning`](crate::music::Tuning) from `tuning` and holds it with
-    /// `tonality` as the reference for judging pitch.
+    /// Set the *musical* frame of reference: the [`Scale`] the singer is
+    /// in — a tooth pattern dropped onto a concrete tuning at a concrete
+    /// register, both motions of the tonic resolved. The coach holds it as
+    /// the reference for judging pitch.
+    ///
+    /// The whole frame is one flat [`Scale`] value: it owns the
+    /// [`ScaleIntervals`] (which grooves are degrees), the rotated tuning
+    /// (which groove is Sa, and the reference-pitch rotation under it), and
+    /// the octave (Sa's register). There is no separate tuning/tonality
+    /// split — the geometry layer folds both into `Scale`.
     ///
     /// **Decoupled from the audio lifecycle.** Valid in *any* state and
     /// causes **no** [`SessionState`] change: the musical lifecycle
@@ -111,10 +115,7 @@ pub enum Command {
     /// snapshot/event pair of one transition (snapshot written first).
     /// A head can read current state via the snapshot or fold the event
     /// stream to reconstruct it; the two never drift.
-    ConfigureSession {
-        tuning: TuningSpec,
-        tonality: Tonality,
-    },
+    ConfigureSession { scale: Scale },
 }
 
 /// Negotiated parameters of the currently-running session.
@@ -148,7 +149,7 @@ pub struct AudioInfo {
 
 /// What the host wants to capture from — the *audio* parameters of a
 /// session (device + stream format). Distinct from the *musical*
-/// configuration of a session (tuning + tonality), which is carried by
+/// configuration of a session (the [`Scale`]), which is carried by
 /// [`Command::ConfigureSession`] and is decoupled from the audio
 /// lifecycle.
 pub struct AudioConfig {
@@ -173,14 +174,15 @@ pub struct AudioConfig {
 }
 
 /// The coach's current *musical* frame of reference — the snapshot
-/// face of [`Command::ConfigureSession`].
+/// face of [`Command::ConfigureSession`]. Carries the configured
+/// [`Scale`] directly.
 ///
 /// This is the materialized read-cache of the musical config: a head
-/// that just wants "what tuning + scale is the coach holding right
-/// now?" reads [`AppCoach::music_info`]; a head doing event-sourcing
-/// folds the [`CoachEvent::SessionConfigured`] stream to the same
-/// value. Both are written in the same place (the configure handler),
-/// snapshot before event, so they cannot drift.
+/// that just wants "what scale is the coach holding right now?" reads
+/// [`AppCoach::music_info`]; a head doing event-sourcing folds the
+/// [`CoachEvent::SessionConfigured`] stream to the same value. Both are
+/// written in the same place (the configure handler), snapshot before
+/// event, so they cannot drift.
 ///
 /// **Lifecycle:** `None` only before the first `ConfigureSession`.
 /// Once set it is **sticky** — it persists across start/stop/error,
@@ -188,13 +190,12 @@ pub struct AudioConfig {
 /// lifecycle (unlike [`AudioInfo`], which clears on stop). Each
 /// configure overwrites it last-write-wins.
 ///
-/// Carries [`TuningSpec`] (flat/`Copy`), not the `Vec`-bearing
-/// [`Tuning`](crate::music::Tuning): the snapshot stays FFI-friendly,
-/// and a head wanting Hz rebuilds the `Tuning` from the spec itself.
+/// Flat and `Copy` ([`Scale`] is itself flat), so the snapshot stays
+/// FFI-friendly: the dial reads ticks, needle, and lit degrees straight
+/// off the `Scale` with no rebuild.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MusicInfo {
-    pub tuning: TuningSpec,
-    pub tonality: Tonality,
+    pub scale: Scale,
 }
 
 // ---------------------------------------------------------------------
@@ -209,11 +210,11 @@ pub enum CoachEvent {
     DevicesListed { devices: Vec<InputDevice> },
 
     /// Reply to [`Command::ListScales`]. Carries the full built-in
-    /// catalogue of [`ScaleShape`]s — interval patterns only, no names.
+    /// catalogue of [`ScaleIntervals`] — tooth patterns only, no names.
     /// Names are the deferred note-system axis (see
     /// `docs/MUSIC_MODEL.md`); the catalogue here is vocabulary-free
     /// and stable across any note-system choice.
-    ScalesListed { shapes: Vec<ScaleShape> },
+    ScalesListed { shapes: Vec<ScaleIntervals> },
 
     /// The session state machine moved.
     SessionStateChanged { new_state: SessionState },
@@ -224,10 +225,7 @@ pub enum CoachEvent {
     /// this is the log entry whose fold reconstructs
     /// [`AppCoach::music_info`]. Emitted on *every* configure (not just
     /// the first), independent of the audio lifecycle.
-    SessionConfigured {
-        tuning: TuningSpec,
-        tonality: Tonality,
-    },
+    SessionConfigured { scale: Scale },
 
     /// Accompanies an `→ Error` transition with detail. `kind` lets
     /// heads branch / localize; `reason` is free-form for logs.
@@ -415,9 +413,8 @@ pub trait AppCoach {
     /// envelope step size). Cheap enough to call every frame.
     fn audio_info(&self) -> Option<AudioInfo>;
 
-    /// The coach's current musical frame of reference (tuning +
-    /// tonality), or `None` before the first
-    /// [`Command::ConfigureSession`].
+    /// The coach's current musical frame of reference (the [`Scale`]),
+    /// or `None` before the first [`Command::ConfigureSession`].
     ///
     /// Unlike [`audio_info`](Self::audio_info), this is **sticky**: it
     /// survives start/stop/error because the musical config is
