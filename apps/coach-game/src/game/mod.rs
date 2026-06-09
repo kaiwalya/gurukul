@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
 
 #[derive(Resource, Default)]
-pub struct LastFeatureTs(u64);
+pub struct LastFeatureHop(Option<u64>);
 
 pub fn on_enter(
     coach: NonSend<Coach>,
@@ -38,9 +38,9 @@ pub fn on_enter(
     has_paused.0 = false;
 }
 
-pub fn on_exit(coach: NonSend<Coach>, mut last: ResMut<LastFeatureTs>) {
+pub fn on_exit(coach: NonSend<Coach>, mut last: ResMut<LastFeatureHop>) {
     coach.0.send_command(Command::StopSession);
-    last.0 = 0;
+    last.0 = None;
 }
 
 /// Esc in InGame → Paused (stops session via OnEnter(Paused)). Marks
@@ -63,8 +63,9 @@ pub fn handle_esc_paused(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextS
     }
 }
 
-pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureTs>) {
+pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureHop>) {
     let Some(Features {
+        hop_index,
         pitch,
         confidence,
         onset,
@@ -76,10 +77,10 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureT
     else {
         return;
     };
-    if t_ms == last.0 {
+    if last.0 == Some(hop_index) {
         return;
     }
-    last.0 = t_ms;
+    last.0 = Some(hop_index);
     // Debug log renders Hz for human eyes — the one place the game prints a
     // frequency. `pitch` is already a PitchLog2; `None` is unvoiced.
     let f0_str = match pitch {
@@ -88,6 +89,6 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureT
     };
     let onset_marker = if onset > 0.0 { "•" } else { " " };
     info!(
-        "t={t_ms:>8}ms  f0 {f0_str}  conf {confidence:>4.2}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>4.2}st  {onset_marker}"
+        "hop={hop_index:>8}  t={t_ms:>8}ms  f0 {f0_str}  conf {confidence:>4.2}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>4.2}st  {onset_marker}"
     );
 }

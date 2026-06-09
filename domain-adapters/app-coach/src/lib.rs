@@ -14,8 +14,9 @@
 //!   drained by a worker thread that runs the dsp engine (PitchYin +
 //!   Onset + Breath + Vibrato from [`pitch_world`]) and publishes the
 //!   latest per-hop feature snapshot into an
-//!   `ArcSwap<Option<FeatureSnapshot>>`. Heads sample with
-//!   [`AppCoach::latest_features`].
+//!   `ArcSwap<Option<FeatureSnapshot>>` and appends retained hops to a
+//!   bounded SPSC ring. Heads use [`AppCoach::latest_features`] for the
+//!   current instant and [`AppCoach::drain_features`] for ordered history.
 //!
 //! # Outbound events
 //!
@@ -37,8 +38,8 @@
 //!
 //! - [`control_plane`] — the thread, the [`Input`](control_plane::Input)
 //!   enum, and the session state machine.
-//! - [`data_plane`] — the worker thread, SPSC ring, and ArcSwap
-//!   publisher.
+//! - [`data_plane`] — the worker thread, audio/feature SPSC rings, and
+//!   ArcSwap publisher.
 //! - [`pitch_world`] — builds the dsp engine from the embedded
 //!   `coach.json` world.
 //! - [`outbound`] — the bounded outbound queue.
@@ -56,7 +57,7 @@ mod outbound;
 mod pitch_world;
 mod shutdown;
 
-use control_plane::{ControlPlane, Input};
+use control_plane::{ControlPlane, FeaturePublishers, Input};
 use inspect::{EngineInspectImpl, InspectShared};
 use outbound::OutboundQueue;
 use shutdown::join_with_timeout;
@@ -67,6 +68,10 @@ use domain_ports::app_coach::{
     ShutdownResult,
 };
 use domain_ports::engine_inspect::EngineInspect;
+use rtrb::{Consumer, RingBuffer};
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -101,6 +106,8 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let feature_publisher_for_thread = Arc::clone(&feature_publisher);
+    let (feature_producer, feature_consumer) =
+        RingBuffer::<FeatureSnapshot>::new(data_plane::FEATURE_RING_CAPACITY);
     let audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>> =
         Arc::new(ArcSwap::from_pointee(None));
     let audio_info_publisher_for_thread = Arc::clone(&audio_info_publisher);
@@ -117,7 +124,10 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
                 deps,
                 outbound_for_thread,
                 rx_cmd,
-                feature_publisher_for_thread,
+                FeaturePublishers {
+                    latest: feature_publisher_for_thread,
+                    history: feature_producer,
+                },
                 audio_info_publisher_for_thread,
                 music_info_publisher_for_thread,
                 inspect_for_thread,
@@ -130,10 +140,12 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
         tx_cmd: Mutex::new(Some(tx_cmd)),
         outbound,
         feature_publisher,
+        feature_consumer: RefCell::new(feature_consumer),
         audio_info_publisher,
         music_info_publisher,
         control_thread: Mutex::new(Some(control_thread)),
         shut_down: Mutex::new(false),
+        thread_affinity: PhantomData,
     };
     let inspect: Arc<dyn EngineInspect> = Arc::new(EngineInspectImpl {
         shared: inspect_shared,
@@ -156,6 +168,10 @@ struct CoachImpl {
     /// before the first snapshot lands (no session running, first
     /// window still filling, etc.).
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+    /// Ordered retained feature hops. `AppCoach` is thread-affine, so
+    /// single-thread interior mutability is sufficient for the consumer's
+    /// `&mut self` pop API without adding a lock.
+    feature_consumer: RefCell<Consumer<FeatureSnapshot>>,
     /// Lock-free snapshot of the negotiated session parameters. Written
     /// by the control plane before emitting `SessionStateChanged(Running)`
     /// and cleared before the next transition out — see [`AudioInfo`]
@@ -168,6 +184,9 @@ struct CoachImpl {
     music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     shut_down: Mutex<bool>,
+    /// Make the concrete opaque return type honor the port's `!Send`
+    /// thread-affinity contract on every platform.
+    thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl AppCoach for CoachImpl {
@@ -211,12 +230,26 @@ impl AppCoach for CoachImpl {
         **self.feature_publisher.load()
     }
 
+    fn drain_features(&self, out: &mut Vec<FeatureSnapshot>) {
+        let mut consumer = self.feature_consumer.borrow_mut();
+        drain_feature_consumer(&mut consumer, out);
+    }
+
     fn audio_info(&self) -> Option<AudioInfo> {
         (**self.audio_info_publisher.load()).clone()
     }
 
     fn music_info(&self) -> Option<MusicInfo> {
         **self.music_info_publisher.load()
+    }
+}
+
+fn drain_feature_consumer(
+    consumer: &mut Consumer<FeatureSnapshot>,
+    out: &mut Vec<FeatureSnapshot>,
+) {
+    while let Ok(snapshot) = consumer.pop() {
+        out.push(snapshot);
     }
 }
 
@@ -309,6 +342,7 @@ mod tests {
     enum FakeOutcome {
         Ok,
         FailUnsupported,
+        FailOnceThenOk,
     }
 
     impl AudioCapture for FakeCapture {
@@ -318,12 +352,16 @@ mod tests {
             _cfg: CaptureConfig,
             _on_frame: CaptureCallback,
         ) -> Result<CaptureSession, CaptureError> {
-            self.opens.fetch_add(1, Ordering::SeqCst);
-            match self.outcome {
-                FakeOutcome::Ok => Ok(CaptureSession::new(|| {})),
-                FakeOutcome::FailUnsupported => Err(CaptureError::UnsupportedConfig {
-                    reason: "test".into(),
-                }),
+            let open_index = self.opens.fetch_add(1, Ordering::SeqCst);
+            match (&self.outcome, open_index) {
+                (FakeOutcome::Ok, _) | (FakeOutcome::FailOnceThenOk, 1..) => {
+                    Ok(CaptureSession::new(|| {}))
+                }
+                (FakeOutcome::FailUnsupported | FakeOutcome::FailOnceThenOk, _) => {
+                    Err(CaptureError::UnsupportedConfig {
+                        reason: "test".into(),
+                    })
+                }
             }
         }
     }
@@ -382,6 +420,38 @@ mod tests {
     }
 
     // ---- tests ----
+
+    fn feature(hop_index: u64, t_ms: u64) -> FeatureSnapshot {
+        FeatureSnapshot {
+            hop_index,
+            f0_hz: 440.0,
+            confidence: 1.0,
+            onset: 0.0,
+            breath: 0.0,
+            vibrato_rate: 0.0,
+            vibrato_depth: 0.0,
+            t_ms,
+        }
+    }
+
+    #[test]
+    fn drain_features_appends_every_pending_snapshot_in_order() {
+        let (mut producer, mut consumer) = RingBuffer::new(4);
+        producer.push(feature(0, 7)).unwrap();
+        producer.push(feature(1, 7)).unwrap();
+        let prefix = feature(99, 1);
+        let mut out = vec![prefix];
+
+        drain_feature_consumer(&mut consumer, &mut out);
+
+        assert_eq!(out, vec![prefix, feature(0, 7), feature(1, 7)]);
+        drain_feature_consumer(&mut consumer, &mut out);
+        assert_eq!(
+            out,
+            vec![prefix, feature(0, 7), feature(1, 7)],
+            "a second drain appends nothing when no snapshots are pending"
+        );
+    }
 
     #[test]
     fn list_devices_round_trip() {
@@ -780,6 +850,67 @@ mod tests {
             )
         });
         assert!(saw_error, "should have emitted SessionStateChanged(Error)");
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn capture_open_failure_returns_feature_producer_for_retry() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::FailOnceThenOk, Arc::clone(&opens));
+        let coach = new(deps);
+
+        coach.send_command(Command::StartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+        });
+
+        coach.send_command(Command::StopSession);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Idle
+                    }
+                )
+            })
+        });
+
+        coach.send_command(Command::StartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().all(|e| !matches!(
+                e,
+                CoachEvent::SessionError {
+                    kind: SessionErrorKind::Other,
+                    ..
+                }
+            )),
+            "retry must not fail because the feature producer was lost"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
 
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),

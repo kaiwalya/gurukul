@@ -78,6 +78,7 @@ fn voiced_feature_writes_a_primary_needle_at_expected_angle() {
     set_features(
         &fake,
         Some(FeatureSnapshot {
+            hop_index: 0,
             f0_hz: 440.0,
             confidence: 0.9,
             onset: 0.0,
@@ -110,6 +111,7 @@ fn singing_sa_lands_the_needle_at_north() {
     set_features(
         &fake,
         Some(FeatureSnapshot {
+            hop_index: 0,
             f0_hz: hz_of_degree(0),
             confidence: 0.9,
             onset: 0.0,
@@ -138,6 +140,7 @@ fn unvoiced_feature_yields_no_needle() {
     set_features(
         &fake,
         Some(FeatureSnapshot {
+            hop_index: 0,
             f0_hz: 0.0, // unvoiced
             confidence: 0.0,
             onset: 0.0,
@@ -164,6 +167,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
     set_features(
         &fake,
         Some(FeatureSnapshot {
+            hop_index: 0,
             f0_hz: 261.625_56, // C4
             confidence: 0.9,
             onset: 0.0,
@@ -180,6 +184,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
     set_features(
         &fake,
         Some(FeatureSnapshot {
+            hop_index: 1,
             f0_hz: 0.0,
             confidence: 0.0,
             onset: 0.0,

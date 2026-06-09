@@ -21,6 +21,7 @@ cargo run -p dsp-bench -- describe-node <name>         # ports and parameters
 cargo run -p dsp-bench -- validate dsp/worlds/hello.json
 cargo run -p dsp-bench -- run dsp/worlds/hello.json --duration 2s --dump-events <port>
 cargo run -p dsp-bench -- render dsp/worlds/hello.json | dot -Tsvg > graph.svg
+cargo test --workspace --release                      # full test suite
 ```
 
 See [`dsp/worlds/hello.json`](dsp/worlds/hello.json) for the canonical demo graph — hand-edit it to rewire, add, or remove nodes.

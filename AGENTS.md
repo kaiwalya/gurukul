@@ -27,6 +27,5 @@ Corollary: **no per-directory `README.md`.** Code + tool output is the authorita
 
 ## Conventions
 
-- Run `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` clean before committing. Don't skip hooks.
-- Never create documentation files unless explicitly asked. This includes per-crate READMEs, design docs, and summary files.
+- Run `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace --release` clean before committing. The DSP sweeps are prohibitively slow in the debug profile. Don't skip hooks.
 - Commit messages: short imperative subject, body explains *why*. Use multi-line HEREDOCs for formatting (see recent history).

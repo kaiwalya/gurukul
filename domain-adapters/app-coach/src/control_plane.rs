@@ -40,6 +40,11 @@ pub(crate) enum Input {
     Quit,
 }
 
+pub(crate) struct FeaturePublishers {
+    pub(crate) latest: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+    pub(crate) history: rtrb::Producer<FeatureSnapshot>,
+}
+
 pub(crate) struct ControlPlane {
     deps: AppCoachDeps,
     outbound: Arc<Mutex<OutboundQueue>>,
@@ -80,6 +85,9 @@ pub(crate) struct ControlPlane {
     /// the SPSC ring's worker-side consumer. The producer half lives
     /// inside the capture callback.
     data_plane: Option<DataPlane>,
+    /// Persistent producer for the ordered feature queue. Loaned to the
+    /// active data-plane worker and returned when that worker joins.
+    feature_producer: Option<rtrb::Producer<FeatureSnapshot>>,
 }
 
 impl ControlPlane {
@@ -87,7 +95,7 @@ impl ControlPlane {
         deps: AppCoachDeps,
         outbound: Arc<Mutex<OutboundQueue>>,
         rx: mpsc::Receiver<Input>,
-        feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
+        feature_publishers: FeaturePublishers,
         audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
         music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
         inspect: Arc<InspectShared>,
@@ -96,7 +104,7 @@ impl ControlPlane {
             deps,
             outbound,
             rx,
-            feature_publisher,
+            feature_publisher: feature_publishers.latest,
             audio_info_publisher,
             music_info_publisher,
             inspect,
@@ -104,6 +112,7 @@ impl ControlPlane {
             session_model: None,
             capture: None,
             data_plane: None,
+            feature_producer: Some(feature_publishers.history),
         }
     }
 
@@ -135,7 +144,7 @@ impl ControlPlane {
             drop(session);
         }
         if let Some(dp) = self.data_plane.take() {
-            dp.stop(&*self.deps.telemetry);
+            let _ = dp.stop(&*self.deps.telemetry);
         }
         // Clear any stale reading so a head polling after shutdown
         // sees `None` instead of the last-known f0 / session info.
@@ -219,13 +228,16 @@ impl ControlPlane {
         // Spawn the data plane first so its ring producer is in hand
         // before cpal can fire the callback. If engine build / thread
         // spawn fails we surface as Other and skip opening the device.
-        let startup = match DataPlane::start(DataPlaneDeps {
-            sample_rate,
-            feature_publisher: Arc::clone(&self.feature_publisher),
-            clock: Arc::clone(&self.deps.clock),
-            telemetry: Arc::clone(&self.deps.telemetry),
-            inspect: Arc::clone(&self.inspect),
-        }) {
+        let startup = match DataPlane::start(
+            DataPlaneDeps {
+                sample_rate,
+                feature_publisher: Arc::clone(&self.feature_publisher),
+                clock: Arc::clone(&self.deps.clock),
+                telemetry: Arc::clone(&self.deps.telemetry),
+                inspect: Arc::clone(&self.inspect),
+            },
+            &mut self.feature_producer,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 self.fail(SessionErrorKind::Other, e.to_string());
@@ -272,7 +284,7 @@ impl ControlPlane {
                 // (with no producer left, since `producer` moved into
                 // the callback which we've now dropped). Stop it so
                 // its worker thread joins before we surface the error.
-                data_plane.stop(&*self.deps.telemetry);
+                self.feature_producer = data_plane.stop(&*self.deps.telemetry);
                 let (kind, reason) = classify_open_error(e);
                 self.fail(kind, reason);
             }
@@ -354,7 +366,7 @@ impl ControlPlane {
             drop(session);
         }
         if let Some(dp) = self.data_plane.take() {
-            dp.stop(&*self.deps.telemetry);
+            self.feature_producer = dp.stop(&*self.deps.telemetry);
         }
         self.feature_publisher.store(Arc::new(None));
         // Clear the inspect publishers so the head's debug pane sees

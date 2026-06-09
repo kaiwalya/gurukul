@@ -90,7 +90,9 @@ are natural. The unit is a **triple**: `(input, world, expectation)`.
   Expectations live in code, not in the graph: there is no `OracleSink` /
   `AssertNear` / `PassFailReporter` node. This keeps the expectation
   language unbounded (any predicate you can write) without growing a JSON
-  schema, and `cargo test` is the runner — discovery, filtering, CI for free.
+  schema, and `cargo test --release` is the runner — discovery, filtering,
+  CI for free. The DSP sweeps must use the release profile; debug-mode
+  execution is prohibitively slow.
 
 The harness is the `Bench` type in `dsp/bench` (`Bench::mount(world)` or
 `Bench::new(inline_json)` → `.bind(port, source)` → `.capture(wire)` →

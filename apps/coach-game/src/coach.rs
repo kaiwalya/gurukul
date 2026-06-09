@@ -38,6 +38,8 @@ pub struct MusicInfoRes(pub Option<MusicInfo>);
 /// and feed it straight into the scale geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Features {
+    /// Session-local producer sequence used to detect missing hops.
+    pub hop_index: u64,
     /// The detected pitch, or `None` when the frame is unvoiced (silence,
     /// breath, noise — the port's `f0_hz <= 0.0`).
     pub pitch: Option<PitchLog2>,
@@ -51,7 +53,7 @@ pub struct Features {
     pub vibrato_rate: f32,
     /// Vibrato depth in semitones.
     pub vibrato_depth: f32,
-    /// Snapshot timestamp in ms (for de-duping repeats between polls).
+    /// Snapshot timestamp in ms for time-axis placement.
     pub t_ms: u64,
 }
 
@@ -155,6 +157,7 @@ pub fn drain_events(
     // so no system below ever sees a frequency. The `f0_hz <= 0.0`
     // unvoiced sentinel becomes `pitch: None`.
     features.0 = coach.0.latest_features().map(|s| Features {
+        hop_index: s.hop_index,
         pitch: (s.f0_hz > 0.0).then(|| PitchLog2::from_hz(s.f0_hz)),
         confidence: s.confidence,
         onset: s.onset,

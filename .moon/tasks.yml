@@ -8,7 +8,7 @@ tasks:
       - 'Cargo.toml'
 
   test:
-    command: 'cargo test -p $project'
+    command: 'cargo test --release -p $project'
     inputs:
       - 'src/**/*.rs'
       - 'tests/**/*.rs'

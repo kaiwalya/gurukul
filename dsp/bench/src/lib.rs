@@ -8,7 +8,7 @@
 //! world, or a constant) and records the wires named via [`Bench::capture`] /
 //! [`Bench::capture_out`]. Expectations are ordinary Rust `assert!`s over the
 //! returned [`Captured`] — there is no expectation DSL and no in-graph assert
-//! node. `cargo test` is the runner.
+//! node. `cargo test --release` is the runner.
 //!
 //! ```no_run
 //! use dsp_bench::{Bench, Source, Run};

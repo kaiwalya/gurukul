@@ -16,9 +16,9 @@
 //!                                        │ engine.in_port(mic).copy_from(...)
 //!                                        │ engine.process_block(BLOCK_FRAMES)
 //!                                        │ read pitch/onset/breath/vibrato out-ports
-//!                                        │ publisher.store(Some(snapshot))
+//!                                        │ publish latest + queued snapshot
 //!                                        ▼
-//!                                   head: coach.latest_features()
+//!                            head: latest_features / drain_features
 //! ```
 //!
 //! # Block-size discipline
@@ -33,8 +33,9 @@
 //! The RT-side `push_samples` only touches the ring producer, which
 //! allocates nothing and never blocks. On ring full it drops samples
 //! and counts them (logged at WARN, but only by the worker — never
-//! the RT thread). The worker side allocates only at construction
-//! (engine build, ringbuffer alloc); the hot loop is alloc-free.
+//! the RT thread). The ordered-history ring push is also allocation-free.
+//! Publishing the latest value through `ArcSwap` allocates an `Arc` per
+//! hop; that worker-thread cost is intentionally outside the RT callback.
 
 use crate::pitch_world::build_pitch_engine;
 use arc_swap::ArcSwap;
@@ -44,6 +45,7 @@ use domain_ports::telemetry::Telemetry;
 use domain_ports::{tel_info, tel_warn};
 use engine::{Engine, InPortHandle, OutPortHandle};
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -56,13 +58,17 @@ pub(crate) const BLOCK_FRAMES: usize = 512;
 /// than any reasonable cpal buffer + worker scheduling jitter.
 const RING_CAPACITY: usize = 4096;
 
+/// Ordered feature snapshots retained for the head. At ~85 hops/s this
+/// absorbs roughly three seconds without a drain.
+pub(crate) const FEATURE_RING_CAPACITY: usize = 256;
+
 // ---------------------------------------------------------------------
 // Public: spawn / teardown
 // ---------------------------------------------------------------------
 
 pub(crate) struct DataPlane {
     quit: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<WorkerExit>>,
     /// Count of samples the RT side had to drop because the worker
     /// fell behind. Inspected on shutdown for a single summary log.
     samples_dropped: Arc<AtomicU64>,
@@ -87,8 +93,15 @@ impl DataPlane {
     /// can push samples; the [`DataPlane`] handle is held by the control
     /// plane so it can [`stop`](Self::stop) the worker on session
     /// teardown.
-    pub(crate) fn start(deps: DataPlaneDeps) -> Result<DataPlaneStartup, DataPlaneError> {
+    pub(crate) fn start(
+        deps: DataPlaneDeps,
+        feature_producer: &mut Option<Producer<FeatureSnapshot>>,
+    ) -> Result<DataPlaneStartup, DataPlaneError> {
+        if feature_producer.is_none() {
+            return Err(DataPlaneError::FeatureProducerUnavailable);
+        }
         let (producer, consumer) = RingBuffer::<f32>::new(RING_CAPACITY);
+        let (feature_tx, feature_rx) = std::sync::mpsc::sync_channel(0);
 
         // Build the engine on the *worker* thread, not here — engines
         // hold trait objects that aren't always `Send`, and the
@@ -107,17 +120,36 @@ impl DataPlane {
         let worker = thread::Builder::new()
             .name("app-coach-data".into())
             .spawn(move || {
-                run_worker(WorkerArgs {
-                    consumer,
-                    sample_rate,
-                    quit: quit_for_thread,
-                    feature_publisher,
-                    clock,
-                    telemetry,
-                    inspect,
-                });
+                let feature_producer = feature_rx
+                    .recv()
+                    .expect("feature producer handoff sender dropped");
+                preserve_feature_producer_on_unwind(feature_producer, |feature_producer| {
+                    run_worker(
+                        WorkerArgs {
+                            consumer,
+                            sample_rate,
+                            quit: quit_for_thread,
+                            feature_publisher,
+                            clock,
+                            telemetry,
+                            inspect,
+                        },
+                        feature_producer,
+                    );
+                })
             })
             .map_err(|e| DataPlaneError::Spawn(e.to_string()))?;
+
+        let producer_for_worker = feature_producer
+            .take()
+            .expect("feature producer must be available before data-plane start");
+        if let Err(e) = feature_tx.send(producer_for_worker) {
+            let _ = worker.join();
+            *feature_producer = Some(e.0);
+            return Err(DataPlaneError::Spawn(
+                "data-plane worker exited before feature producer handoff".into(),
+            ));
+        }
 
         Ok(DataPlaneStartup {
             data_plane: Self {
@@ -132,14 +164,24 @@ impl DataPlane {
 
     /// Signal the worker to quit and join it. Idempotent in practice
     /// — the control plane only calls this once per session.
-    pub(crate) fn stop(mut self, telemetry: &dyn Telemetry) {
+    pub(crate) fn stop(mut self, telemetry: &dyn Telemetry) -> Option<Producer<FeatureSnapshot>> {
         self.quit.store(true, Ordering::Release);
-        if let Some(h) = self.worker.take() {
+        let feature_producer = if let Some(h) = self.worker.take() {
             // Worker checks `quit` every iteration of its drain loop
             // (≤BLOCK_FRAMES samples / a few ms), so the join here is
             // bounded even without a deadline.
-            let _ = h.join();
-        }
+            match h.join() {
+                Ok(exit) => {
+                    if exit.panicked {
+                        tel_warn!(telemetry, "data-plane: worker panicked");
+                    }
+                    Some(exit.feature_producer)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let dropped = self.samples_dropped.load(Ordering::Acquire);
         if dropped > 0 {
             tel_warn!(
@@ -148,6 +190,7 @@ impl DataPlane {
                 samples = dropped,
             );
         }
+        feature_producer
     }
 }
 
@@ -163,12 +206,18 @@ pub(crate) struct DataPlaneDeps {
 pub(crate) enum DataPlaneError {
     /// Worker thread failed to spawn (OS resource exhaustion).
     Spawn(String),
+    /// A prior worker failed before returning the persistent feature
+    /// producer, so ordered history cannot be published safely.
+    FeatureProducerUnavailable,
 }
 
 impl std::fmt::Display for DataPlaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(s) => write!(f, "data plane worker spawn failed: {s}"),
+            Self::FeatureProducerUnavailable => {
+                write!(f, "feature history producer unavailable")
+            }
         }
     }
 }
@@ -187,7 +236,26 @@ struct WorkerArgs {
     inspect: Arc<crate::inspect::InspectShared>,
 }
 
-fn run_worker(args: WorkerArgs) {
+struct WorkerExit {
+    feature_producer: Producer<FeatureSnapshot>,
+    panicked: bool,
+}
+
+fn preserve_feature_producer_on_unwind<F>(
+    mut feature_producer: Producer<FeatureSnapshot>,
+    worker: F,
+) -> WorkerExit
+where
+    F: FnOnce(&mut Producer<FeatureSnapshot>),
+{
+    let panicked = catch_unwind(AssertUnwindSafe(|| worker(&mut feature_producer))).is_err();
+    WorkerExit {
+        feature_producer,
+        panicked,
+    }
+}
+
+fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>) {
     let WorkerArgs {
         mut consumer,
         sample_rate,
@@ -244,6 +312,8 @@ fn run_worker(args: WorkerArgs) {
 
     // Monotonic block index. Heads use it to detect missed taps.
     let mut block_seq: u64 = 0;
+    // Session-local sequence for the published feature stream.
+    let mut hop_index: u64 = 0;
 
     while !quit.load(Ordering::Acquire) {
         // Wait until at least one block is available, or quit.
@@ -285,6 +355,7 @@ fn run_worker(args: WorkerArgs) {
         // the f0_hz == 0.0 sentinel. Publishing unvoiced too lets
         // heads detect "alive but silent" vs "stalled".
         let snapshot = FeatureSnapshot {
+            hop_index,
             f0_hz: engine.out_port(ports.pitch)[0],
             confidence: engine.out_port(ports.confidence)[0],
             onset: engine.out_port(ports.onset)[0],
@@ -293,10 +364,19 @@ fn run_worker(args: WorkerArgs) {
             vibrato_depth: engine.out_port(ports.vibrato_depth)[0],
             t_ms: clock.now_ms(),
         };
+        hop_index = hop_index.wrapping_add(1);
         feature_publisher.store(Arc::new(Some(snapshot)));
+        push_feature(feature_producer, snapshot);
     }
 
     tel_info!(&*telemetry, "data-plane: worker down");
+}
+
+/// Retain one ordered feature hop for the head. If the bounded queue is
+/// full, drop the new history sample; the latest-value publisher remains
+/// current. Realtime-safe: no allocation, lock, blocking, or syscall.
+fn push_feature(producer: &mut Producer<FeatureSnapshot>, snapshot: FeatureSnapshot) {
+    let _ = producer.push(snapshot);
 }
 
 struct ResolvedPorts {
@@ -373,6 +453,151 @@ mod tests {
     use domain_ports::telemetry::TestTelemetry;
     use std::time::Instant;
 
+    fn snapshot(hop_index: u64, t_ms: u64) -> FeatureSnapshot {
+        FeatureSnapshot {
+            hop_index,
+            f0_hz: 440.0,
+            confidence: 1.0,
+            onset: 0.0,
+            breath: 0.0,
+            vibrato_rate: 0.0,
+            vibrato_depth: 0.0,
+            t_ms,
+        }
+    }
+
+    #[test]
+    fn feature_queue_round_trips_in_order_without_timestamp_dedup() {
+        let (mut producer, mut consumer) = RingBuffer::new(FEATURE_RING_CAPACITY);
+        for hop_index in 0..8 {
+            push_feature(&mut producer, snapshot(hop_index, 7));
+        }
+
+        let drained: Vec<_> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(drained.len(), 8);
+        assert!(drained.iter().all(|s| s.t_ms == 7));
+        assert_eq!(
+            drained.iter().map(|s| s.hop_index).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn feature_queue_drops_newest_while_latest_keeps_advancing() {
+        let (mut producer, mut consumer) = RingBuffer::new(FEATURE_RING_CAPACITY);
+        let latest = Arc::new(ArcSwap::from_pointee(None));
+        let produced = FEATURE_RING_CAPACITY as u64 + 4;
+
+        for hop_index in 0..produced {
+            let value = snapshot(hop_index, hop_index);
+            latest.store(Arc::new(Some(value)));
+            push_feature(&mut producer, value);
+        }
+
+        let drained: Vec<_> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(drained.len(), FEATURE_RING_CAPACITY);
+        assert_eq!(drained.first().unwrap().hop_index, 0);
+        assert_eq!(
+            drained.last().unwrap().hop_index,
+            FEATURE_RING_CAPACITY as u64 - 1
+        );
+        assert_eq!(
+            latest.load().as_ref().unwrap().hop_index,
+            produced - 1,
+            "latest snapshot must stay fresh while history is full"
+        );
+
+        let after_gap = snapshot(produced, produced);
+        push_feature(&mut producer, after_gap);
+        assert_eq!(
+            consumer.pop().unwrap().hop_index,
+            produced,
+            "the next accepted sample exposes the exact retained-stream gap"
+        );
+    }
+
+    #[test]
+    fn feature_producer_survives_worker_panic() {
+        let (producer, mut consumer) = RingBuffer::new(FEATURE_RING_CAPACITY);
+        let exit = preserve_feature_producer_on_unwind(producer, |_producer| {
+            panic!("forced worker failure");
+        });
+
+        assert!(exit.panicked);
+        let mut producer = exit.feature_producer;
+        push_feature(&mut producer, snapshot(7, 11));
+        assert_eq!(consumer.pop().unwrap(), snapshot(7, 11));
+    }
+
+    #[test]
+    fn feature_producer_is_reused_and_queued_sessions_expose_reset() {
+        const SR: u32 = 48_000;
+
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(11));
+        let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
+        let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+        let (feature_producer, mut feature_consumer) =
+            RingBuffer::<FeatureSnapshot>::new(FEATURE_RING_CAPACITY);
+        let mut feature_producer = Some(feature_producer);
+
+        for _session in 0..2 {
+            feature_publisher.store(Arc::new(None));
+            let DataPlaneStartup {
+                data_plane,
+                mut producer,
+                ..
+            } = DataPlane::start(
+                DataPlaneDeps {
+                    sample_rate: SR,
+                    feature_publisher: Arc::clone(&feature_publisher),
+                    clock: Arc::clone(&clock),
+                    telemetry: Arc::clone(&telemetry),
+                    inspect: crate::inspect::InspectShared::new(),
+                },
+                &mut feature_producer,
+            )
+            .expect("data plane starts");
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            for _ in 0..BLOCK_FRAMES {
+                loop {
+                    if producer.push(0.0).is_ok() {
+                        break;
+                    }
+                    assert!(Instant::now() <= deadline, "audio ring stayed full");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            let published = loop {
+                if let Some(value) = **feature_publisher.load() {
+                    break value;
+                }
+                assert!(
+                    Instant::now() <= deadline,
+                    "worker did not publish a feature snapshot"
+                );
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(published.hop_index, 0, "each session starts at hop zero");
+
+            drop(producer);
+            feature_producer = data_plane.stop(&*telemetry);
+            assert!(
+                feature_producer.is_some(),
+                "worker must return the persistent feature producer"
+            );
+        }
+
+        let retained: Vec<_> = std::iter::from_fn(|| feature_consumer.pop().ok()).collect();
+        assert_eq!(
+            retained.iter().map(|s| s.hop_index).collect::<Vec<_>>(),
+            vec![0, 0],
+            "undrained prior-session history remains ordered before the reset"
+        );
+    }
+
     /// Loopback: synthesise a 440Hz sine, push it through the ring,
     /// and confirm the worker publishes f0 ≈ 440. Covers the seam
     /// between push_samples and the ArcSwap publisher — YIN itself
@@ -386,18 +611,24 @@ mod tests {
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
         let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
             Arc::new(ArcSwap::from_pointee(None));
+        let (feature_producer, _feature_consumer) =
+            RingBuffer::<FeatureSnapshot>::new(FEATURE_RING_CAPACITY);
+        let mut feature_producer = Some(feature_producer);
 
         let DataPlaneStartup {
             data_plane,
             mut producer,
             samples_dropped: dropped,
-        } = DataPlane::start(DataPlaneDeps {
-            sample_rate: SR,
-            feature_publisher: Arc::clone(&feature_publisher),
-            clock,
-            telemetry: Arc::clone(&telemetry),
-            inspect: crate::inspect::InspectShared::new(),
-        })
+        } = DataPlane::start(
+            DataPlaneDeps {
+                sample_rate: SR,
+                feature_publisher: Arc::clone(&feature_publisher),
+                clock,
+                telemetry: Arc::clone(&telemetry),
+                inspect: crate::inspect::InspectShared::new(),
+            },
+            &mut feature_producer,
+        )
         .expect("data plane starts");
 
         // Feed enough audio for YIN to lock: window=2048 must fill,
@@ -452,7 +683,10 @@ mod tests {
         // Tear down cleanly. Drop the producer first so the worker's
         // pop loop sees the channel close; then stop joins the thread.
         drop(producer);
-        data_plane.stop(&*telemetry);
+        assert!(
+            data_plane.stop(&*telemetry).is_some(),
+            "feature producer returns on stop"
+        );
         assert_eq!(dropped.load(Ordering::Acquire), 0, "no drops expected");
     }
 }

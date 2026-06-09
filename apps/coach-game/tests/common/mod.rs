@@ -20,6 +20,8 @@ pub struct FakeCoachState {
     pub commands: Vec<Command>,
     /// Events the next `poll_events` call will hand back, then drain.
     pub pending_events: Vec<CoachEvent>,
+    /// Feature history the next `drain_features` call will hand back.
+    pub pending_features: Vec<FeatureSnapshot>,
     pub latest_features: Option<FeatureSnapshot>,
     pub audio_info: Option<AudioInfo>,
     pub music_info: Option<MusicInfo>,
@@ -48,6 +50,11 @@ impl AppCoach for FakeCoach {
 
     fn latest_features(&self) -> Option<FeatureSnapshot> {
         self.inner.lock().unwrap().latest_features
+    }
+
+    fn drain_features(&self, out: &mut Vec<FeatureSnapshot>) {
+        let mut g = self.inner.lock().unwrap();
+        out.append(&mut g.pending_features);
     }
 
     fn audio_info(&self) -> Option<AudioInfo> {

@@ -47,7 +47,7 @@ pub fn build_app(app: &mut App) {
         .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
-        .init_resource::<game::LastFeatureTs>()
+        .init_resource::<game::LastFeatureHop>()
         .init_resource::<game::hud::LastMusicInfo>()
         .init_resource::<game::scale_picker::ShowingScalePicker>()
         .init_resource::<coach::MusicInfoRes>()

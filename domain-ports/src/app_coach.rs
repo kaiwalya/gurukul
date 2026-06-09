@@ -15,10 +15,14 @@
 //! - [`AppCoach::poll_events`] — drain the outbound event queue.
 //! - [`AppCoach::shutdown`] — synchronously tear down with a timeout.
 //!
-//! Plus [`AppCoach::latest_features`] — a snapshot read for the
-//! firehose of per-hop feature values (pitch, onset, breath,
-//! vibrato). Out-of-band from the event queue because its ~85Hz rate
-//! would saturate the bounded queue.
+//! Plus two reads for the firehose of per-hop feature values (pitch,
+//! onset, breath, vibrato), kept out of the event queue because their
+//! ~85Hz rate would saturate it:
+//!
+//! - [`AppCoach::latest_features`] — the most recent snapshot, for
+//!   instantaneous UI such as the note dial.
+//! - [`AppCoach::drain_features`] — every retained hop in producer
+//!   order, for history UI such as the scrolling time graph.
 //!
 //! The boundary is deliberately FFI-friendly.
 //!
@@ -285,11 +289,10 @@ pub enum SessionErrorKind {
 
 /// Coherent snapshot of every feature the data plane publishes per hop.
 ///
-/// Heads read this via [`AppCoach::latest_features`] on their own
-/// cadence (UI frame rate, log timer, etc.). The data plane publishes
-/// a new snapshot every `hop` samples worth of audio — typically
-/// ~85Hz at 48kHz with a hop of 512 — so heads polling at 60Hz will
-/// see fresh values most ticks and an occasional repeat.
+/// Heads read the latest value via [`AppCoach::latest_features`] or drain
+/// ordered history via [`AppCoach::drain_features`]. The data plane
+/// publishes a new snapshot every `hop` samples worth of audio —
+/// typically ~85Hz at 48kHz with a hop of 512.
 ///
 /// Voicedness is encoded as [`f0_hz == 0.0`](Self::f0_hz): a voiced
 /// frame reports a positive Hz value; an unvoiced frame reports
@@ -300,6 +303,17 @@ pub enum SessionErrorKind {
 /// distinguished sentinel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FeatureSnapshot {
+    /// Session-local monotonic hop sequence. Assigned once for every
+    /// produced feature snapshot, before that same snapshot is published
+    /// to both the latest-value read and the drained-history queue.
+    ///
+    /// Resets to `0` when a new data-plane session starts and may wrap
+    /// naturally. Consumers detect a retained-stream discontinuity when
+    /// the next value is not `previous.wrapping_add(1)`. This is continuity
+    /// metadata, not a timestamp: repeated [`t_ms`](Self::t_ms) values are
+    /// legal when the clock is coarse.
+    pub hop_index: u64,
+
     /// Estimated fundamental frequency, in Hz. `0.0` means unvoiced
     /// (silence, breath, noise — not a frequency the detector
     /// trusts).
@@ -336,9 +350,10 @@ pub struct FeatureSnapshot {
     pub vibrato_depth: f32,
 
     /// Wall-clock milliseconds (from the coach's [`Clock`]) at which
-    /// this snapshot was published. Heads use this to detect
-    /// staleness — if `t_ms` hasn't advanced between two polls, the
-    /// data plane is stalled.
+    /// this snapshot was published. Useful for placing samples on a
+    /// time axis, but not for continuity: coarse clocks may assign the
+    /// same value to consecutive hops. Use [`hop_index`](Self::hop_index)
+    /// to distinguish a repeated poll from a newly-produced hop.
     pub t_ms: u64,
 }
 
@@ -399,6 +414,20 @@ pub trait AppCoach {
     /// cadence — there is no event for feature updates because the
     /// rate (~85Hz) would saturate the bounded event queue.
     fn latest_features(&self) -> Option<FeatureSnapshot>;
+
+    /// Drain retained feature snapshots into `out`, in producer order.
+    ///
+    /// Non-blocking and lock-free. Appends every snapshot currently
+    /// pending and returns immediately. Repeated timestamps are preserved;
+    /// consumers use [`FeatureSnapshot::hop_index`] rather than `t_ms` to
+    /// detect discontinuities.
+    ///
+    /// The queue is bounded. If the consumer stalls long enough to fill it,
+    /// newly produced history snapshots may be dropped while
+    /// [`latest_features`](Self::latest_features) continues advancing.
+    /// Undrained snapshots survive a session restart; the next session is
+    /// visible when `hop_index` resets to `0`.
+    fn drain_features(&self, out: &mut Vec<FeatureSnapshot>);
 
     /// Negotiated parameters of the currently-running session, or
     /// `None` when no session is running.
