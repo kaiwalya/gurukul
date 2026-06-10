@@ -19,8 +19,11 @@
 //! schedule against a fake `AppCoach`.
 
 pub mod coach;
+pub mod feature_history;
+pub mod feature_types;
 pub mod font;
 pub mod game;
+pub mod graph_model;
 pub mod menu;
 pub mod state;
 pub mod ui;
@@ -52,6 +55,10 @@ pub fn build_app(app: &mut App) {
         .init_resource::<game::scale_picker::ShowingScalePicker>()
         .init_resource::<coach::MusicInfoRes>()
         .init_resource::<coach::LatestFeatures>()
+        .init_resource::<coach::FeatureHistoryRes>()
+        .init_resource::<coach::FeatureDrainScratch>()
+        .init_resource::<game::GraphProjectorRes>()
+        .init_resource::<game::SemanticGraphRes>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
@@ -115,6 +122,7 @@ pub fn build_app(app: &mut App) {
             Update,
             (
                 game::log_features,
+                game::refresh_semantic_graph,
                 game::handle_esc_in_game,
                 game::dial::update_from_features,
                 game::dial::repaint_slots,

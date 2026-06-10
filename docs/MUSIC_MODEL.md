@@ -25,8 +25,35 @@ for it. Read them first; this doc never restates their arithmetic:
 - [`domain-ports/src/scale.rs`](../domain-ports/src/scale.rs) — the
   outer cylinder whose **teeth** drop into some of those grooves:
   `ScaleIntervals` (the tooth pattern, a bitmask) and `Scale` (a
-  pattern placed on a concrete tuning at a concrete register, exposing
-  `tonic_pitch`, `degree_pitch`, `needle_angle`, `tick_angle`).
+  pattern placed on a concrete tuning at a concrete register).
+
+### Why `PitchLog2` is the common geometry
+
+`PitchLog2` turns frequency ratios into ordinary additive distances.
+Multiplying a frequency by two becomes adding `1.0`, so every integer
+translation is an exact octave move. The fractional displacement within
+that unit interval is preserved by every such move.
+
+That gives the model one coordinate system for both the linear and
+repeating sides of pitch:
+
+- absolute pitches remain points on an unbounded line;
+- intervals are differences on that same line;
+- octave movement is integer translation;
+- octave-free structure is represented by the within-octave remainder
+  and repeats unchanged under any integer translation.
+
+This is the leverage behind the helix and cylinder models. A tuning can
+describe only its octave-free groove geometry without choosing a
+register; those grooves already imply all octave-equivalent occurrences.
+A concrete register is needed only when selecting one particular
+occurrence. No conversion through Hz, duplicated octave arithmetic, or
+special-case wrapping is required.
+
+The integer/remainder split is meaningful for an interval from a chosen
+reference, not for an isolated pitch point. Subtract points first, then
+read whole-octave and within-octave parts, as defined by
+[`pitch.rs`](../domain-ports/src/pitch.rs).
 
 This doc owns what the code doesn't and shouldn't: the **dial** the
 geometry feeds, and the **deferred** label/vocabulary layer. Where it

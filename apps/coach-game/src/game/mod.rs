@@ -6,13 +6,20 @@ pub mod dial;
 pub mod hud;
 pub mod scale_picker;
 
-use crate::coach::{Coach, Features, LatestFeatures};
+use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
+use crate::graph_model::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
 
 #[derive(Resource, Default)]
 pub struct LastFeatureHop(Option<u64>);
+
+#[derive(Resource, Default)]
+pub struct GraphProjectorRes(pub GraphProjector);
+
+#[derive(Resource, Default)]
+pub struct SemanticGraphRes(pub SemanticGraph);
 
 pub fn on_enter(
     coach: NonSend<Coach>,
@@ -38,9 +45,27 @@ pub fn on_enter(
     has_paused.0 = false;
 }
 
-pub fn on_exit(coach: NonSend<Coach>, mut last: ResMut<LastFeatureHop>) {
+pub fn on_exit(
+    coach: NonSend<Coach>,
+    mut last: ResMut<LastFeatureHop>,
+    mut history: ResMut<FeatureHistoryRes>,
+    mut projector: ResMut<GraphProjectorRes>,
+    mut graph: ResMut<SemanticGraphRes>,
+) {
     coach.0.send_command(Command::StopSession);
     last.0 = None;
+    history.0.clear();
+    projector.0.clear();
+    graph.0 = SemanticGraph::default();
+}
+
+pub fn refresh_semantic_graph(
+    history: Res<FeatureHistoryRes>,
+    music: Res<MusicInfoRes>,
+    mut projector: ResMut<GraphProjectorRes>,
+    mut graph: ResMut<SemanticGraphRes>,
+) {
+    graph.0 = projector.0.project(&history.0, music.0.as_ref());
 }
 
 /// Esc in InGame → Paused (stops session via OnEnter(Paused)). Marks

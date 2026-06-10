@@ -6,11 +6,13 @@
 //! driven by state transitions; this module only owns construction
 //! and the always-on event drain.
 
-use crate::state::{KnownDevices, KnownScales};
+use crate::feature_history::FeatureHistory;
+pub use crate::feature_types::Features;
+use crate::state::{AppState, KnownDevices, KnownScales};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, MusicInfo};
+use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, MusicInfo};
 use domain_ports::clock::Clock;
-use domain_ports::pitch::PitchLog2;
 use domain_ports::telemetry::Telemetry;
 use domain_ports::tuning::Tuning;
 use std::sync::Arc;
@@ -30,33 +32,6 @@ pub struct Coach(pub Box<dyn AppCoach>);
 #[derive(Resource, Default)]
 pub struct MusicInfoRes(pub Option<MusicInfo>);
 
-/// The game-side live features: the port's `FeatureSnapshot` with `f0`
-/// already lifted out of raw Hz into a [`PitchLog2`] (`None` = unvoiced,
-/// retiring the port's `f0_hz == 0.0` sentinel). The Hz→pitch conversion
-/// happens **once**, at the poll seam in [`drain_events`], so no game
-/// system below ever touches a raw frequency — they read a `PitchLog2`
-/// and feed it straight into the scale geometry.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Features {
-    /// Session-local producer sequence used to detect missing hops.
-    pub hop_index: u64,
-    /// The detected pitch, or `None` when the frame is unvoiced (silence,
-    /// breath, noise — the port's `f0_hz <= 0.0`).
-    pub pitch: Option<PitchLog2>,
-    /// YIN periodicity confidence, `0.0..=1.0` (carried through verbatim).
-    pub confidence: f32,
-    /// Onset detector output (positive on attack).
-    pub onset: f32,
-    /// Breath / aspiration energy estimate.
-    pub breath: f32,
-    /// Vibrato rate in Hz over the recent window.
-    pub vibrato_rate: f32,
-    /// Vibrato depth in semitones.
-    pub vibrato_depth: f32,
-    /// Snapshot timestamp in ms for time-axis placement.
-    pub t_ms: u64,
-}
-
 /// The head-side **read model** for the latest live [`Features`] (`pitch`,
 /// onset, breath, vibrato). Polled from the coach every tick by
 /// [`drain_events`] and republished here so UI systems read a plain
@@ -66,6 +41,23 @@ pub struct Features {
 /// event), so it refreshes every frame rather than on an event.
 #[derive(Resource, Default)]
 pub struct LatestFeatures(pub Option<Features>);
+
+#[derive(Resource, Default)]
+pub struct FeatureHistoryRes(pub FeatureHistory);
+
+#[derive(Resource, Default)]
+pub struct FeatureDrainScratch(Vec<FeatureSnapshot>);
+
+#[derive(SystemParam)]
+pub struct DrainReadModels<'w> {
+    known: ResMut<'w, KnownDevices>,
+    scales: ResMut<'w, KnownScales>,
+    music: ResMut<'w, MusicInfoRes>,
+    features: ResMut<'w, LatestFeatures>,
+    state: Res<'w, State<AppState>>,
+    history: ResMut<'w, FeatureHistoryRes>,
+    feature_scratch: ResMut<'w, FeatureDrainScratch>,
+}
 
 pub fn spawn_coach(world: &mut World) {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
@@ -109,13 +101,16 @@ pub fn shutdown_on_exit(mut exits: MessageReader<bevy::app::AppExit>, coach: Non
 ///   (the read side of the config CQRS round-trip).
 /// - lifecycle / errors / drops → logs.
 /// - every tick → poll `latest_features()` into [`LatestFeatures`].
-pub fn drain_events(
-    coach: NonSend<Coach>,
-    mut known: ResMut<KnownDevices>,
-    mut scales: ResMut<KnownScales>,
-    mut music: ResMut<MusicInfoRes>,
-    mut features: ResMut<LatestFeatures>,
-) {
+pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
+    let DrainReadModels {
+        mut known,
+        mut scales,
+        mut music,
+        mut features,
+        state,
+        mut history,
+        mut feature_scratch,
+    } = models;
     let mut events = Vec::new();
     coach.0.poll_events(&mut events);
     for ev in events {
@@ -156,14 +151,13 @@ pub fn drain_events(
     // carries `f0_hz` (DSP's native unit), and we convert to PitchLog2 here
     // so no system below ever sees a frequency. The `f0_hz <= 0.0`
     // unvoiced sentinel becomes `pitch: None`.
-    features.0 = coach.0.latest_features().map(|s| Features {
-        hop_index: s.hop_index,
-        pitch: (s.f0_hz > 0.0).then(|| PitchLog2::from_hz(s.f0_hz)),
-        confidence: s.confidence,
-        onset: s.onset,
-        breath: s.breath,
-        vibrato_rate: s.vibrato_rate,
-        vibrato_depth: s.vibrato_depth,
-        t_ms: s.t_ms,
-    });
+    features.0 = coach.0.latest_features().map(Features::from);
+
+    feature_scratch.0.clear();
+    coach.0.drain_features(&mut feature_scratch.0);
+    if *state.get() == AppState::InGame {
+        history
+            .0
+            .extend(feature_scratch.0.drain(..).map(Features::from));
+    }
 }
