@@ -1,38 +1,36 @@
 # Contributing to `coach-game`
 
+*How to build a widget.* For **what** the layers are and **why** the crate is
+shaped this way (the slice doctrine, music quarantine, scene shapes, marker
+ownership), see [`ARCHITECTURE.md`](ARCHITECTURE.md). The backport plan for the
+existing InGame UI lives in
+[`../../docs/COACH_GAME_LAYERING_PLAN.md`](../../docs/COACH_GAME_LAYERING_PLAN.md).
+
 Build UI in isolated pieces before stitching it into the screen. A widget
-should be useful and testable through its own model, scene contract, and
-ECS systems before the app route, menu, or game surface depends on it.
-
-This app is easiest to build one widget at a time, but the unit is not a
-React-style function component. In Bevy, the stable unit is:
-
-1. a pure model or projection step,
-2. a small scene/resource contract,
-3. a widget system pair that turns that contract into ECS nodes.
+should be useful and testable through its own model, scene contract, and ECS
+systems before the app route, menu, or game surface depends on it. The unit is
+not a React-style function component — it is the vertical slice described in
+ARCHITECTURE.md.
 
 ## Preferred build order
 
-For new UI work, split the job into three layers:
+Build the slice bottom-up:
 
-1. **Model**
-   Plain Rust, no Bevy. Keep music/domain logic here.
-
-2. **Scene**
-   A small render-facing struct or resource. This is the widget input.
-
-3. **Widget**
-   Bevy-only code that reads the scene and owns nodes, transforms, colours, and scheduling.
+1. **Model** — the pure domain → geometry projection.
+2. **Scene** — the render-facing contract the widget consumes.
+3. **Systems** — Bevy code that spawns nodes and paints from the scene.
 
 Example:
 
-- `graph_model` computes semantic pitch/time geometry.
+- `semantic_graph` computes semantic pitch/time geometry.
 - `widgets::time_graph::TimeGraphSceneRes` is the render contract.
 - `widgets::time_graph::*` systems build and update the UI tree.
 
 ## Testing ladder
 
-Use the same three test levels for each non-trivial widget:
+The three test levels map onto the three layers (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for why); this section is how to write
+each. Use all three for each non-trivial widget:
 
 1. **Pure tests**
    Test the math or projection without an `App`.
@@ -52,22 +50,6 @@ a two-step loop. The Bevy scheduling mechanics for that loop live in
 - `PostLayout`: capture measured sizes for the next frame.
 
 Do not try to spawn layout-dependent nodes for the first time in `PostLayout` and expect them to be fully laid out immediately.
-
-## Widget rules
-
-Keep widgets narrow:
-
-- Widgets should not own business logic.
-- Widgets should have a small number of input resources/components.
-- Important nodes should have marker components so tests can query them directly.
-
-For example, a graph widget should expose markers like:
-
-- root
-- lanes
-- repeated visual children such as ticks, spans, or trace bodies
-
-That gives tests a stable surface even when the visual tree grows.
 
 ## Practical workflow
 

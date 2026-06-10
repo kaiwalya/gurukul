@@ -9,13 +9,16 @@ Module layout: `coach` owns the `!Send` AppCoach handle as a NonSend
 resource and the always-on event drain. `state` defines `AppState`
 (`MainMenu` / `Settings` / `InGame`) and the `SelectedDevice` /
 `KnownDevices` resources. `menu::main_menu` and `menu::settings` are
-the menu screens. `game` runs the session: `StartSession` on enter,
-`StopSession` on exit, feature snapshots logged each frame.
+the menu screens. `game` runs the session (`StartSession` on enter,
+`StopSession` on exit, feature snapshots logged each frame) and holds the
+InGame route glue, one `game/<name>.rs` per widget. InGame UI lives in
+`widgets/<name>/` vertical slices; `semantic_graph` is the crate-level
+shared pitch/time projection that feeds them.
 
-Widget workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md): build
-model, scene contract, and widget systems in isolation before stitching
-them into an app screen. This file owns the Bevy mechanics and local app
-conventions.
+Crate structure and the widget-slice doctrine live in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) (the *what/why*); the build workflow
+lives in [`CONTRIBUTING.md`](CONTRIBUTING.md) (the *how*). This file owns
+the Bevy mechanics and local app conventions.
 
 ## Running it
 
