@@ -170,6 +170,20 @@ rule above:
   widget's policy — so there is nothing to clamp in pixel space, and a
   fixed-range mode is just a different policy for the same field.
 
+In the time graph this is `widgets/time_graph/`: the pitch lane holds two
+full-size layer children, `GridlineLayer` (back z) and `TraceLayer` (front z),
+each painted by its own system into its own parent — so the despawn-fight is
+impossible by construction, not avoided by despawn-scoping. The "separate redraw
+triggers" property is realized as two scene **resources** split by *cadence*, not
+feature: `TimeGraphGridSceneRes` (grooves — slow) and `TimeGraphLiveSceneRes`
+(trace + onset ticks + breath spans — fast, all normalized against the rolling
+time window so they scroll every frame). The glue (`game/time_graph.rs`) projects
+one scene and distributes it, value-gating the slow resource with `set_if_neq` so
+a live-only frame leaves the gridlines untouched. The viewport itself is not a
+separate ECS component — it is already domain-valued in the model's projector and
+out-of-window points are dropped there, so an ECS mirror would be a second source
+of truth with no readers.
+
 ### How children consume the viewport: cutout vs. project-in-window
 
 A child reads the viewport in one of two ways, and which one depends on whether

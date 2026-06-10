@@ -165,7 +165,7 @@ pub fn build_layout_test_app() -> (App, FakeCoach) {
 /// Drive the layout-aware schedule until the capture→paint loop settles.
 /// The chain spans two frames: `capture_pitch_lane_size` runs in
 /// `PostUpdate` after `UiSystems::PostLayout` (so it sees this frame's
-/// measured lane), and `apply_trace_scene` reads that captured size on the
+/// measured lane), and `apply_trace` reads that captured size on the
 /// *next* `Update`. A single `app.update()` therefore paints zero trace
 /// bodies (no size yet); several updates let the size land, the trace
 /// paint, and the layout re-settle on the painted nodes. `allow(dead_code)`

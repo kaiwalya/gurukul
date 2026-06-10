@@ -85,8 +85,32 @@ pub struct TimeGraphScene {
     pub breath_spans: Vec<NormalizedBreathSpan>,
 }
 
+// The scene is split into two resources by **repaint cadence**, not by
+// feature type. Gridlines are a function of the viewport (pitch range +
+// scale) and change rarely; the trace and the time-anchored events scroll
+// with the rolling time window and change every frame. Separate resources
+// let Bevy change-detection fire independently, so the gridline layer only
+// repaints when its data actually changes. See the layered-children pattern
+// in `ARCHITECTURE.md`. The glue (`game/time_graph.rs`) distributes a single
+// `TimeGraphScene` projection into these two, value-gating the slow one.
+
+/// Slow-cadence scene: tonal gridlines, a function of the pitch viewport and
+/// scale. Painted into the gridline layer; repaints only when the grooves
+/// change (write it via `set_if_neq` so it doesn't churn every frame).
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
-pub struct TimeGraphSceneRes(pub TimeGraphScene);
+pub struct TimeGraphGridSceneRes {
+    pub grooves: Vec<NormalizedGrooveLine>,
+}
+
+/// Fast-cadence scene: the pitch trace plus the time-anchored event markers
+/// (onset ticks, breath spans). All three are normalized against the rolling
+/// time window, so they scroll — and repaint — every frame.
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
+pub struct TimeGraphLiveSceneRes {
+    pub pitch_segments: Vec<NormalizedTraceSegment>,
+    pub onset_ticks: Vec<NormalizedOnsetTick>,
+    pub breath_spans: Vec<NormalizedBreathSpan>,
+}
 
 /// Pitch lane's measured size, captured after `PostLayout` and fed back
 /// into the next frame's trace painting. Held as a [`LogicalSize`] so the

@@ -5,7 +5,10 @@
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
 
-use super::scene::{LogicalSize, NormalizedPoint, TimeGraphPitchLaneSize, TimeGraphSceneRes};
+use super::scene::{
+    LogicalSize, NormalizedPoint, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
+    TimeGraphPitchLaneSize,
+};
 
 const ROOT_LEFT: f32 = 32.0;
 const ROOT_TOP: f32 = 96.0;
@@ -36,6 +39,17 @@ pub struct TimeGraphPitchLane;
 
 #[derive(Component)]
 pub struct TimeGraphEventsLane;
+
+/// Back layer of the pitch lane: holds the tonal gridlines. A full-size
+/// child of the lane, kept separate from [`TraceLayer`] so the two never
+/// share a parent — the structural fix for the despawn-fight hazard (see
+/// `ARCHITECTURE.md`). Each layer's painter clears only its own layer.
+#[derive(Component)]
+pub struct GridlineLayer;
+
+/// Front layer of the pitch lane: holds the pitch trace bodies.
+#[derive(Component)]
+pub struct TraceLayer;
 
 #[derive(Component)]
 pub struct GrooveLineMarker;
@@ -80,16 +94,25 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
         .id();
 
     commands.entity(root).with_children(|parent| {
-        parent.spawn((
-            TimeGraphPitchLane,
-            Node {
-                position_type: PositionType::Relative,
-                flex_grow: 4.0,
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            BackgroundColor(COLOR_PITCH_LANE),
-        ));
+        // The pitch lane is the measured frame owner (capture reads its
+        // ComputedNode) and the clip boundary. It holds two full-size,
+        // absolutely-positioned layer children — gridlines behind, trace in
+        // front — so the two painters never share a parent.
+        parent
+            .spawn((
+                TimeGraphPitchLane,
+                Node {
+                    position_type: PositionType::Relative,
+                    flex_grow: 4.0,
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(COLOR_PITCH_LANE),
+            ))
+            .with_children(|lane| {
+                lane.spawn((GridlineLayer, layer_node(), ZIndex(0)));
+                lane.spawn((TraceLayer, layer_node(), ZIndex(1)));
+            });
         parent.spawn((
             TimeGraphEventsLane,
             Node {
@@ -105,43 +128,43 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
     root
 }
 
-pub fn apply_scene(
+/// A full-size, absolutely-positioned, transparent layer that fills its
+/// parent lane. Both pitch-lane layers use it; back/front is decided by the
+/// `ZIndex` each is spawned with.
+fn layer_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: px(0),
+        top: px(0),
+        right: px(0),
+        bottom: px(0),
+        ..default()
+    }
+}
+
+/// Repaint the tonal gridlines into the gridline layer. Gated on the
+/// slow-cadence grid scene, so it only runs when the grooves actually
+/// change (the glue value-gates the write). The gridline layer is *not*
+/// shared with the trace, so this can clear its own children wholesale.
+pub fn apply_gridlines(
     mut commands: Commands,
-    scene: Res<TimeGraphSceneRes>,
-    pitch_lane: Query<Entity, With<TimeGraphPitchLane>>,
-    events_lane: Query<Entity, With<TimeGraphEventsLane>>,
+    grid: Res<TimeGraphGridSceneRes>,
+    layer: Query<Entity, With<GridlineLayer>>,
     grooves: Query<Entity, With<GrooveLineMarker>>,
-    onsets: Query<Entity, With<OnsetTickMarker>>,
-    breaths: Query<Entity, With<BreathSpanMarker>>,
 ) {
-    // Skip when nothing changed *and* this system's own markers are already
-    // painted. The emptiness check is scoped to the markers `apply_scene`
-    // owns — not the lane's `Children` — because the pitch lane is *shared*
-    // with `apply_trace_scene`'s trace bodies; counting those as "already
-    // painted" would wrongly suppress a first groove paint.
-    let already_painted = !grooves.is_empty() && (!onsets.is_empty() || !breaths.is_empty());
-    if !scene.is_changed() && already_painted {
+    let already_painted = !grooves.is_empty();
+    if !grid.is_changed() && already_painted {
         return;
     }
-
-    let Ok(pitch_entity) = pitch_lane.single() else {
+    let Ok(layer_entity) = layer.single() else {
         return;
     };
-    let Ok(events_entity) = events_lane.single() else {
-        return;
-    };
-
-    // Despawn only what this system spawned. Clearing the pitch lane
-    // wholesale (`despawn_related::<Children>()`) would also destroy the
-    // trace bodies `apply_trace_scene` parents there — the shared-parent
-    // despawn hazard in `ARCHITECTURE.md`. Marker-scoped despawn removes
-    // the cross-system coupling that only `.chain()` ordering was hiding.
-    for entity in grooves.iter().chain(onsets.iter()).chain(breaths.iter()) {
+    for entity in grooves.iter() {
         commands.entity(entity).despawn();
     }
 
-    for groove in &scene.0.grooves {
-        commands.entity(pitch_entity).with_child((
+    for groove in &grid.grooves {
+        commands.entity(layer_entity).with_child((
             GrooveLineMarker,
             Node {
                 position_type: PositionType::Absolute,
@@ -158,8 +181,31 @@ pub fn apply_scene(
             }),
         ));
     }
+}
 
-    for onset in &scene.0.onset_ticks {
+/// Repaint the time-anchored event markers (onset ticks, breath spans) into
+/// the events lane. Gated on the fast-cadence live scene — these scroll with
+/// the rolling time window. The events lane has no shared-parent problem, so
+/// no layer split is needed there.
+pub fn apply_events(
+    mut commands: Commands,
+    live: Res<TimeGraphLiveSceneRes>,
+    events_lane: Query<Entity, With<TimeGraphEventsLane>>,
+    onsets: Query<Entity, With<OnsetTickMarker>>,
+    breaths: Query<Entity, With<BreathSpanMarker>>,
+) {
+    let already_painted = !onsets.is_empty() || !breaths.is_empty();
+    if !live.is_changed() && already_painted {
+        return;
+    }
+    let Ok(events_entity) = events_lane.single() else {
+        return;
+    };
+    for entity in onsets.iter().chain(breaths.iter()) {
+        commands.entity(entity).despawn();
+    }
+
+    for onset in &live.onset_ticks {
         commands.entity(events_entity).with_child((
             OnsetTickMarker,
             Node {
@@ -174,7 +220,7 @@ pub fn apply_scene(
         ));
     }
 
-    for span in &scene.0.breath_spans {
+    for span in &live.breath_spans {
         commands.entity(events_entity).with_child((
             BreathSpanMarker,
             Node {
@@ -190,22 +236,24 @@ pub fn apply_scene(
     }
 }
 
-pub fn apply_trace_scene(
+/// Repaint the pitch trace into the trace layer. Gated on the fast-cadence
+/// live scene plus the measured lane size (the trace geometry is in logical
+/// pixels). The trace layer is its own entity, so the despawn is a simple
+/// wholesale clear — no parent-filtering, no coupling to the gridlines.
+pub fn apply_trace(
     mut commands: Commands,
-    scene: Res<TimeGraphSceneRes>,
-    pitch_lane: Query<Entity, With<TimeGraphPitchLane>>,
+    live: Res<TimeGraphLiveSceneRes>,
+    layer: Query<Entity, With<TraceLayer>>,
     lane_size: Res<TimeGraphPitchLaneSize>,
-    existing_bodies: Query<(Entity, &ChildOf), With<TraceSegmentBody>>,
+    existing_bodies: Query<Entity, With<TraceSegmentBody>>,
 ) {
-    let Ok(pitch_entity) = pitch_lane.single() else {
-        return;
-    };
-    let has_existing = existing_bodies
-        .iter()
-        .any(|(_, parent)| parent.parent() == pitch_entity);
-    if !scene.is_changed() && has_existing {
+    let has_existing = !existing_bodies.is_empty();
+    if !live.is_changed() && has_existing {
         return;
     }
+    let Ok(layer_entity) = layer.single() else {
+        return;
+    };
     let Some(size) = lane_size.0.map(LogicalSize::get) else {
         return;
     };
@@ -213,13 +261,11 @@ pub fn apply_trace_scene(
         return;
     }
 
-    for (entity, parent) in existing_bodies.iter() {
-        if parent.parent() == pitch_entity {
-            commands.entity(entity).despawn();
-        }
+    for entity in existing_bodies.iter() {
+        commands.entity(entity).despawn();
     }
 
-    for segment in &scene.0.pitch_segments {
+    for segment in &live.pitch_segments {
         for pair in segment.points.windows(2) {
             let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
                 continue;
@@ -228,7 +274,7 @@ pub fn apply_trace_scene(
                 trace_color(((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0));
             commands.spawn((
                 TraceSegmentBody,
-                ChildOf(pitch_entity),
+                ChildOf(layer_entity),
                 Node {
                     position_type: PositionType::Absolute,
                     left: px(geom.center.x - geom.length * 0.5),

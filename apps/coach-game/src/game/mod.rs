@@ -70,14 +70,16 @@ pub fn on_exit(
     mut history: ResMut<FeatureHistoryRes>,
     mut projector: ResMut<GraphProjectorRes>,
     mut graph: ResMut<SemanticGraphRes>,
-    mut scene: ResMut<crate::widgets::time_graph::TimeGraphSceneRes>,
+    mut grid: ResMut<crate::widgets::time_graph::TimeGraphGridSceneRes>,
+    mut live: ResMut<crate::widgets::time_graph::TimeGraphLiveSceneRes>,
 ) {
     coach.0.send_command(Command::StopSession);
     last.0 = None;
     history.0.clear();
     projector.0.clear();
     graph.0 = SemanticGraph::default();
-    scene.0 = Default::default();
+    *grid = Default::default();
+    *live = Default::default();
 }
 
 pub fn refresh_semantic_graph(

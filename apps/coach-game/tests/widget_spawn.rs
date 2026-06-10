@@ -5,18 +5,23 @@
 //! ownership exists to provide — if a widget breaks its own tree, these
 //! fail without dragging the whole app in.
 //!
-//! Also covers the time-graph `apply_scene` change-detection guard, driven
-//! by a minimal `Schedule` over a `World`. The trace painter
-//! (`apply_trace_scene`) is *not* tested here: it consumes a measured lane
-//! size, so faking one with an injected `Vec2` would certify the very
-//! physical/logical frame bug the `LogicalSize` newtype exists to prevent.
-//! Its paint/skip behaviour is covered at layer 3 with the real producer —
-//! see `tests/time_graph_layout.rs` and the layer-3 rules in
+//! Also covers the time-graph `apply_gridlines` / `apply_events`
+//! change-detection guards, driven by a minimal `Schedule` over a `World`.
+//! The trace painter (`apply_trace`) is *not* tested here: it consumes a
+//! measured lane size, so faking one with an injected `Vec2` would certify
+//! the very physical/logical frame bug the `LogicalSize` newtype exists to
+//! prevent. Its paint/skip behaviour is covered at layer 3 with the real
+//! producer — see `tests/time_graph_layout.rs` and the layer-3 rules in
 //! `CONTRIBUTING.md`.
 
 use bevy::ecs::world::CommandQueue;
 use bevy::prelude::*;
 
+use coach_game::game::time_graph::refresh_scene;
+use coach_game::game::SemanticGraphRes;
+use coach_game::semantic_graph::{
+    GrooveLine, PitchWindow, SemanticGraph, TimeWindow, TracePoint, TraceSegment,
+};
 use coach_game::widgets::hud::{self, HudBadge, HudDegRow};
 use coach_game::widgets::note_dial::{
     self, DialHub, DialHubLabel, DialScale, DialState, NoteDialRoot,
@@ -25,11 +30,11 @@ use coach_game::widgets::scale_picker::{
     self, PickerRow, ScalePickerCloseButton, ScalePickerRoot, ScalePickerRows, ScaleRow,
 };
 use coach_game::widgets::time_graph::{
-    self, systems as tg, GrooveLineMarker, NormalizedGrooveLine, NormalizedOnsetTick,
-    NormalizedPoint, NormalizedTracePoint, NormalizedTraceSegment, OnsetTickMarker,
-    TimeGraphEventsLane, TimeGraphPitchLane, TimeGraphRoot, TimeGraphScene, TimeGraphSceneRes,
-    TraceSegmentBody,
+    self, systems as tg, GridlineLayer, GrooveLineMarker, NormalizedGrooveLine,
+    NormalizedOnsetTick, OnsetTickMarker, TimeGraphEventsLane, TimeGraphGridSceneRes,
+    TimeGraphLiveSceneRes, TimeGraphPitchLane, TimeGraphRoot, TraceLayer, TraceSegmentBody,
 };
+use domain_ports::pitch::PitchLog2;
 
 /// A throwaway marker so a test can recover the entity `spawn` returned.
 #[derive(Component)]
@@ -227,33 +232,43 @@ fn time_graph_spawn_builds_root_and_two_lanes() {
     assert_eq!(parent_of(&world, root), parent, "root under given parent");
     assert_eq!(children_with::<TimeGraphPitchLane>(&mut world, root), 1);
     assert_eq!(children_with::<TimeGraphEventsLane>(&mut world, root), 1);
+
+    // The pitch lane holds two stacked layer children — gridlines behind,
+    // trace in front — so the two painters never share a parent (the
+    // structural fix for the despawn-fight hazard).
+    assert_eq!(count::<GridlineLayer>(&mut world), 1, "one gridline layer");
+    assert_eq!(count::<TraceLayer>(&mut world), 1, "one trace layer");
+    let pitch_lane = world
+        .query_filtered::<Entity, With<TimeGraphPitchLane>>()
+        .single(&world)
+        .expect("pitch lane exists");
+    assert_eq!(
+        children_with::<GridlineLayer>(&mut world, pitch_lane),
+        1,
+        "gridline layer under the pitch lane"
+    );
+    assert_eq!(
+        children_with::<TraceLayer>(&mut world, pitch_lane),
+        1,
+        "trace layer under the pitch lane"
+    );
 }
 
-// --- time_graph apply_scene / apply_trace_scene change detection ------
+// --- time_graph apply_gridlines / apply_events change detection -------
 
-fn scene_with_one_of_each() -> TimeGraphScene {
-    TimeGraphScene {
-        pitch_segments: vec![NormalizedTraceSegment {
-            points: vec![
-                NormalizedTracePoint {
-                    point: NormalizedPoint { x: 0.1, y: 0.2 },
-                    confidence: 0.5,
-                    vibrato_rate: 0.0,
-                    vibrato_depth: 0.0,
-                },
-                NormalizedTracePoint {
-                    point: NormalizedPoint { x: 0.9, y: 0.8 },
-                    confidence: 0.5,
-                    vibrato_rate: 0.0,
-                    vibrato_depth: 0.0,
-                },
-            ],
-        }],
+fn one_groove() -> TimeGraphGridSceneRes {
+    TimeGraphGridSceneRes {
         grooves: vec![NormalizedGrooveLine {
             y: 0.5,
             slot: 0,
             active: true,
         }],
+    }
+}
+
+fn one_onset() -> TimeGraphLiveSceneRes {
+    TimeGraphLiveSceneRes {
+        pitch_segments: vec![],
         onset_ticks: vec![NormalizedOnsetTick {
             x: 0.25,
             strength: 0.9,
@@ -262,31 +277,30 @@ fn scene_with_one_of_each() -> TimeGraphScene {
     }
 }
 
-/// A `World` with the time-graph tree spawned and the scene resource
-/// inserted, ready to run `apply_scene` via a `Schedule`.
-fn world_with_graph(scene: TimeGraphScene) -> World {
+/// A `World` with the time-graph tree spawned and both cadence-split scene
+/// resources inserted, ready to run the painters via a `Schedule`.
+fn world_with_graph(grid: TimeGraphGridSceneRes, live: TimeGraphLiveSceneRes) -> World {
     let (mut world, _parent) = spawn_world(|commands, parent| {
         time_graph::spawn(commands, parent);
     });
-    world.insert_resource(TimeGraphSceneRes(scene));
+    world.insert_resource(grid);
+    world.insert_resource(live);
     world
 }
 
 #[test]
-fn apply_scene_paints_then_skips_when_unchanged() {
-    let mut world = world_with_graph(scene_with_one_of_each());
+fn apply_gridlines_paints_then_skips_when_unchanged() {
+    let mut world = world_with_graph(one_groove(), one_onset());
     let mut schedule = Schedule::default();
-    schedule.add_systems(tg::apply_scene);
+    schedule.add_systems(tg::apply_gridlines);
 
-    // First run: lanes are empty → paint regardless of change state.
+    // First run: layer is empty → paint regardless of change state.
     schedule.run(&mut world);
     world.clear_trackers();
     assert_eq!(count::<GrooveLineMarker>(&mut world), 1, "groove painted");
-    assert_eq!(count::<OnsetTickMarker>(&mut world), 1, "onset painted");
 
-    // Run again with the scene unchanged and the lanes non-empty: the guard
-    // (`!is_changed() && both lanes non-empty`) must short-circuit, leaving
-    // the SAME marker entities — not despawn+respawn.
+    // Run again unchanged with grooves present: the guard short-circuits,
+    // leaving the SAME marker entity — not despawn+respawn.
     let groove_before = world
         .query_filtered::<Entity, With<GrooveLineMarker>>()
         .single(&world)
@@ -299,24 +313,24 @@ fn apply_scene_paints_then_skips_when_unchanged() {
         .unwrap();
     assert_eq!(
         groove_before, groove_after,
-        "unchanged scene must not despawn/respawn markers"
+        "unchanged grid scene must not despawn/respawn grooves"
     );
 }
 
 #[test]
-fn apply_scene_repaints_when_scene_changes() {
-    let mut world = world_with_graph(scene_with_one_of_each());
+fn apply_events_repaints_when_live_scene_changes() {
+    let mut world = world_with_graph(one_groove(), one_onset());
     let mut schedule = Schedule::default();
-    schedule.add_systems(tg::apply_scene);
+    schedule.add_systems(tg::apply_events);
 
     schedule.run(&mut world);
     world.clear_trackers();
     assert_eq!(count::<OnsetTickMarker>(&mut world), 1);
 
-    // Mutate the scene → two onset ticks. ResMut access marks it changed.
+    // Mutate the live scene → two onset ticks. ResMut access marks it changed.
     {
-        let mut scene = world.resource_mut::<TimeGraphSceneRes>();
-        scene.0.onset_ticks = vec![
+        let mut live = world.resource_mut::<TimeGraphLiveSceneRes>();
+        live.onset_ticks = vec![
             NormalizedOnsetTick {
                 x: 0.2,
                 strength: 0.5,
@@ -332,32 +346,32 @@ fn apply_scene_repaints_when_scene_changes() {
     assert_eq!(
         count::<OnsetTickMarker>(&mut world),
         2,
-        "repainted from new scene"
+        "repainted from new live scene"
     );
 }
 
 #[test]
-fn apply_scene_repaint_does_not_despawn_trace_bodies() {
-    // The defect-3 guard. `apply_scene` and `apply_trace_scene` both parent
-    // into the pitch lane. When `apply_scene` repaints its grooves it must
-    // despawn only *its own* markers — not clear the lane wholesale, which
-    // would also destroy the trace bodies `apply_trace_scene` owns. This
-    // runs `apply_scene` ALONE (no `.chain()`ed trace repaint to mask the
-    // damage), so the old `despawn_related::<Children>()` would fail it
-    // while the production `.chain()` ordering hid the bug.
-    let mut world = world_with_graph(scene_with_one_of_each());
+fn apply_gridlines_does_not_despawn_trace_bodies() {
+    // The defect-3 guard, now STRUCTURAL. Gridlines and trace live in
+    // separate layer children of the pitch lane, so `apply_gridlines`
+    // clears only the gridline layer — it cannot reach a trace body in the
+    // trace layer. This passes by construction (separate parents), which is
+    // the point of the refactor: the regression anchor is that the layers
+    // stay separate. Runs `apply_gridlines` ALONE, with a trace body planted
+    // in the trace layer, and asserts the body survives a groove repaint.
+    let mut world = world_with_graph(one_groove(), one_onset());
 
-    // Plant a trace body in the pitch lane, as `apply_trace_scene` would.
-    let pitch_lane = world
-        .query_filtered::<Entity, With<TimeGraphPitchLane>>()
+    // Plant a trace body in the trace layer, as `apply_trace` would.
+    let trace_layer = world
+        .query_filtered::<Entity, With<TraceLayer>>()
         .single(&world)
-        .expect("pitch lane exists");
-    let trace_body = world.spawn((TraceSegmentBody, ChildOf(pitch_lane))).id();
+        .expect("trace layer exists");
+    let trace_body = world.spawn((TraceSegmentBody, ChildOf(trace_layer))).id();
 
     let mut schedule = Schedule::default();
-    schedule.add_systems(tg::apply_scene);
+    schedule.add_systems(tg::apply_gridlines);
 
-    // First run paints grooves into the same lane (markers were empty).
+    // First run paints grooves into the gridline layer (it was empty).
     schedule.run(&mut world);
     world.clear_trackers();
     assert!(
@@ -369,15 +383,101 @@ fn apply_scene_repaint_does_not_despawn_trace_bodies() {
         "trace body must survive the first groove paint"
     );
 
-    // Change the scene so `apply_scene` despawns + repaints its grooves.
+    // Change the grid scene so `apply_gridlines` despawns + repaints grooves.
     {
-        let mut scene = world.resource_mut::<TimeGraphSceneRes>();
-        scene.0.grooves[0].active = !scene.0.grooves[0].active;
+        let mut grid = world.resource_mut::<TimeGraphGridSceneRes>();
+        grid.grooves[0].active = !grid.grooves[0].active;
     }
     schedule.run(&mut world);
     world.clear_trackers();
     assert!(
         world.get_entity(trace_body).is_ok(),
-        "trace body must survive an apply_scene groove repaint (shared-parent despawn hazard)"
+        "trace body in its own layer must survive an apply_gridlines repaint"
+    );
+}
+
+// --- time_graph cadence split -----------------------------------------
+
+/// A graph carrying one groove and a two-point trace, with the windows the
+/// model needs to normalize both. `trace_t` lets a caller advance the trace
+/// while leaving the grooves identical.
+fn graph_with(trace_t: u64) -> SemanticGraph {
+    SemanticGraph {
+        time_window: Some(TimeWindow {
+            start_ms: 0,
+            end_ms: 100,
+        }),
+        pitch_window: Some(PitchWindow {
+            min: PitchLog2(8.0),
+            max: PitchLog2(10.0),
+        }),
+        trace_segments: vec![TraceSegment {
+            points: vec![
+                TracePoint {
+                    t_ms: trace_t,
+                    pitch: PitchLog2(8.5),
+                    confidence: 0.5,
+                    vibrato_rate: 0.0,
+                    vibrato_depth: 0.0,
+                },
+                TracePoint {
+                    t_ms: trace_t + 10,
+                    pitch: PitchLog2(9.0),
+                    confidence: 0.5,
+                    vibrato_rate: 0.0,
+                    vibrato_depth: 0.0,
+                },
+            ],
+        }],
+        grooves: vec![GrooveLine {
+            pitch: PitchLog2(9.0),
+            slot: 3,
+            active: true,
+        }],
+        onset_ticks: vec![],
+        breath_spans: vec![],
+    }
+}
+
+#[test]
+fn live_only_frame_does_not_respawn_gridlines() {
+    // The property the cadence split exists to provide. The glue
+    // (`refresh_scene`) projects one scene and distributes it into a slow
+    // grid resource (value-gated with `set_if_neq`) and a fast live resource.
+    // When only the trace moves — same grooves, new trace points — the grid
+    // resource is NOT marked changed, so `apply_gridlines` skips and the
+    // gridline entities keep their identities. Drive the REAL glue so this
+    // tests the `set_if_neq` value-gate, not a hand-rolled stand-in.
+    let (mut world, _parent) = spawn_world(|commands, parent| {
+        time_graph::spawn(commands, parent);
+    });
+    world.insert_resource(SemanticGraphRes(graph_with(0)));
+    world.init_resource::<TimeGraphGridSceneRes>();
+    world.init_resource::<TimeGraphLiveSceneRes>();
+
+    let mut schedule = Schedule::default();
+    schedule.add_systems((refresh_scene, tg::apply_gridlines).chain());
+
+    // First frame: grid resource is written, grooves paint into the layer.
+    schedule.run(&mut world);
+    world.clear_trackers();
+    assert_eq!(count::<GrooveLineMarker>(&mut world), 1, "groove painted");
+    let groove_before = world
+        .query_filtered::<Entity, With<GrooveLineMarker>>()
+        .single(&world)
+        .unwrap();
+
+    // Live-only change: advance the trace, leave the groove untouched.
+    world.resource_mut::<SemanticGraphRes>().0 = graph_with(5);
+    schedule.run(&mut world);
+    world.clear_trackers();
+
+    let groove_after = world
+        .query_filtered::<Entity, With<GrooveLineMarker>>()
+        .single(&world)
+        .unwrap();
+    assert_eq!(
+        groove_before, groove_after,
+        "a live-only frame must not respawn gridlines (set_if_neq value-gates the grid resource)"
     );
 }

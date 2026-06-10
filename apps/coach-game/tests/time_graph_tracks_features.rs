@@ -6,8 +6,8 @@ use bevy::prelude::*;
 use coach_game::game::InGameRoot;
 use coach_game::menu::main_menu::NewGameButton;
 use coach_game::widgets::time_graph::{
-    BreathSpanMarker, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane, TimeGraphPitchLane,
-    TimeGraphRoot, TimeGraphSceneRes,
+    BreathSpanMarker, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane,
+    TimeGraphGridSceneRes, TimeGraphLiveSceneRes, TimeGraphPitchLane, TimeGraphRoot,
 };
 use common::{build_test_app, pump};
 use domain_ports::app_coach::{CoachEvent, FeatureSnapshot, MusicInfo};
@@ -80,10 +80,11 @@ fn semantic_graph_projects_into_tree_and_lane_nodes() {
     ];
     app.update();
 
-    let scene = app.world().resource::<TimeGraphSceneRes>().0.clone();
-    assert!(!scene.grooves.is_empty());
-    assert_eq!(scene.onset_ticks.len(), 2);
-    assert_eq!(scene.breath_spans.len(), 1);
+    let grid = app.world().resource::<TimeGraphGridSceneRes>().clone();
+    let live = app.world().resource::<TimeGraphLiveSceneRes>().clone();
+    assert!(!grid.grooves.is_empty());
+    assert_eq!(live.onset_ticks.len(), 2);
+    assert_eq!(live.breath_spans.len(), 1);
 
     let world = app.world_mut();
     let roots = {
@@ -126,8 +127,8 @@ fn semantic_graph_projects_into_tree_and_lane_nodes() {
         .query_filtered::<(&GrooveLineMarker, &Node), With<GrooveLineMarker>>()
         .iter(world)
         .collect::<Vec<_>>();
-    assert_eq!(grooves.len(), scene.grooves.len());
-    let groove_y = scene.grooves[0].y;
+    assert_eq!(grooves.len(), grid.grooves.len());
+    let groove_y = grid.grooves[0].y;
     assert!(grooves.iter().any(
         |(_, node)| matches!(node.top, Val::Percent(v) if (v - (1.0 - groove_y) * 100.0).abs() < 1e-5)
     ));
@@ -136,11 +137,11 @@ fn semantic_graph_projects_into_tree_and_lane_nodes() {
         .query_filtered::<(&OnsetTickMarker, &Node), With<OnsetTickMarker>>()
         .iter(world)
         .collect::<Vec<_>>();
-    assert_eq!(ticks.len(), scene.onset_ticks.len());
+    assert_eq!(ticks.len(), live.onset_ticks.len());
 
     let spans = world
         .query_filtered::<(&BreathSpanMarker, &Node), With<BreathSpanMarker>>()
         .iter(world)
         .collect::<Vec<_>>();
-    assert_eq!(spans.len(), scene.breath_spans.len());
+    assert_eq!(spans.len(), live.breath_spans.len());
 }

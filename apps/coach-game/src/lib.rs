@@ -66,7 +66,8 @@ pub fn build_app(app: &mut App) {
         .init_resource::<game::GraphProjectorRes>()
         .init_resource::<game::SemanticGraphRes>()
         .init_resource::<widgets::time_graph::scene::TimeGraphPitchLaneSize>()
-        .init_resource::<widgets::time_graph::scene::TimeGraphSceneRes>()
+        .init_resource::<widgets::time_graph::scene::TimeGraphGridSceneRes>()
+        .init_resource::<widgets::time_graph::scene::TimeGraphLiveSceneRes>()
         .init_resource::<widgets::hud::scene::HudSceneRes>()
         // Always-on
         .add_observer(ui::on_scroll)
@@ -143,8 +144,9 @@ pub fn build_app(app: &mut App) {
                 (
                     game::refresh_semantic_graph,
                     game::time_graph::refresh_scene,
-                    widgets::time_graph::systems::apply_scene,
-                    widgets::time_graph::systems::apply_trace_scene,
+                    widgets::time_graph::systems::apply_gridlines,
+                    widgets::time_graph::systems::apply_trace,
+                    widgets::time_graph::systems::apply_events,
                 )
                     .chain(),
                 game::handle_esc_in_game,

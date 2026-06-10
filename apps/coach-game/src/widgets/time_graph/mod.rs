@@ -12,10 +12,10 @@ pub mod systems;
 pub use model::project_scene;
 pub use scene::{
     LogicalSize, NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
-    NormalizedTracePoint, NormalizedTraceSegment, TimeGraphPitchLaneSize, TimeGraphScene,
-    TimeGraphSceneRes,
+    NormalizedTracePoint, NormalizedTraceSegment, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
+    TimeGraphPitchLaneSize, TimeGraphScene,
 };
 pub use systems::{
-    spawn, BreathSpanMarker, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane,
-    TimeGraphPitchLane, TimeGraphRoot, TraceSegmentBody,
+    spawn, BreathSpanMarker, GridlineLayer, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane,
+    TimeGraphPitchLane, TimeGraphRoot, TraceLayer, TraceSegmentBody,
 };
