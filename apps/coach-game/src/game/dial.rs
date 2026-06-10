@@ -32,7 +32,8 @@
 //! from the latest poll.
 
 use crate::coach::{Coach, Features, LatestFeatures, MusicInfoRes};
-use crate::state::{AppSettings, AppState, SongTonality};
+use crate::game::InGameRoot;
+use crate::state::{AppSettings, SongTonality};
 use crate::ui::*;
 use crate::widgets::note_dial::{DialScale, DialSlot, DialState, Needle, NeedleStyle};
 use bevy::prelude::*;
@@ -124,10 +125,10 @@ fn build_slots(info: &MusicInfo) -> Vec<DialSlot> {
 /// snapshot is available (and again whenever it changes). Until then the
 /// dial renders as a bare ring with no slots — honest absence, mirroring
 /// the HUD's `—` placeholder.
-pub fn spawn(mut commands: Commands) {
+pub fn spawn(mut commands: Commands, root: Single<Entity, With<InGameRoot>>) {
     let dial = commands
         .spawn((
-            DespawnOnExit(AppState::InGame),
+            ChildOf(*root),
             InGameDial,
             // `Button` makes the whole dial box pickable so `sync_hub` can
             // reveal the hub on *dial* hover (not hub hover). `ButtonSelected`

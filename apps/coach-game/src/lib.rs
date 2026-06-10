@@ -30,6 +30,7 @@ pub mod ui;
 pub mod widgets;
 
 use bevy::prelude::*;
+use bevy::ui::UiSystems;
 use state::{
     AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, SelectedDevice,
     SongTonality,
@@ -59,6 +60,8 @@ pub fn build_app(app: &mut App) {
         .init_resource::<coach::FeatureDrainScratch>()
         .init_resource::<game::GraphProjectorRes>()
         .init_resource::<game::SemanticGraphRes>()
+        .init_resource::<widgets::time_graph::TimeGraphPitchLaneSize>()
+        .init_resource::<widgets::time_graph::TimeGraphSceneRes>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
@@ -115,14 +118,29 @@ pub fn build_app(app: &mut App) {
         // InGame
         .add_systems(
             OnEnter(AppState::InGame),
-            (game::on_enter, game::dial::spawn, game::hud::spawn),
+            (
+                game::on_enter,
+                (
+                    game::spawn_root,
+                    game::dial::spawn,
+                    game::hud::spawn,
+                    game::time_graph::spawn,
+                )
+                    .chain(),
+            ),
         )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
         .add_systems(
             Update,
             (
                 game::log_features,
-                game::refresh_semantic_graph,
+                (
+                    game::refresh_semantic_graph,
+                    game::time_graph::refresh_scene,
+                    widgets::time_graph::apply_scene,
+                    widgets::time_graph::apply_trace_scene,
+                )
+                    .chain(),
                 game::handle_esc_in_game,
                 game::dial::update_from_features,
                 game::dial::repaint_slots,
@@ -146,6 +164,12 @@ pub fn build_app(app: &mut App) {
                 // Read this frame's republished resources, not last
                 // frame's: drain_events writes MusicInfoRes / LatestFeatures.
                 .after(coach::drain_events)
+                .run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            PostUpdate,
+            widgets::time_graph::capture_pitch_lane_size
+                .after(UiSystems::PostLayout)
                 .run_if(in_state(AppState::InGame)),
         )
         // Paused

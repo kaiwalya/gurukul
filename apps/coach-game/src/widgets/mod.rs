@@ -5,3 +5,4 @@
 //! pitch) into widget input (angles, slot states, needle positions).
 
 pub mod note_dial;
+pub mod time_graph;

@@ -5,6 +5,7 @@
 pub mod dial;
 pub mod hud;
 pub mod scale_picker;
+pub mod time_graph;
 
 use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
 use crate::graph_model::{GraphProjector, SemanticGraph};
@@ -20,6 +21,24 @@ pub struct GraphProjectorRes(pub GraphProjector);
 
 #[derive(Resource, Default)]
 pub struct SemanticGraphRes(pub SemanticGraph);
+
+#[derive(Component)]
+pub struct InGameRoot;
+
+pub fn spawn_root(mut commands: Commands) {
+    commands.spawn((
+        DespawnOnExit(AppState::InGame),
+        InGameRoot,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            top: px(0),
+            right: px(0),
+            bottom: px(0),
+            ..default()
+        },
+    ));
+}
 
 pub fn on_enter(
     coach: NonSend<Coach>,
@@ -51,12 +70,14 @@ pub fn on_exit(
     mut history: ResMut<FeatureHistoryRes>,
     mut projector: ResMut<GraphProjectorRes>,
     mut graph: ResMut<SemanticGraphRes>,
+    mut scene: ResMut<crate::widgets::time_graph::TimeGraphSceneRes>,
 ) {
     coach.0.send_command(Command::StopSession);
     last.0 = None;
     history.0.clear();
     projector.0.clear();
     graph.0 = SemanticGraph::default();
+    scene.0 = Default::default();
 }
 
 pub fn refresh_semantic_graph(

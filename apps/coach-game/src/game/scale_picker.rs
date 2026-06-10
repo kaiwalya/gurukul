@@ -24,7 +24,8 @@
 //! pause. `ConfigureSession` is decoupled from the audio lifecycle.
 
 use crate::coach::Coach;
-use crate::state::{AppState, KnownScales, SongTonality};
+use crate::game::InGameRoot;
+use crate::state::{KnownScales, SongTonality};
 use crate::ui::*;
 use bevy::prelude::*;
 use domain_ports::app_coach::Command;
@@ -81,6 +82,7 @@ pub fn sync_picker(
     existing: Query<Entity, With<ScalePickerRoot>>,
     scales: Res<KnownScales>,
     tonality: Res<SongTonality>,
+    root: Single<Entity, With<InGameRoot>>,
 ) {
     if !showing.is_changed() {
         return;
@@ -92,7 +94,12 @@ pub fn sync_picker(
     if !showing.0 {
         return;
     }
-    spawn_picker(&mut commands, &scales.0, tonality.0.tuning().len() as u32);
+    spawn_picker(
+        &mut commands,
+        *root,
+        &scales.0,
+        tonality.0.tuning().len() as u32,
+    );
 }
 
 /// Repopulate the row list when [`KnownScales`] changes while the
@@ -184,11 +191,11 @@ fn shape_label(shape: ScaleIntervals, n: u32) -> String {
 /// Spawn the overlay tree. The shape rows are placed in a scrollable
 /// child so long catalogues don't overflow the screen. `n` is the active
 /// tuning's slot count, used to render each row's tooth-widths.
-fn spawn_picker(commands: &mut Commands, shapes: &[ScaleIntervals], n: u32) {
+fn spawn_picker(commands: &mut Commands, parent: Entity, shapes: &[ScaleIntervals], n: u32) {
     let root = commands
         .spawn((
+            ChildOf(parent),
             ScalePickerRoot,
-            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 left: px(32),

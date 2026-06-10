@@ -24,7 +24,7 @@
 //! it becomes `Some`.
 
 use crate::coach::MusicInfoRes;
-use crate::state::AppState;
+use crate::game::InGameRoot;
 use crate::ui::*;
 use bevy::prelude::*;
 use domain_ports::app_coach::MusicInfo;
@@ -48,14 +48,18 @@ pub struct HudDegRow;
 #[derive(Resource, Default)]
 pub struct LastMusicInfo(pub Option<MusicInfo>);
 
-pub fn spawn(mut commands: Commands, mut last: ResMut<LastMusicInfo>) {
+pub fn spawn(
+    mut commands: Commands,
+    mut last: ResMut<LastMusicInfo>,
+    root: Single<Entity, With<InGameRoot>>,
+) {
     // Force a repaint on (re)entry: the panel's text nodes spawn empty,
     // so clear the change-tracker even if the snapshot is unchanged
     // from the previous InGame visit.
     last.0 = None;
     let panel = commands
         .spawn((
-            DespawnOnExit(AppState::InGame),
+            ChildOf(*root),
             HudBadge,
             Button,
             Node {
