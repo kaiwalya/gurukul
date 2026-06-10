@@ -12,6 +12,11 @@ resource and the always-on event drain. `state` defines `AppState`
 the menu screens. `game` runs the session: `StartSession` on enter,
 `StopSession` on exit, feature snapshots logged each frame.
 
+Widget workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md): build
+model, scene contract, and widget systems in isolation before stitching
+them into an app screen. This file owns the Bevy mechanics and local app
+conventions.
+
 ## Running it
 
 `cargo run -p coach-game`. **It takes ~3 seconds to boot.** Bevy

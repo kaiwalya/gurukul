@@ -1,6 +1,11 @@
 # Contributing to `coach-game`
 
-This app is easiest to build one widget at a time, but the unit is not a React-style function component. In Bevy, the stable unit is:
+Build UI in isolated pieces before stitching it into the screen. A widget
+should be useful and testable through its own model, scene contract, and
+ECS systems before the app route, menu, or game surface depends on it.
+
+This app is easiest to build one widget at a time, but the unit is not a
+React-style function component. In Bevy, the stable unit is:
 
 1. a pure model or projection step,
 2. a small scene/resource contract,
@@ -39,7 +44,9 @@ Use the same three test levels for each non-trivial widget:
 3. **Layout-aware tests**
    When geometry depends on UI layout, capture `ComputedNode` after `UiSystems::PostLayout` and feed the next frame from that measured size.
 
-This is the important Bevy-specific rule: layout-dependent UI often needs a two-step loop.
+This is the important Bevy-specific rule: layout-dependent UI often needs
+a two-step loop. The Bevy scheduling mechanics for that loop live in
+[`AGENTS.md`](AGENTS.md); this file owns the widget workflow.
 
 - `Update`: build the scene and UI from last known layout inputs.
 - `PostLayout`: capture measured sizes for the next frame.
@@ -62,14 +69,6 @@ For example, a graph widget should expose markers like:
 
 That gives tests a stable surface even when the visual tree grows.
 
-## Scheduling rules
-
-- If a paint/apply pass depends on entities spawned earlier in the same frame, use `.chain()`.
-- If a system depends on measured UI size, run the measurement after `UiSystems::PostLayout`.
-- Prefer a single screen root for each state and parent overlays/widgets under it with `ChildOf`.
-
-Independent top-level UI roots are easy to spawn, but they make layering and clipping harder to reason about.
-
 ## Practical workflow
 
 When building a new widget:
@@ -81,5 +80,6 @@ When building a new widget:
 5. Add layout-dependent geometry only after the static tree is correct.
 6. Capture measured layout into a resource if the geometry depends on actual lane/panel size.
 7. Only then add styling and richer behaviour.
+8. Stitch the widget into the app screen after the isolated model, scene, and widget tests pass.
 
 This keeps iteration local and makes it possible to debug tree shape, layout, and rendering separately instead of all at once.
