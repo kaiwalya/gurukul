@@ -2,9 +2,7 @@
 
 *How to build a widget.* For **what** the layers are and **why** the crate is
 shaped this way (the slice doctrine, music quarantine, scene shapes, marker
-ownership), see [`ARCHITECTURE.md`](ARCHITECTURE.md). The backport plan for the
-existing InGame UI lives in
-[`../../docs/COACH_GAME_LAYERING_PLAN.md`](../../docs/COACH_GAME_LAYERING_PLAN.md).
+ownership), see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 Build UI in isolated pieces before stitching it into the screen. A widget
 should be useful and testable through its own model, scene contract, and ECS
