@@ -1,14 +1,14 @@
 //! InGame state: open a session with the selected device, stream
 //! features. Features print to stdout (see [`log_features`]) and feed
-//! the note dial overlay (see [`dial`]).
+//! the note dial overlay (see [`note_dial`]).
 
-pub mod dial;
 pub mod hud;
+pub mod note_dial;
 pub mod scale_picker;
 pub mod time_graph;
 
 use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
-use crate::graph_model::{GraphProjector, SemanticGraph};
+use crate::semantic_graph::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};

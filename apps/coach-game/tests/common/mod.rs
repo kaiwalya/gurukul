@@ -6,6 +6,8 @@
 //! `coach_game::build_app` on top. The fake's call log is shared via
 //! an `Arc<Mutex<...>>` so tests can assert on it after `app.update()`.
 
+use bevy::camera::{Camera, ComputedCameraValues, RenderTargetInfo};
+use bevy::math::UVec2;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use coach_game::coach::Coach;
@@ -71,6 +73,11 @@ impl AppCoach for FakeCoach {
 /// a handle to the fake's state for assertions. `InputPlugin` is
 /// included so systems that read `Res<ButtonInput<KeyCode>>` (e.g. Esc
 /// handlers) resolve their resources.
+///
+/// `allow(dead_code)` for the per-binary recompile reason noted on
+/// `drain_commands`: a layout-only test binary uses `build_layout_test_app`
+/// instead and never touches this one.
+#[allow(dead_code)]
 pub fn build_test_app() -> (App, FakeCoach) {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
@@ -92,6 +99,82 @@ pub fn build_test_app() -> (App, FakeCoach) {
 #[allow(dead_code)]
 pub fn drain_commands(fake: &FakeCoach) -> Vec<Command> {
     std::mem::take(&mut fake.inner.lock().unwrap().commands)
+}
+
+/// Build a **layout-aware** test app: the production wiring on top of the
+/// real Bevy UI layout schedule, with no GPU and no window. This is the
+/// only harness that populates `ComputedNode` (measured sizes) and
+/// `UiGlobalTransform` (global screen positions), so it is the only level
+/// that can see the measure→paint seam — the physical/logical frame and
+/// clipping. See `ARCHITECTURE.md` ("Testability follows the layers") and
+/// `CONTRIBUTING.md` (the layer-3 rules) for *why*.
+///
+/// Recipe (proven against bevy_ui 0.18): keep `RenderPlugin` so every
+/// downstream render plugin's shader/asset init is satisfied, but give
+/// wgpu **no backend** so no GPU device is created; drop the window and
+/// disable winit. A `Camera2d` carrying a hand-set `RenderTargetInfo` at
+/// **scale_factor 2.0** drives layout at a non-unit scale — at 1× a
+/// physical/logical frame bug is mathematically invisible and the test
+/// would certify the broken code, so 2× is mandatory, not incidental.
+///
+/// `DefaultPlugins` brings its own `InputPlugin` and `StatesPlugin` is not
+/// part of it (state is registered by `build_app`'s `init_state`), so —
+/// unlike `build_test_app` — neither is added here.
+pub fn build_layout_test_app() -> (App, FakeCoach) {
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: None,
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                ..default()
+            })
+            .set(bevy::render::RenderPlugin {
+                render_creation: bevy::render::settings::WgpuSettings {
+                    backends: None,
+                    ..default()
+                }
+                .into(),
+                ..default()
+            })
+            .disable::<bevy::winit::WinitPlugin>(),
+    );
+
+    // Camera with a hand-set 2× render target — no GPU, no window.
+    app.world_mut().spawn((
+        Camera2d,
+        Camera {
+            computed: ComputedCameraValues {
+                target_info: Some(RenderTargetInfo {
+                    physical_size: UVec2::new(1600, 1200),
+                    scale_factor: 2.0,
+                }),
+                ..default()
+            },
+            ..default()
+        },
+    ));
+
+    let fake = FakeCoach::default();
+    app.insert_non_send_resource(Coach(Box::new(fake.clone())));
+
+    coach_game::build_app(&mut app);
+    (app, fake)
+}
+
+/// Drive the layout-aware schedule until the capture→paint loop settles.
+/// The chain spans two frames: `capture_pitch_lane_size` runs in
+/// `PostUpdate` after `UiSystems::PostLayout` (so it sees this frame's
+/// measured lane), and `apply_trace_scene` reads that captured size on the
+/// *next* `Update`. A single `app.update()` therefore paints zero trace
+/// bodies (no size yet); several updates let the size land, the trace
+/// paint, and the layout re-settle on the painted nodes. `allow(dead_code)`
+/// for the same per-binary recompile reason as `drain_commands`.
+#[allow(dead_code)]
+pub fn pump_layout(app: &mut App) {
+    for _ in 0..6 {
+        app.update();
+    }
 }
 
 /// Drive the schedule until any pending `NextState` has been applied

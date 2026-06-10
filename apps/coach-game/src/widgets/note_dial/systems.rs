@@ -1,82 +1,39 @@
-//! Note-dial widget — N positions around a circle plus zero or more
-//! needles pointing into the circle.
+//! Note-dial systems: Bevy node spawning, markers, painting,
+//! current-slot geometry. Reads the [scene](super::scene), knows the
+//! engine, not the domain.
 //!
-//! The widget is purely geometric. It knows nothing of frequencies,
-//! scales, tonics, tuning systems, or labels' meaning. Callers compute
-//! angles upstream and hand them over.
-//!
-//! Convention: `angle = 0` points to 12 o'clock; positive radians
-//! rotate clockwise. Callers using standard math convention (0 = 3
-//! o'clock, CCW positive) convert before passing in.
-//!
-//! Two components per dial entity:
-//!
-//! - [`DialScale`] — geometry (slot angles, labels, active/inactive).
-//!   Changes rarely (when the underlying scale/raga/tonic changes).
-//! - [`DialState`] — per-frame state (just needles, for now). Changes
-//!   frequently. The "current slot" highlight is derived inside the
-//!   widget from the primary needle's angle — callers do not specify
-//!   it directly.
-//!
-//! Split so `Changed<DialState>` repaints existing slot children
-//! without rebuilding the geometry.
+//! The widget owns its spawn ([`spawn`]) and stays **placement-agnostic**:
+//! it builds the shell, hub, and hub label in neutral/relative layout and
+//! takes no placement argument, so the same tree is reusable under any
+//! route or test harness. Route placement is applied by glue on the
+//! returned shell entity.
 
 use bevy::prelude::*;
 use std::f32::consts::TAU;
 
-/// Geometry of one dial. Spawn alongside a [`DialState`] on the same
-/// entity, plus a [`Node`] (or 3D transform) positioning the dial.
+use crate::ui::*;
+
+use super::scene::{DialScale, DialState, HubState, NeedleStyle};
+
+/// Marker for the dial shell entity so its `DialState` can be looked up
+/// each frame without ambiguity. Carries no route vocabulary — placement
+/// (InGame overlay, etc.) is a glue concern applied to the same entity.
 #[derive(Component)]
-pub struct DialScale {
-    pub slots: Vec<DialSlot>,
-}
+pub struct NoteDialRoot;
 
-pub struct DialSlot {
-    /// Radians, 0 = 12 o'clock, clockwise positive. Should lie in
-    /// `[0, TAU)` but callers may pass any value; the widget uses
-    /// it directly to position the slot.
-    pub angle: f32,
-    /// Display label. `None` skips text rendering for that slot.
-    pub label: Option<String>,
-    /// In the current scale / raga / mode? Inactive slots render with
-    /// a dim fill; active ones with a medium fill. Both can still
-    /// become "current" if the needle lands on them — the border is
-    /// what shows that.
-    pub active: bool,
-}
+/// Marker for the dial's **center hub** — a click target over the dial's
+/// middle (where Sa lives). Clicking captures the live pitch as the new
+/// root; hovering reveals the affordance.
+#[derive(Component)]
+pub struct DialHub;
 
-/// Per-frame state. Spawn alongside a [`DialScale`] on the same entity.
-#[derive(Component, Default)]
-pub struct DialState {
-    /// Zero or more needles. Each rebuild despawns and respawns all
-    /// needle entities — cheap because needles are few and trivial.
-    ///
-    /// The *first* needle (if any) is the "primary" needle, and the
-    /// one used to compute the current-slot highlight. Subsequent
-    /// needles are decorative (e.g. a target pitch).
-    pub needles: Vec<Needle>,
-}
+/// Marker for the hub's label text, so glue can swap its colour between
+/// resting and hover states.
+#[derive(Component)]
+pub struct DialHubLabel;
 
-pub struct Needle {
-    pub angle: f32,
-    pub style: NeedleStyle,
-    /// Opacity multiplier in `0.0..=1.0`, applied to the needle
-    /// colour's alpha at paint time. Drives "certainty" — a faint
-    /// needle is a low-confidence pitch. Defaults to fully opaque for
-    /// decorative needles that don't carry a confidence signal.
-    pub brightness: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NeedleStyle {
-    Primary,
-    Secondary,
-}
-
-// --- Internals --------------------------------------------------------
-
-/// Child marker for slot dots — owned by the parent dial entity, one
-/// per `DialScale::slots` entry, in the same order.
+/// Child marker for slot dots — owned by the parent dial entity, one per
+/// `DialScale::slots` entry, in the same order.
 #[derive(Component)]
 pub struct SlotDot {
     index: usize,
@@ -96,10 +53,12 @@ const NEEDLE_LENGTH_PX: f32 = DIAL_RADIUS_PX - SLOT_SIZE_PX;
 const NEEDLE_WIDTH_PRIMARY_PX: f32 = 4.0;
 const NEEDLE_WIDTH_SECONDARY_PX: f32 = 2.0;
 /// Pixel offset from the parent's top-left corner to its centre.
-/// The widget assumes the parent is at least `2 * (DIAL_RADIUS_PX +
-/// SLOT_SIZE_PX/2)` px wide and tall; callers spawning a smaller
-/// container will see slots clipped.
 const DIAL_CENTRE_PX: f32 = DIAL_RADIUS_PX + SLOT_SIZE_PX;
+/// The shell's intrinsic side length: wide enough to hold the ring plus a
+/// slot on each side.
+const DIAL_BOX_PX: f32 = 324.0;
+/// The hub's diameter.
+const HUB_SIZE_PX: f32 = 64.0;
 
 /// Inactive slot fill — slot is not in the current scale.
 const COLOR_SLOT_INACTIVE: Color = Color::srgb(0.20, 0.20, 0.24);
@@ -107,19 +66,88 @@ const COLOR_SLOT_INACTIVE: Color = Color::srgb(0.20, 0.20, 0.24);
 const COLOR_SLOT_ACTIVE: Color = Color::srgb(0.45, 0.70, 0.95);
 /// Border glow on the current slot when it is in-scale ("right on it").
 const COLOR_BORDER_CURRENT_ACTIVE: Color = Color::srgb(1.0, 1.0, 1.0);
-/// Border glow on the current slot when it is *out-of-scale*
-/// ("you're singing a note that's not in this raga"). Distinct hue so
-/// it reads as a warning rather than a target.
+/// Border glow on the current slot when it is *out-of-scale*. Distinct hue
+/// so it reads as a warning rather than a target.
 const COLOR_BORDER_CURRENT_INACTIVE: Color = Color::srgb(0.95, 0.55, 0.20);
 /// Transparent border for slots that aren't current. We always draw a
-/// border-width-sized border so the slot's inner size is stable —
-/// flipping current on/off only changes the colour, not the geometry.
+/// border-width-sized border so the slot's inner size is stable.
 const COLOR_BORDER_NONE: Color = Color::srgba(0.0, 0.0, 0.0, 0.0);
 
 const COLOR_NEEDLE_PRIMARY: Color = Color::srgb(0.95, 0.95, 0.95);
 const COLOR_NEEDLE_SECONDARY: Color = Color::srgba(0.95, 0.95, 0.95, 0.45);
 
-// --- Systems ----------------------------------------------------------
+// --- Spawn ------------------------------------------------------------
+
+/// Spawn the dial shell, hub, and hub label under `parent`, **empty** (no
+/// slots yet) and in neutral/relative layout. Returns the shell entity so
+/// glue can apply route placement to its `Node`.
+///
+/// The shell carries [`DialScale`] / [`DialState`] (the scene contract glue
+/// writes), a [`Button`] so the whole box is pickable for hub hover, and
+/// [`ButtonSelected`] to opt out of the generic repaint.
+pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
+    let dial = commands
+        .spawn((
+            ChildOf(parent),
+            NoteDialRoot,
+            Button,
+            ButtonSelected,
+            Node {
+                width: px(DIAL_BOX_PX),
+                height: px(DIAL_BOX_PX),
+                // Center the hub child over the dial's middle (Sa).
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            DialScale { slots: Vec::new() },
+            DialState::default(),
+        ))
+        .id();
+
+    // Center hub: the click target. Spawns transparent (invisible until
+    // hovered); glue paints the three-state look. `ButtonSelected` opts it
+    // out of the generic hover/press repaint.
+    commands.entity(dial).with_child((
+        Button,
+        DialHub,
+        ButtonSelected,
+        Node {
+            width: px(HUB_SIZE_PX),
+            height: px(HUB_SIZE_PX),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            border_radius: BorderRadius::all(percent(50)),
+            ..default()
+        },
+        BackgroundColor(Color::NONE),
+        children![(
+            DialHubLabel,
+            Text::new("Zero"),
+            TextFont {
+                font_size: FONT_BODY,
+                ..default()
+            },
+            TextColor(Color::NONE),
+        )],
+    ));
+
+    dial
+}
+
+/// Map a resolved [`HubState`] to the hub's (background, text) colour pair.
+/// The enum → colour mapping lives here (the Bevy layer); the model resolves
+/// the enum without touching `bevy::Color`.
+pub fn hub_colors(state: HubState) -> (Color, Color) {
+    match state {
+        HubState::Hidden => (Color::NONE, Color::NONE),
+        HubState::Disabled => (COLOR_BUTTON_DISABLED, COLOR_TEXT_DIM),
+        HubState::Enabled => (COLOR_BUTTON, COLOR_TEXT),
+        HubState::Pressed => (COLOR_BUTTON_PRESSED, COLOR_TEXT),
+    }
+}
+
+// --- Painting ---------------------------------------------------------
 
 /// Rebuild slot child entities whenever `DialScale` changes. Each slot
 /// becomes a small UI node positioned at its angle on a circle of
@@ -130,13 +158,11 @@ pub fn rebuild_slots(
     existing_slots: Query<(Entity, &ChildOf), With<SlotDot>>,
 ) {
     for (dial_entity, scale) in dials.iter() {
-        // Despawn old slot children.
         for (child, parent) in existing_slots.iter() {
             if parent.parent() == dial_entity {
                 commands.entity(child).despawn();
             }
         }
-        // Spawn fresh slot dots.
         for (i, slot) in scale.slots.iter().enumerate() {
             let (x, y) = polar_to_offset(slot.angle, DIAL_RADIUS_PX);
             commands.spawn((
@@ -160,13 +186,8 @@ pub fn rebuild_slots(
 }
 
 /// Repaint slot dots and rebuild needles whenever `DialState` *or*
-/// `DialScale` changes. Both, because:
-/// - State change → recompute the current slot, recolour all slots,
-///   respawn needles.
-/// - Scale change → `rebuild_slots` (above) just spawned fresh slots in
-///   their default-inactive colour; we need a paint pass on the same
-///   frame (after the rebuild's commands flush) so the very first
-///   render shows the correct active/inactive state.
+/// `DialScale` changes (the scale path repaints the fresh slots
+/// `rebuild_slots` just spawned, on the same frame).
 pub fn apply_state(
     mut commands: Commands,
     dials: Query<(Entity, &DialScale, &DialState), Or<(Changed<DialState>, Changed<DialScale>)>>,
@@ -209,17 +230,10 @@ pub fn apply_state(
                 NeedleStyle::Primary => (COLOR_NEEDLE_PRIMARY, NEEDLE_WIDTH_PRIMARY_PX),
                 NeedleStyle::Secondary => (COLOR_NEEDLE_SECONDARY, NEEDLE_WIDTH_SECONDARY_PX),
             };
-            // Scale the style colour's own alpha by the needle's
-            // brightness so confidence ghosts the needle without
-            // changing its hue.
             let color = base_color.with_alpha(base_color.alpha() * needle.brightness);
-            // To anchor the needle's *base* at the dial centre while
-            // pivoting around that base, wrap the needle in a zero-size
-            // pivot node positioned at the centre and rotated by `angle`.
-            // The needle itself is a child of the pivot, offset so its
-            // bottom edge sits at the pivot's origin and it extends
-            // upward (12 o'clock at angle = 0). When the pivot rotates,
-            // the needle swings around the pivot's origin — the centre.
+            // Wrap the needle in a zero-size pivot node at the centre,
+            // rotated by `angle`; the needle child extends upward so its
+            // base sits at the pivot's origin (12 o'clock at angle = 0).
             let pivot = commands
                 .spawn((
                     NeedleEntity,
@@ -251,24 +265,23 @@ pub fn apply_state(
     }
 }
 
+// --- Current-slot geometry --------------------------------------------
+
 /// Find the slot the primary needle is currently "on", or `None` if it
 /// sits in the dead band between slots.
 ///
-/// Returns the index of the slot whose centre is within `slot_arc / 6`
-/// of the primary needle's angle, where `slot_arc` is the smaller of
-/// the two arcs from this slot to its neighbours (handles non-uniform
-/// spacings — for 12-TET it simplifies to `TAU/72`, i.e. ±5° around
-/// each slot, with a 10° dead zone in the middle of each pair).
+/// Returns the index of the slot whose centre is within `slot_arc / 6` of
+/// the primary needle's angle, where `slot_arc` is the smaller of the two
+/// arcs from this slot to its neighbours.
 ///
-/// No needles → `None`. The first needle is the primary; later needles
-/// are decorative and do not influence the highlight.
+/// No needles → `None`. The first needle is the primary; later needles are
+/// decorative and do not influence the highlight.
 fn current_slot(scale: &DialScale, state: &DialState) -> Option<usize> {
     let needle = state.needles.first()?;
     if scale.slots.is_empty() {
         return None;
     }
     let n = scale.slots.len();
-    // Pre-compute normalised slot angles.
     let angles: Vec<f32> = scale
         .slots
         .iter()
@@ -276,15 +289,10 @@ fn current_slot(scale: &DialScale, state: &DialState) -> Option<usize> {
         .collect();
     let needle_angle = needle.angle.rem_euclid(TAU);
 
-    // Find the nearest slot first.
     let (nearest_idx, nearest_dist) = (0..n)
         .map(|i| (i, angular_distance(angles[i], needle_angle)))
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
 
-    // Half the smaller arc from this slot to its (sorted-by-angle)
-    // neighbours, divided by 3 for the deadband. Build a sorted index
-    // list so neighbours are well-defined even when slots are given out
-    // of angular order.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|a, b| {
         angles[*a]
@@ -297,8 +305,6 @@ fn current_slot(scale: &DialScale, state: &DialState) -> Option<usize> {
     let arc_prev = angular_distance(angles[nearest_idx], angles[prev]);
     let arc_next = angular_distance(angles[nearest_idx], angles[next]);
     let smaller_arc = arc_prev.min(arc_next);
-    // Highlight band: ±(smaller_arc / 6) → the middle third of the gap
-    // to each neighbour is dead.
     let band = smaller_arc / 6.0;
 
     if nearest_dist <= band {
@@ -314,10 +320,9 @@ fn angular_distance(a: f32, b: f32) -> f32 {
     d.min(TAU - d)
 }
 
-/// Map an angle (clock convention, 0 = up, clockwise positive) to a
-/// pixel offset from the parent's centre.
+/// Map an angle (clock convention, 0 = up, clockwise positive) to a pixel
+/// offset from the parent's centre.
 fn polar_to_offset(angle: f32, radius: f32) -> (f32, f32) {
-    // Clock: angle 0 → (0, -radius), TAU/4 → (radius, 0).
     let normalised = angle.rem_euclid(TAU);
     let x = radius * normalised.sin();
     let y = -radius * normalised.cos();
@@ -326,6 +331,7 @@ fn polar_to_offset(angle: f32, radius: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::scene::{DialSlot, Needle};
     use super::*;
 
     fn scale_12tet(active: [bool; 12]) -> DialScale {
@@ -360,15 +366,12 @@ mod tests {
     #[test]
     fn current_is_slot_when_needle_on_slot() {
         let scale = scale_12tet([true; 12]);
-        // Slot 3 is at 3 * TAU/12 = TAU/4.
         let state = with_needle(TAU / 4.0);
         assert_eq!(current_slot(&scale, &state), Some(3));
     }
 
     #[test]
     fn current_is_none_in_dead_zone_between_slots() {
-        // 12 slots → slot arc = TAU/12. Band = TAU/72 each side.
-        // Halfway between slot 0 and slot 1 is TAU/24, far outside ±TAU/72.
         let scale = scale_12tet([true; 12]);
         let state = with_needle(TAU / 24.0);
         assert_eq!(current_slot(&scale, &state), None);
@@ -377,7 +380,6 @@ mod tests {
     #[test]
     fn current_is_slot_just_inside_band() {
         let scale = scale_12tet([true; 12]);
-        // Just inside ±TAU/72 of slot 0.
         let state = with_needle(TAU / 72.0 * 0.99);
         assert_eq!(current_slot(&scale, &state), Some(0));
     }
@@ -391,8 +393,6 @@ mod tests {
 
     #[test]
     fn inactive_slot_still_eligible_for_current() {
-        // Off-scale current — slot 1 (C#) is inactive, but the needle
-        // points exactly at it.
         let mut active = [true; 12];
         active[1] = false;
         let scale = scale_12tet(active);

@@ -13,7 +13,13 @@
 //! - `state` — AppState enum + shared resources.
 //! - `ui` — colour palette + per-frame button repaint.
 //! - `menu::main_menu`, `menu::settings` — menu screens.
-//! - `game` — InGame setup/teardown + feature logging.
+//! - `game` — InGame setup/teardown + feature logging, plus the route
+//!   glue (`game/<name>.rs`, one per widget) that stitches widgets to
+//!   app state.
+//! - `widgets::<name>` — InGame UI vertical slices (`model` / `scene` /
+//!   `systems`); see `ARCHITECTURE.md`.
+//! - `semantic_graph` — crate-level shared pitch/time projection that
+//!   feeds the time-graph widget.
 //!
 //! Items are `pub` so integration tests under `tests/` can spawn the
 //! schedule against a fake `AppCoach`.
@@ -23,8 +29,8 @@ pub mod feature_history;
 pub mod feature_types;
 pub mod font;
 pub mod game;
-pub mod graph_model;
 pub mod menu;
+pub mod semantic_graph;
 pub mod state;
 pub mod ui;
 pub mod widgets;
@@ -52,7 +58,6 @@ pub fn build_app(app: &mut App) {
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
         .init_resource::<game::LastFeatureHop>()
-        .init_resource::<game::hud::LastMusicInfo>()
         .init_resource::<game::scale_picker::ShowingScalePicker>()
         .init_resource::<coach::MusicInfoRes>()
         .init_resource::<coach::LatestFeatures>()
@@ -60,8 +65,9 @@ pub fn build_app(app: &mut App) {
         .init_resource::<coach::FeatureDrainScratch>()
         .init_resource::<game::GraphProjectorRes>()
         .init_resource::<game::SemanticGraphRes>()
-        .init_resource::<widgets::time_graph::TimeGraphPitchLaneSize>()
-        .init_resource::<widgets::time_graph::TimeGraphSceneRes>()
+        .init_resource::<widgets::time_graph::scene::TimeGraphPitchLaneSize>()
+        .init_resource::<widgets::time_graph::scene::TimeGraphSceneRes>()
+        .init_resource::<widgets::hud::scene::HudSceneRes>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
@@ -75,8 +81,8 @@ pub fn build_app(app: &mut App) {
                 // flushes the rebuild's spawn commands so apply_state
                 // sees the new SlotDot entities on the same frame.
                 (
-                    widgets::note_dial::rebuild_slots,
-                    widgets::note_dial::apply_state,
+                    widgets::note_dial::systems::rebuild_slots,
+                    widgets::note_dial::systems::apply_state,
                 )
                     .chain(),
             ),
@@ -122,7 +128,7 @@ pub fn build_app(app: &mut App) {
                 game::on_enter,
                 (
                     game::spawn_root,
-                    game::dial::spawn,
+                    game::note_dial::spawn,
                     game::hud::spawn,
                     game::time_graph::spawn,
                 )
@@ -137,27 +143,29 @@ pub fn build_app(app: &mut App) {
                 (
                     game::refresh_semantic_graph,
                     game::time_graph::refresh_scene,
-                    widgets::time_graph::apply_scene,
-                    widgets::time_graph::apply_trace_scene,
+                    widgets::time_graph::systems::apply_scene,
+                    widgets::time_graph::systems::apply_trace_scene,
                 )
                     .chain(),
                 game::handle_esc_in_game,
-                game::dial::update_from_features,
-                game::dial::repaint_slots,
-                game::dial::handle_hub_capture,
-                game::dial::sync_hub,
+                game::note_dial::update_from_features,
+                game::note_dial::repaint_slots,
+                game::note_dial::handle_hub_capture,
+                game::note_dial::sync_hub,
                 game::hud::refresh,
+                widgets::hud::systems::sync_text,
                 // Scale picker: handle_hud_click opens, sync_picker
-                // spawns/despawns, sync_rows repopulates when the
-                // catalogue lands, row/close clicks select or close.
-                // sync_rows uses .chain() so spawn_picker's Commands
-                // flush before sync_rows reads the new ScalePickerRows.
+                // spawns/despawns, sync_rows repopulates when the catalogue
+                // lands, row/close clicks select or close. The three are
+                // `.chain()`ed so sync_picker's spawn `Commands` flush
+                // before sync_rows reads the new ScalePickerRows on the same
+                // frame (the same-frame sync-point rule, AGENTS.md).
                 (
                     game::scale_picker::handle_hud_click,
                     game::scale_picker::sync_picker,
+                    game::scale_picker::sync_rows,
                 )
                     .chain(),
-                game::scale_picker::sync_rows,
                 game::scale_picker::handle_row_click,
                 game::scale_picker::handle_close_click,
             )
@@ -168,7 +176,7 @@ pub fn build_app(app: &mut App) {
         )
         .add_systems(
             PostUpdate,
-            widgets::time_graph::capture_pitch_lane_size
+            widgets::time_graph::systems::capture_pitch_lane_size
                 .after(UiSystems::PostLayout)
                 .run_if(in_state(AppState::InGame)),
         )

@@ -57,6 +57,14 @@ gives you an empty log file and a misleading "no output" conclusion.
   `Node` doesn't require it — adding `Transform` to a UI child fires
   B0004 on the parent. `UiTransform` rotates clockwise, matching the
   clock convention used elsewhere.
+- `ComputedNode` geometry is in **physical pixels**; `px(...)` /
+  `Val::Px` are **logical**. Multiply by `inverse_scale_factor()` to
+  convert physical → logical before feeding a measured size back into a
+  `Node`. On a 2× display, skipping this doubles every coordinate and
+  the painted node lands off-screen. `src/ui.rs` (the scroll clamp:
+  `(content_size() - size()) * inverse_scale_factor()`) is the correct
+  in-crate precedent. The *rule* for storing such a value behind a
+  frame-explicit newtype lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - A `Changed<X>` paint pass needs a sync point if it depends on
   entities spawned earlier in the same frame. Order with `.chain()`
   so the spawning system's `Commands` flush before the paint reads

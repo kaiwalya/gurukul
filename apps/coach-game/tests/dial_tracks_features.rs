@@ -1,4 +1,4 @@
-//! Integration tests for `game::dial::update_from_features`: voiced
+//! Integration tests for `game::note_dial::update_from_features`: voiced
 //! → primary needle at the expected angle; unvoiced or no snapshot →
 //! no needle; transitioning from voiced to unvoiced clears the needle.
 //!
@@ -8,9 +8,8 @@
 mod common;
 
 use bevy::prelude::*;
-use coach_game::game::dial::InGameDial;
 use coach_game::menu::main_menu::NewGameButton;
-use coach_game::widgets::note_dial::DialState;
+use coach_game::widgets::note_dial::{DialState, NoteDialRoot};
 use common::{build_test_app, pump};
 use domain_ports::app_coach::{CoachEvent, FeatureSnapshot, MusicInfo};
 use domain_ports::pitch::PitchLog2;
@@ -61,7 +60,7 @@ fn set_features(fake: &common::FakeCoach, snap: Option<FeatureSnapshot>) {
 
 fn dial_needles(app: &mut App) -> Vec<f32> {
     app.world_mut()
-        .query_filtered::<&DialState, With<InGameDial>>()
+        .query_filtered::<&DialState, With<NoteDialRoot>>()
         .iter(app.world())
         .flat_map(|s| s.needles.iter().map(|n| n.angle))
         .collect()
