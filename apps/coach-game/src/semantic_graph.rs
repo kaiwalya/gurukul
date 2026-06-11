@@ -542,6 +542,89 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_zoom_out_moves_both_edges_equally_keeping_curve_centered() {
+        let mut projector = GraphProjector::default();
+        let center = 8.5;
+
+        // An oscillation whose amplitude grows each step: the data range
+        // widens symmetrically around the center, so the window must too.
+        let mut samples = Vec::new();
+        let mut previous: Option<PitchWindow> = None;
+        for i in 0..10u64 {
+            let amp = 0.1 * (i + 1) as f32;
+            samples.push(feature(2 * i, i * 200, Some(center + amp)));
+            samples.push(feature(2 * i + 1, i * 200 + 100, Some(center - amp)));
+            let window = projector
+                .project(&history(samples.iter().copied()), None)
+                .pitch_window
+                .unwrap();
+
+            let midpoint = (window.min.0 + window.max.0) * 0.5;
+            assert!(
+                (midpoint - center).abs() < 1e-4,
+                "step {i}: midpoint {midpoint} drifted from {center}"
+            );
+            if let Some(prev) = previous {
+                let min_moved = prev.min.0 - window.min.0;
+                let max_moved = window.max.0 - prev.max.0;
+                assert!(min_moved > 0.0 && max_moved > 0.0);
+                assert!(
+                    (min_moved - max_moved).abs() < 1e-4,
+                    "step {i}: asymmetric expansion (min {min_moved}, max {max_moved})"
+                );
+            }
+            previous = Some(window);
+        }
+    }
+
+    #[test]
+    fn symmetric_contraction_eases_both_edges_equally_keeping_curve_centered() {
+        let mut projector = GraphProjector::default();
+        let center = 8.5;
+        let broad = history([
+            feature(0, 0, Some(center - 1.0)),
+            feature(1, 10, Some(center + 1.0)),
+        ]);
+        projector.project(&broad, None);
+
+        // After the extremes are gone from history, only narrow notes around
+        // the same center remain. Each easing step must shrink both edges by
+        // equal amounts; the narrow target span is 0.1 + 2 * padding.
+        let narrow_target_span = 0.1 + 2.0 * PITCH_PADDING_OCTAVES;
+        let mut previous: Option<PitchWindow> = None;
+        for i in 0..8u64 {
+            let t = 1_000 + i * 200;
+            let window = projector
+                .project(
+                    &history([
+                        feature(10 + 2 * i, t, Some(center - 0.05)),
+                        feature(11 + 2 * i, t + 100, Some(center + 0.05)),
+                    ]),
+                    None,
+                )
+                .pitch_window
+                .unwrap();
+
+            let midpoint = (window.min.0 + window.max.0) * 0.5;
+            assert!(
+                (midpoint - center).abs() < 1e-4,
+                "step {i}: midpoint {midpoint} drifted from {center}"
+            );
+            if i == 0 {
+                // Eases rather than snapping straight to the narrow target.
+                assert!(window.max.0 - window.min.0 > narrow_target_span + 0.05);
+            }
+            if let Some(prev) = previous {
+                assert!(window.min.0 >= prev.min.0 && window.max.0 <= prev.max.0);
+            }
+            previous = Some(window);
+        }
+        // It actually contracted over the run.
+        let settled = previous.unwrap();
+        assert!(settled.max.0 - settled.min.0 < 2.0);
+    }
+
+    #[test]
     fn groove_geometry_repeats_by_octave_and_ignores_scale_register() {
         let intervals = ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1]);
         let low = music(TuningKind::HindustaniJust, intervals, 4);
