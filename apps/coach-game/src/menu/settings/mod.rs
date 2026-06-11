@@ -79,6 +79,7 @@ pub fn on_enter(
 
     let root = commands
         .spawn((
+            Name::new("settings"),
             DespawnOnExit(AppState::Settings),
             Node {
                 width: percent(100),
@@ -129,6 +130,7 @@ pub fn on_enter(
     commands
         .spawn((
             ChildOf(root),
+            Name::new("back"),
             Button,
             BackButton,
             Node {
@@ -162,6 +164,7 @@ fn spawn_tab_button(
     let btn = commands
         .spawn((
             ChildOf(parent),
+            Name::new(format!("tab_{tab:?}")),
             Button,
             TabButton(tab),
             Node {

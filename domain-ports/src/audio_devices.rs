@@ -54,6 +54,7 @@ use std::sync::Arc;
 /// through values they got from a prior [`AudioDevices::list_devices`]
 /// call. Treat the inner string as opaque; do not parse it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DeviceId(pub String);
 
 impl std::fmt::Display for DeviceId {
@@ -67,6 +68,7 @@ impl std::fmt::Display for DeviceId {
 /// A device has one or more [`InputStream`]s — most consumer devices
 /// have exactly one; multi-input interfaces have several.
 #[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InputDevice {
     /// Stable across reboots / replugs where the platform supports
     /// it. `None` on Android and bare ALSA. Treat as opaque; do not
@@ -89,10 +91,18 @@ pub struct InputDevice {
 /// On a built-in mic this is "the mic." On a Scarlett 18i20 this is
 /// "Input 1/2" or "ADAT 1-8".
 #[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InputStream {
     /// Opaque, **session-scoped** identifier. The capture port (future)
     /// will accept this to open the stream. Do not persist; do not
     /// compare across adapter instances.
+    ///
+    /// Skipped at the serde boundary: it is a live native handle, not a
+    /// fact that survives the session, so a trace records nothing and
+    /// deserialization re-mints an inert placeholder via [`null_handle`].
+    /// See `docs/COACH_GAME_UX_TRACE_PLAN.md` (the session-scoped-fields
+    /// rule).
+    #[cfg_attr(feature = "serde", serde(skip, default = "null_handle"))]
     pub handle: StreamHandle,
 
     /// Display label. On single-stream devices often matches the
@@ -111,6 +121,7 @@ pub struct InputStream {
 /// — not every backend reports this cleanly (cpal doesn't surface
 /// CoreAudio's transport-type property, for instance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Transport {
     BuiltIn,
     Usb,
@@ -124,6 +135,7 @@ pub enum Transport {
 /// by platform — modelling it as a flat `Vec<u32>` would force every
 /// adapter except Android to lie.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SampleRateSupport {
     /// A discrete list (Android). May be empty / incomplete in
     /// practice.
@@ -150,6 +162,18 @@ impl std::fmt::Debug for StreamHandle {
         // clones of the same handle look the same in logs.
         write!(f, "StreamHandle({:p})", Arc::as_ptr(&self.0))
     }
+}
+
+/// An inert [`StreamHandle`] placeholder for [`InputStream::handle`] after
+/// deserialization. The handle is `#[serde(skip)]` (a live native handle is
+/// not a fact that survives the session), so a deserialized `InputStream`
+/// carries this zero-sized stand-in. It is never downcast — the capture port
+/// that consumes a real handle is future, and trace/replay only reads
+/// `persistent_id` / `name` and passes `DeviceId` back. Private: fabricating a
+/// handle stays out of the public port API.
+#[cfg(feature = "serde")]
+fn null_handle() -> StreamHandle {
+    StreamHandle(Arc::new(()))
 }
 
 pub trait AudioDevices: Send + Sync {

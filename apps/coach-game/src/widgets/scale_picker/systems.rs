@@ -35,6 +35,7 @@ pub fn spawn(commands: &mut Commands, parent: Entity, rows: &PickerRows) -> Enti
         .spawn((
             ChildOf(parent),
             ScalePickerRoot,
+            Name::new("scale_picker"),
             Node {
                 position_type: PositionType::Absolute,
                 left: px(32),

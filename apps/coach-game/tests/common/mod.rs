@@ -120,6 +120,11 @@ pub fn drain_commands(fake: &FakeCoach) -> Vec<Command> {
 /// `DefaultPlugins` brings its own `InputPlugin` and `StatesPlugin` is not
 /// part of it (state is registered by `build_app`'s `init_state`), so —
 /// unlike `build_test_app` — neither is added here.
+///
+/// `allow(dead_code)` for the same per-binary recompile reason as
+/// `drain_commands`: `common/` is rebuilt for every test binary, so a helper
+/// only some binaries use warns in the rest.
+#[allow(dead_code)]
 pub fn build_layout_test_app() -> (App, FakeCoach) {
     let mut app = App::new();
     app.add_plugins(

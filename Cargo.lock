@@ -2008,6 +2008,8 @@ dependencies = [
  "adapter-telemetry-std",
  "bevy",
  "domain-ports",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2445,6 +2447,9 @@ dependencies = [
 [[package]]
 name = "domain-ports"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "downcast-rs"

@@ -20,6 +20,8 @@
 //!   `systems`); see `ARCHITECTURE.md`.
 //! - `semantic_graph` — crate-level shared pitch/time projection that
 //!   feeds the time-graph widget.
+//! - `trace` — the UX flight recorder (JSONL trace of inputs, coach
+//!   reads, and computed geometry); wired in `main`, not `build_app`.
 //!
 //! Items are `pub` so integration tests under `tests/` can spawn the
 //! schedule against a fake `AppCoach`.
@@ -32,6 +34,7 @@ pub mod game;
 pub mod menu;
 pub mod semantic_graph;
 pub mod state;
+pub mod trace;
 pub mod ui;
 pub mod widgets;
 

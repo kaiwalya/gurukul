@@ -245,6 +245,10 @@ another layer's job. The *how* of each level — the `tests/common` harness, the
 layout-aware harness, the `ComputedNode` / `PostLayout` mechanics — belongs in
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+All three levels run before ship. Bugs that only manifest *live* have a fourth
+surface: the per-run UX trace (see `trace` under crate-level pieces below, and
+the debugging workflow in [`CONTRIBUTING.md`](CONTRIBUTING.md)).
+
 ## Crate-level pieces (not in any slice)
 
 - **`semantic_graph`** — the semantic pitch/time projection. It is an *upstream
@@ -253,6 +257,18 @@ layout-aware harness, the `ComputedNode` / `PostLayout` mechanics — belongs in
   graph's private model, so it lives at crate level, not inside
   `widgets/time_graph/`. Its Bevy wrapper (`SemanticGraphRes`) lives in
   `game/mod.rs` so the projection module itself stays Bevy-free.
+- **`trace`** — the UX flight recorder: one JSONL trace per run of what the
+  app *saw* (inputs, coach reads, clock deltas) and what it *did on screen*
+  (computed geometry, captured after layout). It exists because every test
+  level above is blind to live-run dynamics — the trace is the observability
+  surface for bugs that only manifest in a real session, and it is what lets
+  an agent debug a visual defect from data (workflow and worked example in
+  [`CONTRIBUTING.md`](CONTRIBUTING.md); schema in `trace/record.rs`; design
+  in [`docs/COACH_GAME_UX_TRACE_PLAN.md`](../../docs/COACH_GAME_UX_TRACE_PLAN.md)).
+  Doctrine notes: recording computed pixels does **not** violate the
+  domain-decision rule — no decision reads them; the trace is pure
+  observability output, the same exemption telemetry has. And it is wired in
+  `main.rs`, not `build_app`, so headless tests never write traces.
 - **Out of slices on purpose**: `ui.rs` (shared button/colour primitives),
   `feature_history.rs`, `feature_types.rs`, `coach.rs`, `state.rs`, and
   everything under `menu/`.

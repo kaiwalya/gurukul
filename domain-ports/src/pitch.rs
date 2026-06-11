@@ -60,6 +60,7 @@ use std::ops::{Add, Neg, Sub};
 ///
 /// `f32`, so `PartialEq`/`PartialOrd` but not `Eq`/`Ord`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PitchLog2(pub f32);
 
 /// A signed difference between two points on the log2 line.
@@ -71,6 +72,7 @@ pub struct PitchLog2(pub f32);
 ///
 /// `f32`, so `PartialEq`/`PartialOrd` but not `Eq`/`Ord`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PitchLog2Interval(pub f32);
 
 impl PitchLog2 {

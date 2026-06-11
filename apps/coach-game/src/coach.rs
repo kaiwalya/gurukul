@@ -59,20 +59,27 @@ pub struct DrainReadModels<'w> {
     feature_scratch: ResMut<'w, FeatureDrainScratch>,
 }
 
-pub fn spawn_coach(world: &mut World) {
+/// Construct the real adapter-backed coach. Split out of [`spawn_coach`] so a
+/// recording build (`main.rs` + the `trace` module) can wrap this in a
+/// `RecordingCoach` before it becomes the [`Coach`] handle, without the trace
+/// module knowing how the adapter is wired.
+pub fn build_coach() -> Box<dyn AppCoach> {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
     let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
     let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
 
-    let coach = adapter_app_coach::new(AppCoachDeps {
+    Box::new(adapter_app_coach::new(AppCoachDeps {
         clock,
         telemetry,
         audio_devices,
         audio_capture,
         host_version: env!("CARGO_PKG_VERSION"),
-    });
-    world.insert_non_send_resource(Coach(Box::new(coach)));
+    }))
+}
+
+pub fn spawn_coach(world: &mut World) {
+    world.insert_non_send_resource(Coach(build_coach()));
 }
 
 /// On `AppExit`, synchronously tear down the coach so its control

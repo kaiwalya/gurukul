@@ -78,6 +78,10 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
         .spawn((
             ChildOf(parent),
             TimeGraphRoot,
+            // `Name`s give the trace recorder a stable, run-to-run widget path
+            // (`time_graph/pitch_lane/trace_layer/…`) instead of a volatile
+            // `Entity` id. They also help any future inspector tooling.
+            Name::new("time_graph"),
             Node {
                 position_type: PositionType::Absolute,
                 left: px(ROOT_LEFT),
@@ -101,6 +105,7 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
         parent
             .spawn((
                 TimeGraphPitchLane,
+                Name::new("pitch_lane"),
                 Node {
                     position_type: PositionType::Relative,
                     flex_grow: 4.0,
@@ -110,11 +115,22 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
                 BackgroundColor(COLOR_PITCH_LANE),
             ))
             .with_children(|lane| {
-                lane.spawn((GridlineLayer, layer_node(), ZIndex(0)));
-                lane.spawn((TraceLayer, layer_node(), ZIndex(1)));
+                lane.spawn((
+                    GridlineLayer,
+                    Name::new("gridline_layer"),
+                    layer_node(),
+                    ZIndex(0),
+                ));
+                lane.spawn((
+                    TraceLayer,
+                    Name::new("trace_layer"),
+                    layer_node(),
+                    ZIndex(1),
+                ));
             });
         parent.spawn((
             TimeGraphEventsLane,
+            Name::new("events_lane"),
             Node {
                 position_type: PositionType::Relative,
                 flex_grow: 1.0,

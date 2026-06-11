@@ -36,6 +36,16 @@ Bevy logs to **stderr**, not stdout. Capture with `>file 2>&1` (or
 just `2>&1 | tee file`) when smoke-testing — redirecting only stdout
 gives you an empty log file and a misleading "no output" conclusion.
 
+Every run also records a UX trace to `traces/<YYYY-MM-DD-HHMMSS>/ux.jsonl`
+(UTC stamp; latest run = lexicographically greatest dir; flushed every
+frame, so a crashed run's trace is intact). One JSON object per line,
+`{"f": <frame>, "k": "<kind>", …}` — kinds and fields in
+`src/trace/record.rs`. **F10** writes a `mark` record ("the bug is
+happening *now*"). Recording is wired in `main.rs`, not `build_app`, so
+tests and other heads don't write traces. To *debug* from a trace, see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) ("Debugging live runs from the
+trace").
+
 ## Conventions
 
 - Bevy 0.18. Bundles are gone — `Node` is a component, not

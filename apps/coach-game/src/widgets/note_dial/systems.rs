@@ -90,6 +90,9 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
         .spawn((
             ChildOf(parent),
             NoteDialRoot,
+            // Stable widget-path anchor for the trace recorder (see the
+            // time_graph slice for the rationale).
+            Name::new("note_dial"),
             Button,
             ButtonSelected,
             Node {

@@ -89,6 +89,57 @@ Convert a captured size at capture time, behind the frame newtype — trap and A
 in [`AGENTS.md`](AGENTS.md), rule in [`ARCHITECTURE.md`](ARCHITECTURE.md). Never
 store a raw `Vec2` size in a capture resource.
 
+## Debugging live runs from the trace
+
+The ladder above ends at layout-aware tests, and every level is blind to
+something. Bugs that only exist *live* — viewport jitter, frame-batching
+glitches, despawn flicker, anything a human reports as "it looks wrong" —
+have a fourth surface: every `cargo run` writes a UX trace (file location
+and mechanics in [`AGENTS.md`](AGENTS.md); record schema in
+`src/trace/record.rs`; design rationale in
+[`docs/COACH_GAME_UX_TRACE_PLAN.md`](../../docs/COACH_GAME_UX_TRACE_PLAN.md)).
+Saw the bug happen? Press **F10 in the moment** — it writes a `mark` record
+that turns "I saw it flicker once" into a frame number.
+
+Read a trace the way the recorder wrote it: effects in one channel, causes
+in the others, aligned by the frame field `f`.
+
+1. **Find the symptom in `geom`.** This channel is *computed* geometry —
+   where nodes actually landed after layout, in physical px — so a visual
+   defect is present as data. Ask what the doctrine says *should* be true
+   and query for the violation: bodies inside their lane's rect, gridlines
+   repainting rarely, entity paths not flapping `gone`.
+2. **Find the cause in `coach` / `input`.** These channels preserve
+   per-frame batching jitter on purpose. Line them up with the symptom
+   frames; an exact frame-correlation is the recorder handing you the
+   causal arrow.
+3. **The decision between them is code.** The trace shows what went in and
+   what came out; the wrong decision lives in whichever layer maps one to
+   the other — and the correlation names it. Go read that layer; don't
+   guess from pixels.
+
+Worked example — "the pitch trace looks jumpy, like the zoom is bouncing":
+
+```sh
+# Symptom: gridlines should repaint only on viewport change, yet…
+jq -r 'select(.k=="geom" and (.path|contains("gridline_layer/")))
+       | "\(.f) \(.rect_px)"' ux.jsonl
+# …they repainted on 34 of ~60 InGame frames, line spacing flapping
+# 151→111→77→66 px: pan AND zoom bouncing. Cause: which frames got data?
+jq -r 'select(.k=="coach") | "\(.f) \(.drained)"' ux.jsonl
+```
+
+Every repaint frame coincided exactly with a voiced pitch sample arriving —
+sparse, low-confidence (0.2–0.4) samples, one a 3-octave outlier. Diagnosis,
+without a screenshot or a human in the loop: the viewport policy follows the
+raw data extent with no damping, and low-confidence points are admitted to
+the extent. Both fixes are domain-side policy (the projector), per the
+domain-decision rule.
+
+What the trace is blind to: z-order, color, text rendering — anything
+outside the recorded fields. If a trace says "fine" while eyes say
+"broken", suspect those, and see the plan doc's deferred screenshot hook.
+
 ## Practical workflow
 
 When building a new widget:

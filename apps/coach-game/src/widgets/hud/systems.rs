@@ -27,6 +27,7 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
         .spawn((
             ChildOf(parent),
             HudBadge,
+            Name::new("hud"),
             Button,
             Node {
                 position_type: PositionType::Absolute,

@@ -109,6 +109,7 @@ pub const MAX_TUNING_SLOTS: usize = 32;
 ///
 /// [`well_formed`]: TuningIntervals::well_formed
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TuningIntervals {
     /// The gap from each line to the next (prev-relative), in slot order, the
     /// first `len` entries each a mantissa in `[0, 1)` and the rest `0.0`
@@ -285,6 +286,7 @@ pub trait Tuning {
 /// Flat and `Copy` (its [`TuningIntervals`] is a fixed array), so it crosses the
 /// command boundary directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TuningAbsolute {
     /// The rigid shape — the line-angles, reference-independent.
     intervals: TuningIntervals,
@@ -433,6 +435,7 @@ impl Tuning for TuningAbsolute {
 /// `Copy` and flat: a `TuningKind` is the user-pickable tag the settings UI
 /// stores and matches on, and it crosses the command boundary by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TuningKind {
     /// 12-tone equal temperament. `N = 12`, each line `×2^(1/12)` from the last
     /// — every gap `1/12` of an octave. Rotationally symmetric: the shape reads
@@ -573,6 +576,7 @@ impl TuningKind {
 ///
 /// Flat and `Copy`, so it crosses the command boundary directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TuningRotated {
     /// The authored cylinder, owned. Never mutated; a shift produces a new
     /// `TuningRotated` over a copy.

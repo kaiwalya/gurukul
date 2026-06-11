@@ -29,6 +29,7 @@ pub fn spawn_root(mut commands: Commands) {
     commands.spawn((
         DespawnOnExit(AppState::InGame),
         InGameRoot,
+        Name::new("in_game"),
         Node {
             position_type: PositionType::Absolute,
             left: px(0),

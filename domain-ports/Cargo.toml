@@ -11,4 +11,11 @@ edition = "2021"
 #   domain-ports = { path = "...", features = ["test-util"] }
 test-util = []
 
+# Serialize/Deserialize on the data types crossing the port surface
+# (FeatureSnapshot, CoachEvent, Command, MusicInfo, and the domain
+# types they carry). OFF by default — only the coach-game trace/replay
+# consumer pays for it. See `docs/COACH_GAME_UX_TRACE_PLAN.md`.
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { workspace = true, optional = true }

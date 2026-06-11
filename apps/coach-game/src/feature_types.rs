@@ -6,7 +6,7 @@ use domain_ports::pitch::PitchLog2;
 /// The game-side live features: the port's `FeatureSnapshot` with `f0`
 /// already lifted out of raw Hz into a [`PitchLog2`] (`None` = unvoiced,
 /// retiring the port's `f0_hz == 0.0` sentinel).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Features {
     /// Session-local producer sequence used to detect missing hops.
     pub hop_index: u64,

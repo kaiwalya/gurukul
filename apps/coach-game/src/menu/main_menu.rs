@@ -23,6 +23,7 @@ pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
         "Free Practice"
     };
     commands.spawn((
+        Name::new("main_menu"),
         DespawnOnExit(AppState::MainMenu),
         Node {
             width: percent(100),
@@ -47,15 +48,19 @@ pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
                     ..default()
                 },
             ),
-            menu_button(start_label, NewGameButton),
-            menu_button("Settings", SettingsButton),
-            menu_button("Quit", QuitButton),
+            // Trace paths key off the stable `Name`, not the dynamic label
+            // ("Continue" vs "Free Practice"), so an agent reads the same path
+            // regardless of session state.
+            menu_button("new_game", start_label, NewGameButton),
+            menu_button("settings", "Settings", SettingsButton),
+            menu_button("quit", "Quit", QuitButton),
         ],
     ));
 }
 
-fn menu_button<M: Component>(label: &str, marker: M) -> impl Bundle {
+fn menu_button<M: Component>(name: &'static str, label: &str, marker: M) -> impl Bundle {
     (
+        Name::new(name),
         Button,
         marker,
         Node {

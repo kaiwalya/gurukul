@@ -32,6 +32,7 @@ pub struct ConfirmCancelButton;
 pub fn spawn(mut commands: Commands) {
     let root = commands
         .spawn((
+            Name::new("paused"),
             DespawnOnExit(AppState::Paused),
             Node {
                 width: percent(100),
@@ -59,14 +60,21 @@ pub fn spawn(mut commands: Commands) {
                 ..default()
             },
         ));
-        spawn_button(parent, "Resume", ResumeButton, false);
-        spawn_button(parent, "Settings", PausedSettingsButton, true);
-        spawn_button(parent, "Quit to Main Menu", QuitToMainButton, false);
+        spawn_button(parent, "resume", "Resume", ResumeButton, false);
+        spawn_button(parent, "settings", "Settings", PausedSettingsButton, true);
+        spawn_button(
+            parent,
+            "quit_to_main",
+            "Quit to Main Menu",
+            QuitToMainButton,
+            false,
+        );
     });
 }
 
 fn spawn_button<M: Component>(
     parent: &mut ChildSpawnerCommands,
+    name: &'static str,
     label: &str,
     marker: M,
     disabled: bool,
@@ -77,6 +85,7 @@ fn spawn_button<M: Component>(
         (COLOR_BUTTON, COLOR_TEXT)
     };
     let mut btn = parent.spawn((
+        Name::new(name),
         Button,
         marker,
         Node {
@@ -184,6 +193,7 @@ pub fn sync_confirm_modal(
     }
     let root = commands
         .spawn((
+            Name::new("quit_confirm"),
             ConfirmModalRoot,
             DespawnOnExit(AppState::Paused),
             Node {
@@ -219,8 +229,8 @@ pub fn sync_confirm_modal(
                 ..default()
             },))
             .with_children(|row| {
-                spawn_button(row, "Yes, quit", ConfirmYesButton, false);
-                spawn_button(row, "Cancel", ConfirmCancelButton, false);
+                spawn_button(row, "confirm_yes", "Yes, quit", ConfirmYesButton, false);
+                spawn_button(row, "confirm_cancel", "Cancel", ConfirmCancelButton, false);
             });
     });
 }

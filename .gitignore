@@ -8,3 +8,8 @@
 # reasons. Drop wav files into `*/test_data/` and run the ignored
 # tests with `cargo test --release -- --ignored`.
 **/test_data/
+
+# UX flight-recorder output (apps/coach-game). One directory per run,
+# gitignored and grown unbounded — manual cleanup. See
+# docs/COACH_GAME_UX_TRACE_PLAN.md.
+traces/

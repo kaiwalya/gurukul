@@ -9,8 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 bevy = { version = "0.18", default-features = false, features = ["2d", "ui"] }
-domain-ports = { path = "../../domain-ports" }
+domain-ports = { path = "../../domain-ports", features = ["serde"] }
 adapter-clock-std = { path = "../../domain-adapters/clock-std" }
 adapter-telemetry-std = { path = "../../domain-adapters/telemetry-std" }
 adapter-app-coach = { path = "../../domain-adapters/app-coach" }
 adapter-audio-cpal = { path = "../../domain-adapters/audio-cpal" }
+serde = { workspace = true }
+serde_json = { workspace = true }

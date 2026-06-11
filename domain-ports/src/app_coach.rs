@@ -69,6 +69,7 @@ pub struct AppCoachDeps {
 /// already running) are silent no-ops — the coach logs at `Debug`
 /// level via telemetry and discards. Heads do not need to track which
 /// commands are legal in which states.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
     /// Enumerate input devices. The coach replies with
     /// [`CoachEvent::DevicesListed`].
@@ -139,6 +140,7 @@ pub enum Command {
 /// the next transition, so a head reacting to the event will see
 /// coherent state.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioInfo {
     /// Negotiated capture sample rate, in Hz.
     pub sample_rate: u32,
@@ -156,6 +158,7 @@ pub struct AudioInfo {
 /// configuration of a session (the [`Scale`]), which is carried by
 /// [`Command::ConfigureSession`] and is decoupled from the audio
 /// lifecycle.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioConfig {
     /// Identifies the device to open. `None` requests the system's
     /// multimedia-role default input.
@@ -198,6 +201,7 @@ pub struct AudioConfig {
 /// FFI-friendly: the dial reads ticks, needle, and lit degrees straight
 /// off the `Scale` with no rebuild.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MusicInfo {
     pub scale: Scale,
 }
@@ -209,6 +213,7 @@ pub struct MusicInfo {
 /// Notifications the coach pushes to its outbound queue. Heads drain
 /// with [`AppCoach::poll_events`] on their own cadence (the queue is
 /// bounded — see [`CoachEvent::EventsDropped`]).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CoachEvent {
     /// Reply to [`Command::ListDevices`].
     DevicesListed { devices: Vec<InputDevice> },
@@ -256,6 +261,7 @@ pub enum CoachEvent {
 
 /// Where the session is in its lifecycle. Heads render UI off this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SessionState {
     Idle,
     /// `StartSession` accepted; data plane round-trip in flight.
@@ -272,6 +278,7 @@ pub enum SessionState {
 /// heads can match exhaustively; an accompanying `reason: String`
 /// carries adapter-specific detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SessionErrorKind {
     /// Device gone / refused open / requested id is stale.
     DeviceUnavailable,
@@ -302,6 +309,7 @@ pub enum SessionErrorKind {
 /// detectors emit `0.0` during inactive frames rather than a
 /// distinguished sentinel.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FeatureSnapshot {
     /// Session-local monotonic hop sequence. Assigned once for every
     /// produced feature snapshot, before that same snapshot is published

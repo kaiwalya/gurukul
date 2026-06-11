@@ -57,6 +57,7 @@ use crate::tuning::{Tuning, TuningRotated, ORIGIN};
 /// [`TuningIntervals`]: crate::tuning::TuningIntervals
 /// [`Tuning`]: crate::tuning::Tuning
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScaleIntervals {
     /// Bit `i` set ⇒ slot `i` (from Sa = bit 0) is a degree. The 32-bit width
     /// covers any tuning the system ships (12-TET, 22-shruti) with room over.
@@ -172,6 +173,7 @@ impl ScaleIntervals {
 /// cursor, and `octave` is an integer floor — so the whole tonic placement is
 /// clicky and integral, never a continuous slide.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Scale {
     /// The tooth pattern — which grooves are degrees.
     intervals: ScaleIntervals,
