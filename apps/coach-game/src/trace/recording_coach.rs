@@ -19,20 +19,24 @@ use domain_ports::app_coach::{
     AppCoach, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo, ShutdownResult,
 };
 
-use crate::feature_types::Features;
-
 /// Shared per-frame scratch the decorator appends to and the Bevy drain
 /// system empties. `!Send` (lives beside the `!Send` `Coach` handle on the
 /// main thread), so `Rc<RefCell<…>>`, not `Arc<Mutex<…>>`.
+///
+/// The reads are recorded as the **port types** (`FeatureSnapshot`), not the
+/// head's lifted [`Features`](crate::feature_types::Features): replay serves
+/// these back verbatim so the real `f0_hz → PitchLog2` lift in `drain_events`
+/// re-runs on identical input. Recording the lifted form would both drift on an
+/// f32 round-trip and bypass the lift code replay exists to re-run. This is
+/// the **port-types rule**: record upstream of everything you claim to replay.
 #[derive(Default)]
 pub struct TraceBuffer {
     /// Events `poll_events` handed back this frame.
     pub events: Vec<CoachEvent>,
-    /// What `latest_features` returned this frame (already lifted to
-    /// [`Features`], the same conversion `drain_events` does for the UI).
-    pub latest: Option<Features>,
+    /// What `latest_features` returned this frame, as the raw port snapshot.
+    pub latest: Option<FeatureSnapshot>,
     /// What `drain_features` returned this frame, in producer order.
-    pub drained: Vec<Features>,
+    pub drained: Vec<FeatureSnapshot>,
     /// Commands sent this frame, in send order.
     pub commands: Vec<Command>,
 }
@@ -93,7 +97,9 @@ impl AppCoach for RecordingCoach {
 
     fn latest_features(&self) -> Option<FeatureSnapshot> {
         let snap = self.inner.latest_features();
-        self.buffer.borrow_mut().latest = snap.map(Features::from);
+        // Record the raw snapshot, not the lifted `Features` — replay re-runs
+        // the lift on this exact value.
+        self.buffer.borrow_mut().latest = snap;
         snap
     }
 
@@ -101,8 +107,7 @@ impl AppCoach for RecordingCoach {
         let before = out.len();
         self.inner.drain_features(out);
         let mut buf = self.buffer.borrow_mut();
-        buf.drained
-            .extend(out[before..].iter().copied().map(Features::from));
+        buf.drained.extend(out[before..].iter().copied());
     }
 
     fn audio_info(&self) -> Option<AudioInfo> {

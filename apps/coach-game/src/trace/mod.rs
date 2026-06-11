@@ -7,16 +7,34 @@
 //! directories; a test that wants the recorder adds [`TracePlugin`] explicitly
 //! with a temp dir.
 //!
-//! Two halves (see `docs/COACH_GAME_UX_TRACE_PLAN.md`):
+//! Two halves:
 //! 1. Port-side [`RecordingCoach`] decorator + shared [`TraceBuffer`].
 //! 2. Bevy-side recording [`systems`] writing into a [`TraceWriter`].
+//!
+//! Scope boundary: Bevy-side bugs only. The trace records the feature/event
+//! stream where it crosses the `AppCoach` port — never audio, never DSP
+//! internals. Everything downstream of the drain is a deterministic function
+//! of what is recorded; everything upstream is out of scope by design. And
+//! everything is recorded from **Bevy's point of view**, per frame: the
+//! per-frame drain batches are kept as-is (a frame that drained nothing, a
+//! frame that drained three) because that jitter is itself a bug class; the
+//! audio clock and Bevy's are never reconciled.
 //!
 //! Doctrine: recording computed pixels is pure observability output, not a
 //! decision input — the same exemption telemetry has from the pixel-direction
 //! rule (`ARCHITECTURE.md`).
+//!
+//! Deliberately not built (add only when the need actually bites):
+//! screenshots (the `mark` record reserves a field; the semantic trace is
+//! blind to z-order/color/fonts, and a bug class there is the trigger), a
+//! trace diff/invariant-checker tool (grep/jq suffice until the queries get
+//! repetitive), Bevy Remote Protocol (complementary live querying, not a
+//! substitute), replay ergonomics (speed control, scrubbing, partial
+//! replay), and any `traces/` retention policy (manual cleanup).
 
 mod record;
 mod recording_coach;
+pub mod replay;
 mod systems;
 mod wallclock;
 mod writer;
@@ -103,6 +121,21 @@ impl Plugin for TracePlugin {
         // (DefaultPlugins includes it, but a MinimalPlugins test may not).
         if !app.is_plugin_added::<FrameCountPlugin>() {
             app.add_plugins(FrameCountPlugin);
+        }
+
+        // `record_coach` drains a `TraceBufferHandle`. A recording build inserts
+        // it (`install_recording_coach`); a replay build doesn't (its coach is a
+        // `ReplayCoach`, not a `RecordingCoach`). Insert an empty buffer if none
+        // is present, so the recorder runs identically either way — in replay it
+        // simply drains nothing into the `coach` channel, which is correct: the
+        // value being verified across record/replay is the `geom` channel.
+        if app
+            .world()
+            .get_non_send_resource::<TraceBufferHandle>()
+            .is_none()
+        {
+            let buffer: TraceBufferHandle = Rc::new(RefCell::new(TraceBuffer::default()));
+            app.insert_non_send_resource(buffer);
         }
 
         app.insert_resource(writer)

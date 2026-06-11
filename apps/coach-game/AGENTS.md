@@ -46,6 +46,18 @@ tests and other heads don't write traces. To *debug* from a trace, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md) ("Debugging live runs from the
 trace").
 
+A trace can be re-run: `cargo run -p coach-game -- --replay
+[traces/<dir>]` (default: newest) skips mic and engine entirely and
+re-runs the app against the recorded inputs, coach reads, and clock
+deltas. The window is forced to the recorded logical size and scale
+factor, live mouse/keyboard input is suppressed (the recorded stream is
+the only stream the app sees), and the run is deterministic enough that
+the new trace's `geom` channel comes out bit-for-bit identical to the
+source's. It exits after the last recorded frame (`--hold` keeps the
+window open) and writes its own trace whose header carries `replay_of`.
+Flags are parsed in `main.rs` — there is no `--help`; its module doc is
+the flag reference.
+
 ## Conventions
 
 - Bevy 0.18. Bundles are gone — `Node` is a component, not

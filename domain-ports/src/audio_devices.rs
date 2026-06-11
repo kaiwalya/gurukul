@@ -99,9 +99,9 @@ pub struct InputStream {
     ///
     /// Skipped at the serde boundary: it is a live native handle, not a
     /// fact that survives the session, so a trace records nothing and
-    /// deserialization re-mints an inert placeholder via [`null_handle`].
-    /// See `docs/COACH_GAME_UX_TRACE_PLAN.md` (the session-scoped-fields
-    /// rule).
+    /// deserialization re-mints an inert placeholder via [`null_handle`]
+    /// (the session-scoped-fields rule: a trace records facts that survive
+    /// the session).
     #[cfg_attr(feature = "serde", serde(skip, default = "null_handle"))]
     pub handle: StreamHandle,
 

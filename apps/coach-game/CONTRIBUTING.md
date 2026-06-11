@@ -96,8 +96,7 @@ something. Bugs that only exist *live* — viewport jitter, frame-batching
 glitches, despawn flicker, anything a human reports as "it looks wrong" —
 have a fourth surface: every `cargo run` writes a UX trace (file location
 and mechanics in [`AGENTS.md`](AGENTS.md); record schema in
-`src/trace/record.rs`; design rationale in
-[`docs/COACH_GAME_UX_TRACE_PLAN.md`](../../docs/COACH_GAME_UX_TRACE_PLAN.md)).
+`src/trace/record.rs`; design rationale in `src/trace/mod.rs`).
 Saw the bug happen? Press **F10 in the moment** — it writes a `mark` record
 that turns "I saw it flicker once" into a frame number.
 
@@ -136,9 +135,39 @@ raw data extent with no damping, and low-confidence points are admitted to
 the extent. Both fixes are domain-side policy (the projector), per the
 domain-decision rule.
 
+**Close the loop with replay.** A trace is not just evidence — it is an
+executable reproduction:
+
+```sh
+cargo run -p coach-game --release -- --replay   # newest trace; or --replay traces/<dir>
+```
+
+No mic, no engine: the app re-runs against the recorded inputs, coach
+reads, and clock deltas, and emits a fresh trace whose header carries
+`replay_of`. Replay is deterministic (live input is suppressed; the
+recorded stream is the only stream), so a fix is verified by *diffing*,
+not eyeballing: replay the bug trace on the fixed code and diff the
+`geom` channels —
+
+```sh
+diff <(jq -c 'select(.k=="geom")' traces/<bug-run>/ux.jsonl) \
+     <(jq -c 'select(.k=="geom")' traces/<replay>/ux.jsonl)
+```
+
+On unfixed code that diff is empty — bit-for-bit; that is the contract,
+and `tests/trace_replay_roundtrip.rs` is it in executable form (one
+caveat: treat the first ~second as settling time — async font load can
+land on a different frame).
+On fixed code the divergence should be exactly the change you intended,
+nothing else.
+`--hold` keeps the window open after the last frame when you do want to
+look. Mechanics in [`AGENTS.md`](AGENTS.md); flags in `src/main.rs`.
+
 What the trace is blind to: z-order, color, text rendering — anything
 outside the recorded fields. If a trace says "fine" while eyes say
-"broken", suspect those, and see the plan doc's deferred screenshot hook.
+"broken", suspect those — a screenshot hook is deliberately deferred until
+that bug class actually bites (the `mark` record reserves a field for it;
+see the deferred list in `src/trace/mod.rs`).
 
 ## Practical workflow
 

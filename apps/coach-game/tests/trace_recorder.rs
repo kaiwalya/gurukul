@@ -125,7 +125,7 @@ fn records_run_header_frame_coach_and_input_channels() {
 
     // Header first, exactly once.
     assert_eq!(records[0]["k"], "run", "first line must be the run header");
-    assert_eq!(records[0]["schema"], 1);
+    assert_eq!(records[0]["schema"], 2);
     assert_eq!(records[0]["replay_of"], Value::Null);
 
     // Frame records exist (one per update).
@@ -140,6 +140,21 @@ fn records_run_header_frame_coach_and_input_channels() {
     assert!(
         drained.iter().any(|f| f["hop_index"] == 1),
         "drained features should include hop_index 1, got {drained:?}"
+    );
+    // Schema 2: the channel carries the raw port snapshot (`f0_hz`), not the
+    // head's lifted `Features` (`pitch`). Replay re-runs the lift, so the
+    // pre-lift value must survive. The fed snapshot at hop 1 was 222.0 Hz.
+    let hop1 = drained
+        .iter()
+        .find(|f| f["hop_index"] == 1)
+        .expect("drained hop_index 1");
+    assert!(
+        (hop1["f0_hz"].as_f64().expect("raw f0_hz on the snapshot") - 222.0).abs() < 1e-3,
+        "coach channel must record raw f0_hz (port type), got {hop1:?}"
+    );
+    assert!(
+        hop1.get("pitch").is_none(),
+        "coach channel must NOT carry the lifted `pitch` field, got {hop1:?}"
     );
     assert!(
         coach["events"]

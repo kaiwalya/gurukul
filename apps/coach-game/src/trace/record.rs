@@ -1,25 +1,28 @@
 //! Trace record types — the on-disk JSONL schema.
 //!
 //! Each line of `ux.jsonl` is one [`Record`]: a `{"f": <frame>, "k":
-//! "<kind>", …}` object. The kinds and their payloads are the contract in
-//! `docs/COACH_GAME_UX_TRACE_PLAN.md` ("Trace format"). These types are the
-//! *writer's* view; a reader (agent grep/jq, the future diff tool) parses the
-//! same shapes back.
+//! "<kind>", …}` object. The kinds and their payloads defined here *are* the
+//! on-disk contract. These types are the *writer's* view; a reader (agent
+//! grep/jq, [`super::replay::load`]) parses the same shapes back.
 //!
 //! Everything here is plain serde data — no Bevy, no domain logic. The port
-//! payloads (`Features`, `CoachEvent`, `Command`, `MusicInfo`) are embedded by
+//! payloads (`FeatureSnapshot`, `CoachEvent`, `Command`) are embedded by
 //! reference to their own `Serialize` impls (the `serde` feature on
 //! `domain-ports`), so this module never restates a port type's shape.
 
 use serde::Serialize;
 
-use crate::feature_types::Features;
-use domain_ports::app_coach::{CoachEvent, Command};
+use domain_ports::app_coach::{CoachEvent, Command, FeatureSnapshot};
 
 /// Schema version of the `ux.jsonl` format. Bump on any
 /// backward-incompatible change to a record shape so a reader can refuse a
 /// trace it can't parse.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// `2`: the `coach` channel carries port types (`FeatureSnapshot`, `f0_hz`
+/// raw) rather than the head's lifted `Features` — replay serves reads verbatim
+/// (the port-types rule; see [`TraceBuffer`](super::TraceBuffer)). A schema-1
+/// trace is simply re-recorded.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One line of the trace. Flattened so the JSON is `{"f":…,"k":"…",…payload}`
 /// rather than a nested `{"f":…,"payload":{…}}` — friendlier to `jq`/grep.
@@ -119,9 +122,9 @@ pub struct CoachRead {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CoachEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest: Option<Features>,
+    pub latest: Option<FeatureSnapshot>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub drained: Vec<Features>,
+    pub drained: Vec<FeatureSnapshot>,
 }
 
 impl CoachRead {

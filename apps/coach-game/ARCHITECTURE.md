@@ -264,11 +264,20 @@ the debugging workflow in [`CONTRIBUTING.md`](CONTRIBUTING.md)).
   surface for bugs that only manifest in a real session, and it is what lets
   an agent debug a visual defect from data (workflow and worked example in
   [`CONTRIBUTING.md`](CONTRIBUTING.md); schema in `trace/record.rs`; design
-  in [`docs/COACH_GAME_UX_TRACE_PLAN.md`](../../docs/COACH_GAME_UX_TRACE_PLAN.md)).
+  rationale in `trace/mod.rs`).
   Doctrine notes: recording computed pixels does **not** violate the
   domain-decision rule — no decision reads them; the trace is pure
   observability output, the same exemption telemetry has. And it is wired in
   `main.rs`, not `build_app`, so headless tests never write traces.
+  Its `replay` half (`trace/replay/`) is the hexagonal payoff made concrete:
+  `ReplayCoach` is just another `AppCoach` impl, serving the recorded port
+  reads verbatim, so the entire head re-runs against a canned session it
+  cannot distinguish from a live mic. A driver makes the run a *closed
+  system* — recorded clock deltas, recorded inputs, live OS input suppressed
+  — which is what makes the replayed `geom` channel bit-for-bit identical to
+  the source's and a fix verifiable by diff rather than by eye
+  (`tests/trace_replay_roundtrip.rs` is that determinism contract in
+  executable form).
 - **Out of slices on purpose**: `ui.rs` (shared button/colour primitives),
   `feature_history.rs`, `feature_types.rs`, `coach.rs`, `state.rs`, and
   everything under `menu/`.

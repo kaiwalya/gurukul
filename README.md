@@ -31,6 +31,9 @@ The Bevy coach app:
 ```
 ./scripts/fetch-assets.sh    # once: fetch the Devanagari UI font (not in git)
 cargo run -p coach-game
+cargo run -p coach-game -- --replay   # re-run the newest UX trace (no mic/engine)
 ```
 
 Skipping the fetch is harmless — the app falls back to its built-in font, and only the Sargam-Devanagari note labels render as missing glyphs.
+
+Every run records a UX trace to `traces/` (gitignored); mechanics in [`apps/coach-game/AGENTS.md`](apps/coach-game/AGENTS.md), debugging workflow in [`apps/coach-game/CONTRIBUTING.md`](apps/coach-game/CONTRIBUTING.md).

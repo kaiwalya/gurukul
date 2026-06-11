@@ -7,8 +7,6 @@
 //!   single reader of the handle), plus `state` transition records.
 //! - `PostUpdate` after `UiSystems::PostLayout`: the `geom` on-change pass.
 //! - `Last`: flush the writer.
-//!
-//! See `docs/COACH_GAME_UX_TRACE_PLAN.md` ("Recording architecture").
 
 use std::collections::HashMap;
 
