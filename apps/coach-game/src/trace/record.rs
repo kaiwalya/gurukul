@@ -22,7 +22,18 @@ use domain_ports::app_coach::{CoachEvent, Command, FeatureSnapshot};
 /// raw) rather than the head's lifted `Features` — replay serves reads verbatim
 /// (the port-types rule; see [`TraceBuffer`](super::TraceBuffer)). A schema-1
 /// trace is simply re-recorded.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// `3`: the `input` channel records the **canonical** `bevy::window::WindowEvent`
+/// stream (one reader, true cross-channel order) instead of the six *derived*
+/// typed message channels. winit fans `WindowEvent` out into both the combined
+/// stream and the typed channels; the typed channels are a lossy, order-scrambled
+/// shadow, and crucially UI **picking** reads only the combined stream — so a
+/// click recorded off the typed channels was invisible to replay. Recording the
+/// upstream source and letting the app re-derive is the same rule schema 2
+/// applied to the coach channel. The `InputRecord` set widened to the variants
+/// that drive downstream state (hover enter/leave, touch, focus-lost). A
+/// schema-≤2 trace is simply re-recorded.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One line of the trace. Flattened so the JSON is `{"f":…,"k":"…",…payload}`
 /// rather than a nested `{"f":…,"payload":{…}}` — friendlier to `jq`/grep.
@@ -74,10 +85,21 @@ pub enum Body {
     Mark { marker: u32 },
 }
 
-/// A Bevy input message, reduced to the fields that matter for replay /
-/// debugging. We capture our *own* small shapes rather than re-serializing
-/// Bevy's input structs, so the trace format does not depend on Bevy's
-/// `serialize` feature and stays readable.
+/// One [`bevy::window::WindowEvent`] variant, reduced to the fields that matter
+/// for replay / debugging. We capture our *own* small shapes rather than
+/// re-serializing Bevy's input structs, so the trace format does not depend on
+/// Bevy's `serialize` feature and stays readable.
+///
+/// **No window entity is recorded.** Entity ids don't survive the trace
+/// boundary (a fresh run mints fresh ids); the driver remaps every replayed
+/// window reference to the live `PrimaryWindow` at injection. Recording the raw
+/// id would be a number that means nothing on replay.
+///
+/// The variant set is the subset of `WindowEvent` that drives downstream app
+/// state — pointer position/buttons/wheel (picking → `Interaction`), hover
+/// enter/leave (picking hover state), touch (iOS picking), keys, focus-lost
+/// (clears `ButtonInput`), and window resize/scale. Lifecycle/IME/file-drop
+/// variants are not replay-relevant and are dropped.
 #[derive(Debug, Serialize)]
 #[serde(tag = "input", rename_all = "snake_case")]
 pub enum InputRecord {
@@ -88,20 +110,38 @@ pub enum InputRecord {
         state: &'static str,
         repeat: bool,
     },
+    /// All-windows keyboard focus lost — Bevy uses it to clear held keys.
+    KeyboardFocusLost,
     MouseButton {
         /// `MouseButton` `Debug` form (e.g. `"Left"`).
         button: String,
         state: &'static str,
     },
     Cursor {
-        /// Logical-pixel position `[x, y]`.
+        /// Logical-pixel position `[x, y]` — the `WindowEvent::CursorMoved`
+        /// position verbatim, which winit emits in logical px (physical ÷ scale
+        /// factor). On replay the driver re-derives physical (× the recorded
+        /// scale) when it mirrors winit's `set_physical_cursor_position`.
         pos: [f32; 2],
     },
+    /// Cursor entered the window — picking starts tracking it.
+    CursorEntered,
+    /// Cursor left the window — picking drops hover state.
+    CursorLeft,
     Wheel {
         /// `MouseScrollUnit` `Debug` form.
         unit: String,
         x: f32,
         y: f32,
+    },
+    Touch {
+        /// `TouchPhase` `Debug` form (`"Started"`/`"Moved"`/`"Ended"`/`"Canceled"`).
+        phase: String,
+        /// Logical-pixel position `[x, y]` — `TouchInput.position` verbatim, which
+        /// winit converts to logical before emitting (like `CursorMoved`).
+        pos: [f32; 2],
+        /// Finger id, so multi-touch sequences replay distinctly.
+        id: u64,
     },
     Resize {
         /// New logical size `[width, height]`.

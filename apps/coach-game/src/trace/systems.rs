@@ -11,11 +11,9 @@
 use std::collections::HashMap;
 
 use bevy::diagnostic::FrameCount;
-use bevy::input::keyboard::KeyboardInput;
-use bevy::input::mouse::{MouseButtonInput, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::{CalculatedClip, ComputedNode, UiGlobalTransform};
-use bevy::window::{CursorMoved, WindowResized, WindowScaleFactorChanged};
+use bevy::window::WindowEvent;
 
 use crate::state::AppState;
 
@@ -55,87 +53,66 @@ pub fn record_frame(mut writer: ResMut<TraceWriter>, frame: Res<FrameCount>, tim
     );
 }
 
-/// The Bevy input-message readers, grouped so [`record_inputs`] stays under
-/// the argument-count lint and the input channels are named in one place.
-#[derive(bevy::ecs::system::SystemParam)]
-pub struct InputReaders<'w, 's> {
-    keys: MessageReader<'w, 's, KeyboardInput>,
-    buttons: MessageReader<'w, 's, MouseButtonInput>,
-    cursors: MessageReader<'w, 's, CursorMoved>,
-    wheels: MessageReader<'w, 's, MouseWheel>,
-    resizes: MessageReader<'w, 's, WindowResized>,
-    scales: MessageReader<'w, 's, WindowScaleFactorChanged>,
-}
-
-/// `Update`: drain Bevy input messages into `input` records. We read our own
-/// reduced shapes (see [`InputRecord`]) rather than re-serialize Bevy structs.
+/// `Update`: drain the **canonical** [`WindowEvent`] stream into `input`
+/// records, in arrival order. This is the one stream winit fans out from (it
+/// also writes the six typed channels — `CursorMoved`, `KeyboardInput`, … — but
+/// those are derived shadows that scramble cross-channel order, and UI picking
+/// reads only this combined stream). Recording here keeps the true move→click
+/// interleaving a click depends on, and means replay can re-derive everything
+/// downstream. Replay-irrelevant variants (lifecycle, IME, file-drop, window
+/// move/occlude/theme, gestures, mouse-motion) are skipped — see [`InputRecord`].
 pub fn record_inputs(
     mut writer: ResMut<TraceWriter>,
     frame: Res<FrameCount>,
-    mut input: InputReaders,
+    mut events: MessageReader<WindowEvent>,
 ) {
     let f = frame.0;
-    let InputReaders {
-        keys,
-        buttons,
-        cursors,
-        wheels,
-        resizes,
-        scales,
-    } = &mut input;
-    for ev in keys.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::Key {
-                key: format!("{:?}", ev.key_code),
-                state: button_state(ev.state),
-                repeat: ev.repeat,
-            }),
-        );
+    for ev in events.read() {
+        let Some(record) = to_input_record(ev) else {
+            continue;
+        };
+        writer.write(f, Body::Input(record));
     }
-    for ev in buttons.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::MouseButton {
-                button: format!("{:?}", ev.button),
-                state: button_state(ev.state),
-            }),
-        );
-    }
-    for ev in cursors.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::Cursor {
-                pos: [ev.position.x, ev.position.y],
-            }),
-        );
-    }
-    for ev in wheels.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::Wheel {
-                unit: format!("{:?}", ev.unit),
-                x: ev.x,
-                y: ev.y,
-            }),
-        );
-    }
-    for ev in resizes.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::Resize {
-                size: [ev.width, ev.height],
-            }),
-        );
-    }
-    for ev in scales.read() {
-        writer.write(
-            f,
-            Body::Input(InputRecord::ScaleFactor {
-                scale_factor: ev.scale_factor,
-            }),
-        );
-    }
+}
+
+/// Map one [`WindowEvent`] to its [`InputRecord`], or `None` for a variant
+/// replay doesn't reproduce. Window entities are deliberately dropped (they
+/// don't survive the trace boundary; the driver remaps to `PrimaryWindow`).
+fn to_input_record(ev: &WindowEvent) -> Option<InputRecord> {
+    Some(match ev {
+        WindowEvent::KeyboardInput(e) => InputRecord::Key {
+            key: format!("{:?}", e.key_code),
+            state: button_state(e.state),
+            repeat: e.repeat,
+        },
+        WindowEvent::KeyboardFocusLost(_) => InputRecord::KeyboardFocusLost,
+        WindowEvent::MouseButtonInput(e) => InputRecord::MouseButton {
+            button: format!("{:?}", e.button),
+            state: button_state(e.state),
+        },
+        WindowEvent::CursorMoved(e) => InputRecord::Cursor {
+            pos: [e.position.x, e.position.y],
+        },
+        WindowEvent::CursorEntered(_) => InputRecord::CursorEntered,
+        WindowEvent::CursorLeft(_) => InputRecord::CursorLeft,
+        WindowEvent::MouseWheel(e) => InputRecord::Wheel {
+            unit: format!("{:?}", e.unit),
+            x: e.x,
+            y: e.y,
+        },
+        WindowEvent::TouchInput(e) => InputRecord::Touch {
+            phase: format!("{:?}", e.phase),
+            pos: [e.position.x, e.position.y],
+            id: e.id,
+        },
+        WindowEvent::WindowResized(e) => InputRecord::Resize {
+            size: [e.width, e.height],
+        },
+        WindowEvent::WindowScaleFactorChanged(e) => InputRecord::ScaleFactor {
+            scale_factor: e.scale_factor,
+        },
+        _ => return None,
+    })
 }
 
 fn button_state(state: bevy::input::ButtonState) -> &'static str {

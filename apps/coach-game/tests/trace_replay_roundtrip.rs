@@ -2,14 +2,14 @@
 //!
 //! This is the executable form of "a fix is verified by diffing two traces".
 //! It records a synthetic run in the layout harness at 2× (the only level that
-//! produces `ComputedNode` geometry), replays that trace through `ReplayCoach`
-//! + the driver in a *second* layout app, and asserts the two runs' `geom`
-//! records are equal modulo the `run` header.
+//! produces `ComputedNode` geometry), replays that trace through the
+//! `ReplayCoach` and driver in a *second* layout app, and asserts the two runs'
+//! `geom` records are equal modulo the `run` header.
 //!
 //! The harness fixes the scale factor to 2.0 via the camera's `RenderTargetInfo`
 //! (there is no window), so replay's live-only window-override step is correctly
 //! not exercised here — the controlled environment the plan's "Known
-//! nondeterminism" note relies on. What *is* exercised end to end: the schema-2
+//! nondeterminism" note relies on. What *is* exercised end to end: the schema-3
 //! coach channel, verbatim feature replay, input injection, the manual clock,
 //! and the geom recorder running identically across both passes.
 
@@ -24,6 +24,7 @@ use bevy::input::keyboard::KeyboardInput;
 use bevy::input::ButtonState;
 use bevy::math::UVec2;
 use bevy::prelude::*;
+use bevy::window::WindowEvent;
 use coach_game::trace::replay;
 use coach_game::trace::TracePlugin;
 use common::{build_layout_test_app, pump, pump_layout};
@@ -107,17 +108,19 @@ fn record(root: &Path) {
 
     // Canned features flow through the coach channel (and so must replay
     // verbatim); an injected F8 gives the `input` channel something the driver
-    // must re-emit (F8 is in the driver's decode table).
+    // must re-emit (F8 is in the driver's decode table). Schema 3: the recorder
+    // taps the canonical `WindowEvent` stream, so inject the combined event.
     fake.inner.lock().unwrap().pending_features =
         vec![snapshot(0, 1_000, 220.0), snapshot(1, 1_010, 222.0)];
-    app.world_mut().write_message(KeyboardInput {
-        key_code: KeyCode::F8,
-        logical_key: bevy::input::keyboard::Key::Character("8".into()),
-        state: ButtonState::Pressed,
-        text: None,
-        repeat: false,
-        window: Entity::PLACEHOLDER,
-    });
+    app.world_mut()
+        .write_message(WindowEvent::KeyboardInput(KeyboardInput {
+            key_code: KeyCode::F8,
+            logical_key: bevy::input::keyboard::Key::Character("8".into()),
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        }));
     pump_layout(&mut app);
     app.update();
 }

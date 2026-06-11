@@ -18,6 +18,7 @@ use bevy::input::keyboard::KeyboardInput;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
+use bevy::window::WindowEvent;
 use coach_game::menu::main_menu::NewGameButton;
 use coach_game::trace::TracePlugin;
 use common::{pump, FakeCoach};
@@ -104,14 +105,18 @@ fn records_run_header_frame_coach_and_input_channels() {
         state.pending_features = vec![snapshot(0, 1_000, 220.0), snapshot(1, 1_010, 222.0)];
         state.pending_events = vec![CoachEvent::EventsDropped { count: 3 }];
     }
-    app.world_mut().write_message(KeyboardInput {
-        key_code: KeyCode::F8,
-        logical_key: bevy::input::keyboard::Key::Character("8".into()),
-        state: ButtonState::Pressed,
-        text: None,
-        repeat: false,
-        window: Entity::PLACEHOLDER,
-    });
+    // Schema 3: the recorder taps the canonical `WindowEvent` stream, not the
+    // typed `KeyboardInput` channel, so inject the combined event (as winit
+    // would) for it to be captured.
+    app.world_mut()
+        .write_message(WindowEvent::KeyboardInput(KeyboardInput {
+            key_code: KeyCode::F8,
+            logical_key: bevy::input::keyboard::Key::Character("8".into()),
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        }));
     pump(&mut app);
 
     // Flush is per-frame in `Last`; one more update guarantees the buffer hit
@@ -125,7 +130,7 @@ fn records_run_header_frame_coach_and_input_channels() {
 
     // Header first, exactly once.
     assert_eq!(records[0]["k"], "run", "first line must be the run header");
-    assert_eq!(records[0]["schema"], 2);
+    assert_eq!(records[0]["schema"], 3);
     assert_eq!(records[0]["replay_of"], Value::Null);
 
     // Frame records exist (one per update).

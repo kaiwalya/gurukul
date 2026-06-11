@@ -142,14 +142,11 @@ impl Plugin for TracePlugin {
             .init_resource::<MarkerCounter>()
             .init_resource::<GeomMemory>();
 
-        // The window-side input messages (`CursorMoved`, `WindowResized`,
-        // `WindowScaleFactorChanged`) are registered by `WindowPlugin` in a
-        // full app but absent under `MinimalPlugins`. The recorder reads them
-        // either way, so ensure the channels exist — `add_message` is
-        // idempotent when the host already added them.
-        app.add_message::<bevy::window::CursorMoved>()
-            .add_message::<bevy::window::WindowResized>()
-            .add_message::<bevy::window::WindowScaleFactorChanged>();
+        // The recorder reads the combined `WindowEvent` stream, registered by
+        // `WindowPlugin` in a full app but absent under `MinimalPlugins`. Ensure
+        // the channel exists — `add_message` is idempotent when the host already
+        // added it.
+        app.add_message::<bevy::window::WindowEvent>();
 
         // The `run` header: first line, written once at startup before any
         // per-frame record. A Startup system guarantees it precedes frame 0.

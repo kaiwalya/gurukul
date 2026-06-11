@@ -80,8 +80,9 @@ pub struct CoachRead {
 }
 
 /// Read side of one `input` record. Internally tagged by `input`, matching the
-/// writer ([`crate::trace::record::InputRecord`]). The driver turns each back
-/// into a Bevy message.
+/// writer ([`crate::trace::record::InputRecord`]) — the schema-3 `WindowEvent`
+/// variant set. The driver turns each back into a Bevy [`WindowEvent`] (and
+/// fans out to the typed channels, as winit does).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "input", rename_all = "snake_case")]
 pub enum InputRecord {
@@ -91,6 +92,7 @@ pub enum InputRecord {
         #[serde(default)]
         repeat: bool,
     },
+    KeyboardFocusLost,
     MouseButton {
         button: String,
         state: String,
@@ -98,10 +100,17 @@ pub enum InputRecord {
     Cursor {
         pos: [f32; 2],
     },
+    CursorEntered,
+    CursorLeft,
     Wheel {
         unit: String,
         x: f32,
         y: f32,
+    },
+    Touch {
+        phase: String,
+        pos: [f32; 2],
+        id: u64,
     },
     Resize {
         size: [f32; 2],
@@ -249,23 +258,25 @@ mod tests {
         dir
     }
 
-    const HEADER_V2: &str = r#"{"f":0,"k":"run","schema":2,"app_version":"0.1.0","window_logical":[800.0,600.0],"scale_factor":2.0,"wall_start":"2026-06-10 00:00:00 UTC"}"#;
+    const HEADER_V3: &str = r#"{"f":0,"k":"run","schema":3,"app_version":"0.1.0","window_logical":[800.0,600.0],"scale_factor":2.0,"wall_start":"2026-06-10 00:00:00 UTC"}"#;
 
     #[test]
     fn parses_each_record_kind() {
         let dir = write_trace(
             "kinds",
             &[
-                HEADER_V2,
+                HEADER_V3,
                 r#"{"f":1,"k":"frame","delta_s":0.016}"#,
                 r#"{"f":1,"k":"coach","drained":[{"hop_index":1,"f0_hz":222.0,"confidence":0.7,"onset":0.0,"breath":0.0,"vibrato_rate":0.0,"vibrato_depth":0.0,"t_ms":1010}]}"#,
+                r#"{"f":1,"k":"input","input":"cursor","pos":[640.0,360.0]}"#,
+                r#"{"f":1,"k":"input","input":"mouse_button","button":"Left","state":"pressed"}"#,
                 r#"{"f":1,"k":"input","input":"key","key":"F8","state":"pressed","repeat":false}"#,
                 r#"{"f":1,"k":"state","from":"—","to":"MainMenu"}"#,
                 r#"{"f":2,"k":"frame","delta_s":0.017}"#,
             ],
         );
         let trace = load(&dir).expect("loads");
-        assert_eq!(trace.header.schema, 2);
+        assert_eq!(trace.header.schema, 3);
         assert_eq!(trace.header.window_logical, [800.0, 600.0]);
         assert_eq!(trace.header.scale_factor, 2.0);
         assert_eq!(trace.frames.len(), 2, "two frames produced records");
@@ -276,13 +287,27 @@ mod tests {
         let coach = f1.coach.as_ref().expect("coach record on frame 1");
         assert_eq!(coach.drained.len(), 1);
         assert!((coach.drained[0].f0_hz - 222.0).abs() < 1e-3);
-        assert_eq!(f1.inputs.len(), 1);
+        // Three inputs this frame, preserved in recorded (arrival) order:
+        // cursor, then button, then key — the cross-channel ordering schema 3
+        // exists to keep (a click needs the cursor move before it).
+        assert_eq!(f1.inputs.len(), 3);
         match &f1.inputs[0] {
+            InputRecord::Cursor { pos } => assert_eq!(*pos, [640.0, 360.0]),
+            other => panic!("expected a cursor input first, got {other:?}"),
+        }
+        match &f1.inputs[1] {
+            InputRecord::MouseButton { button, state } => {
+                assert_eq!(button, "Left");
+                assert_eq!(state, "pressed");
+            }
+            other => panic!("expected a mouse-button input second, got {other:?}"),
+        }
+        match &f1.inputs[2] {
             InputRecord::Key { key, state, .. } => {
                 assert_eq!(key, "F8");
                 assert_eq!(state, "pressed");
             }
-            other => panic!("expected a key input, got {other:?}"),
+            other => panic!("expected a key input third, got {other:?}"),
         }
         assert_eq!(trace.last_frame(), 2);
     }

@@ -1,5 +1,12 @@
 //! Shared helpers for headless integration tests.
 //!
+//! `#![allow(dead_code)]`: each integration-test binary compiles this module
+//! fresh, and no single binary uses every helper — without the allow, a test
+//! that skips one (e.g. `trace_replay_click` defines its own settle loop) trips
+//! `dead_code` on the unused `pub fn`.
+//!
+#![allow(dead_code)]
+
 //! Builds a `Bevy App` with `MinimalPlugins + StatesPlugin` (no
 //! renderer, no window), inserts a `FakeCoach` that records every
 //! `Command` and serves canned events / feature snapshots, and runs
