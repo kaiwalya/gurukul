@@ -3,6 +3,8 @@
 use crate::feature_types::Features;
 use std::collections::VecDeque;
 
+/// Retention is also the graph's visible time width: everything held here
+/// is drawn, so `semantic_graph` fits the pitch window to all of it.
 pub const DEFAULT_HISTORY_MS: u64 = 6_000;
 pub const DEFAULT_HISTORY_CAPACITY: usize = 4_096;
 

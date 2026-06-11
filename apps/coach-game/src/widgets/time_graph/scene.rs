@@ -87,12 +87,14 @@ pub struct TimeGraphScene {
 
 // The scene is split into two resources by **repaint cadence**, not by
 // feature type. Gridlines are a function of the viewport (pitch range +
-// scale) and change rarely; the trace and the time-anchored events scroll
-// with the rolling time window and change every frame. Separate resources
-// let Bevy change-detection fire independently, so the gridline layer only
-// repaints when its data actually changes. See the layered-children pattern
-// in `ARCHITECTURE.md`. The glue (`game/time_graph.rs`) distributes a single
-// `TimeGraphScene` projection into these two, value-gating the slow one.
+// scale) and change rarely — every frame while the pitch window animates,
+// then not at all once it settles on its fixed point. The trace and the
+// time-anchored events scroll with the rolling time window and change
+// every frame. Separate resources let Bevy change-detection fire
+// independently, so the gridline layer only repaints when its data
+// actually changes. See the layered-children pattern in `ARCHITECTURE.md`.
+// The glue (`game/time_graph.rs`) distributes a single `TimeGraphScene`
+// projection into these two, value-gating the slow one.
 
 /// Slow-cadence scene: tonal gridlines, a function of the pitch viewport and
 /// scale. Painted into the gridline layer; repaints only when the grooves

@@ -8,7 +8,15 @@ use domain_ports::tuning::{Tuning, ORIGIN};
 
 const PITCH_PADDING_OCTAVES: f32 = 0.25;
 const MIN_PITCH_SPAN_OCTAVES: f32 = 0.5;
-const CONTRACT_AFTER_MS: u64 = 750;
+/// Each window edge halves its remaining distance to the contraction
+/// target over this long — expansion stays instant.
+const CONTRACT_HALF_LIFE_MS: f32 = 1_000.0;
+/// An edge this close to its target snaps onto it, giving the ease a fixed
+/// point so downstream change-detection goes quiet between contractions.
+const CONTRACT_SNAP_EPSILON_OCTAVES: f32 = 1e-3;
+/// One easing step never integrates more elapsed time than this, so a
+/// stalled feature stream resumes with a smooth step instead of a snap.
+const MAX_EASE_STEP_MS: u64 = 250;
 pub const BREATH_ACTIVE_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,7 +78,7 @@ pub struct SemanticGraph {
 #[derive(Debug, Default)]
 pub struct GraphProjector {
     pitch_window: Option<PitchWindow>,
-    contraction_since_ms: Option<u64>,
+    last_ms: Option<u64>,
 }
 
 impl GraphProjector {
@@ -87,9 +95,8 @@ impl GraphProjector {
             .time_bounds()
             .map(|(start_ms, end_ms)| TimeWindow { start_ms, end_ms });
         let newest_ms = time_window.map(|window| window.end_ms);
-        let latest_state = latest_state(history);
-        let target = target_pitch_window(history, latest_state);
-        self.update_pitch_window(target, latest_state, newest_ms);
+        let target = target_pitch_window(history);
+        self.update_pitch_window(target, newest_ms);
 
         SemanticGraph {
             time_window,
@@ -104,18 +111,17 @@ impl GraphProjector {
         }
     }
 
-    fn update_pitch_window(
-        &mut self,
-        target: Option<PitchWindow>,
-        latest_state: CurrentVoiceState,
-        newest_ms: Option<u64>,
-    ) {
-        if latest_state == CurrentVoiceState::Silence {
-            self.contraction_since_ms = None;
-            return;
+    fn update_pitch_window(&mut self, target: Option<PitchWindow>, newest_ms: Option<u64>) {
+        let dt_ms = match (self.last_ms, newest_ms) {
+            (Some(last), Some(now)) => now.saturating_sub(last).min(MAX_EASE_STEP_MS),
+            _ => 0,
+        };
+        if newest_ms.is_some() {
+            self.last_ms = newest_ms;
         }
+
+        // No voiced pitch in history: hold the window where it is.
         let Some(target) = target else {
-            self.contraction_since_ms = None;
             return;
         };
         let Some(current) = self.pitch_window else {
@@ -123,59 +129,45 @@ impl GraphProjector {
             return;
         };
 
-        if target.min.0 < current.min.0 || target.max.0 > current.max.0 {
+        // A register jump (no overlap with the current window) refits
+        // immediately.
+        if target.min.0 > current.max.0 || target.max.0 < current.min.0 {
             self.pitch_window = Some(target);
-            self.contraction_since_ms = None;
             return;
         }
 
-        let Some(now_ms) = newest_ms else {
-            return;
+        // Each edge moves independently: expansion is instant, contraction
+        // eases and snaps once the remainder is sub-visible.
+        let alpha = 1.0 - 0.5_f32.powf(dt_ms as f32 / CONTRACT_HALF_LIFE_MS);
+        let contract = |edge: f32, toward: f32| {
+            let next = edge + (toward - edge) * alpha;
+            if (toward - next).abs() < CONTRACT_SNAP_EPSILON_OCTAVES {
+                toward
+            } else {
+                next
+            }
         };
-        let since = self.contraction_since_ms.get_or_insert(now_ms);
-        if now_ms.saturating_sub(*since) >= CONTRACT_AFTER_MS {
-            self.pitch_window = Some(target);
-            self.contraction_since_ms = None;
-        }
+        self.pitch_window = Some(PitchWindow {
+            min: PitchLog2(if target.min.0 < current.min.0 {
+                target.min.0
+            } else {
+                contract(current.min.0, target.min.0)
+            }),
+            max: PitchLog2(if target.max.0 > current.max.0 {
+                target.max.0
+            } else {
+                contract(current.max.0, target.max.0)
+            }),
+        });
     }
 }
 
-fn latest_state(history: &FeatureHistory) -> CurrentVoiceState {
-    let mut last_segment_voice = CurrentVoiceState::Silence;
-    let mut previous: Option<&Features> = None;
+/// Fit every voiced pitch still in the history: the history's retention is
+/// also the visible time width, so the window tracks exactly what's on
+/// screen and contracts as extremes scroll off the left edge.
+fn target_pitch_window(history: &FeatureHistory) -> Option<PitchWindow> {
+    let mut voiced = history.iter().filter_map(|sample| sample.pitch);
 
-    for sample in history.iter() {
-        let contiguous =
-            previous.is_some_and(|prev| sample.hop_index == prev.hop_index.wrapping_add(1));
-        if sample.pitch.is_some() && (previous.is_none() || contiguous) {
-            last_segment_voice = CurrentVoiceState::Voiced;
-        } else if sample.pitch.is_none() {
-            last_segment_voice = CurrentVoiceState::Silence;
-        } else {
-            last_segment_voice = CurrentVoiceState::Voiced;
-        }
-        previous = Some(sample);
-    }
-
-    last_segment_voice
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CurrentVoiceState {
-    Silence,
-    Voiced,
-}
-
-fn target_pitch_window(
-    history: &FeatureHistory,
-    latest_state: CurrentVoiceState,
-) -> Option<PitchWindow> {
-    if latest_state == CurrentVoiceState::Silence {
-        return None;
-    }
-
-    let voiced = current_voiced_run(history)?;
-    let mut voiced = voiced.into_iter();
     let first = voiced.next()?;
     let (mut min, mut max) = (first.0, first.0);
     for pitch in voiced {
@@ -195,31 +187,6 @@ fn target_pitch_window(
         min: PitchLog2(min),
         max: PitchLog2(max),
     })
-}
-
-fn current_voiced_run(history: &FeatureHistory) -> Option<Vec<PitchLog2>> {
-    let mut current = Vec::new();
-    let mut previous: Option<&Features> = None;
-
-    for sample in history.iter() {
-        let contiguous =
-            previous.is_some_and(|prev| sample.hop_index == prev.hop_index.wrapping_add(1));
-        match sample.pitch {
-            Some(pitch) if previous.is_none() || contiguous => current.push(pitch),
-            Some(pitch) => {
-                current.clear();
-                current.push(pitch);
-            }
-            None => current.clear(),
-        }
-        previous = Some(sample);
-    }
-
-    if current.is_empty() {
-        None
-    } else {
-        Some(current)
-    }
 }
 
 fn trace_segments(history: &FeatureHistory) -> Vec<TraceSegment> {
@@ -364,7 +331,7 @@ mod tests {
     }
 
     fn history(samples: impl IntoIterator<Item = Features>) -> FeatureHistory {
-        let mut history = FeatureHistory::new(6_000, 4_096);
+        let mut history = FeatureHistory::default();
         history.extend(samples);
         history
     }
@@ -409,19 +376,169 @@ mod tests {
     }
 
     #[test]
-    fn contraction_waits_for_sustained_voiced_range() {
+    fn contraction_waits_for_extremes_to_scroll_out_of_history() {
         let mut projector = GraphProjector::default();
         let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
         let broad_window = projector.project(&broad, None).pitch_window.unwrap();
 
-        let narrow_start = history([feature(2, 1_000, Some(8.5))]);
+        // The extremes are still on screen: window holds.
+        let recent = history([
+            feature(0, 0, Some(8.0)),
+            feature(1, 10, Some(9.0)),
+            feature(2, 1_000, Some(8.5)),
+        ]);
         assert_eq!(
-            projector.project(&narrow_start, None).pitch_window,
+            projector.project(&recent, None).pitch_window,
             Some(broad_window)
         );
-        let narrow_later = history([feature(2, 1_000, Some(8.5)), feature(3, 1_800, Some(8.5))]);
-        let contracted = projector.project(&narrow_later, None).pitch_window.unwrap();
+
+        // Only the narrow note remains in history: window contracts.
+        let aged = history([feature(3, 5_000, Some(8.5)), feature(4, 5_800, Some(8.5))]);
+        let contracted = projector.project(&aged, None).pitch_window.unwrap();
         assert!(contracted.max.0 - contracted.min.0 < broad_window.max.0 - broad_window.min.0);
+    }
+
+    #[test]
+    fn expansion_snaps_the_breached_edge_while_the_other_eases() {
+        let mut projector = GraphProjector::default();
+        let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+        let broad_window = projector.project(&broad, None).pitch_window.unwrap();
+
+        // A note slightly above the window top: max expands instantly,
+        // min only eases a small step toward the new target.
+        let higher = history([feature(3, 1_000, Some(9.3))]);
+        let target_min = 9.3 - PITCH_PADDING_OCTAVES;
+        let expanded = projector.project(&higher, None).pitch_window.unwrap();
+        assert!(expanded.max.0 > broad_window.max.0);
+        assert!(expanded.min.0 >= broad_window.min.0);
+        assert!(expanded.min.0 < broad_window.min.0 + 0.3);
+        assert!(expanded.min.0 < target_min);
+    }
+
+    #[test]
+    fn expansion_below_the_window_snaps_the_min_edge() {
+        let mut projector = GraphProjector::default();
+        let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+        let broad_window = projector.project(&broad, None).pitch_window.unwrap();
+
+        // 7.6 padded overlaps the window bottom: min expands instantly.
+        let lower = history([feature(3, 1_000, Some(7.6))]);
+        let expanded = projector.project(&lower, None).pitch_window.unwrap();
+        assert!(expanded.min.0 < broad_window.min.0);
+        assert!(expanded.max.0 <= broad_window.max.0);
+    }
+
+    #[test]
+    fn downward_register_jump_refits_immediately() {
+        let mut projector = GraphProjector::default();
+        let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+        let broad_window = projector.project(&broad, None).pitch_window.unwrap();
+
+        // 7.0 padded sits entirely below the window: full refit.
+        let low = history([feature(3, 1_000, Some(7.0))]);
+        let jumped = projector.project(&low, None).pitch_window.unwrap();
+        assert!(jumped.max.0 < broad_window.min.0);
+        assert!(jumped.min.0 < 7.0 && jumped.max.0 > 7.0);
+    }
+
+    #[test]
+    fn contraction_is_framerate_independent() {
+        let broad = || history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+
+        let mut two_steps = GraphProjector::default();
+        two_steps.project(&broad(), None);
+        two_steps.project(&history([feature(2, 110, Some(8.5))]), None);
+        let fine = two_steps
+            .project(
+                &history([feature(2, 110, Some(8.5)), feature(3, 210, Some(8.5))]),
+                None,
+            )
+            .pitch_window
+            .unwrap();
+
+        let mut one_step = GraphProjector::default();
+        one_step.project(&broad(), None);
+        let coarse = one_step
+            .project(&history([feature(2, 210, Some(8.5))]), None)
+            .pitch_window
+            .unwrap();
+
+        assert!((fine.min.0 - coarse.min.0).abs() < 1e-4);
+        assert!((fine.max.0 - coarse.max.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silence_does_not_inflate_the_next_easing_step() {
+        let mut projector = GraphProjector::default();
+        let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+        let broad_window = projector.project(&broad, None).pitch_window.unwrap();
+        let broad_span = broad_window.max.0 - broad_window.min.0;
+
+        // Silence holds the window but must still advance the clock, so
+        // the next easing step integrates 100ms, not 590ms.
+        projector.project(&history([feature(2, 500, None)]), None);
+        let eased = projector
+            .project(&history([feature(3, 600, Some(8.5))]), None)
+            .pitch_window
+            .unwrap();
+        assert!(eased.max.0 - eased.min.0 > broad_span - 0.1);
+    }
+
+    #[test]
+    fn contraction_settles_exactly_on_the_target() {
+        let mut projector = GraphProjector::default();
+        projector.project(
+            &history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]),
+            None,
+        );
+
+        let mut window = None;
+        for i in 0..80u64 {
+            let t = 1_000 + i * 250;
+            window = projector
+                .project(&history([feature(2 + i, t, Some(8.5))]), None)
+                .pitch_window;
+        }
+        let settled = window.unwrap();
+        let half = MIN_PITCH_SPAN_OCTAVES * 0.5;
+        assert_eq!(settled.min.0, 8.5 - half);
+        assert_eq!(settled.max.0, 8.5 + half);
+    }
+
+    #[test]
+    fn contraction_eases_toward_target_instead_of_snapping() {
+        let mut projector = GraphProjector::default();
+        let broad = history([feature(0, 0, Some(8.0)), feature(1, 10, Some(9.0))]);
+        let broad_window = projector.project(&broad, None).pitch_window.unwrap();
+        let broad_span = broad_window.max.0 - broad_window.min.0;
+
+        // Each projection step closes only part of the remaining gap.
+        projector.project(&history([feature(2, 1_000, Some(8.5))]), None);
+        let first = projector
+            .project(
+                &history([feature(2, 1_000, Some(8.5)), feature(3, 1_800, Some(8.5))]),
+                None,
+            )
+            .pitch_window
+            .unwrap();
+        let second = projector
+            .project(
+                &history([
+                    feature(2, 1_000, Some(8.5)),
+                    feature(3, 1_800, Some(8.5)),
+                    feature(4, 2_600, Some(8.5)),
+                ]),
+                None,
+            )
+            .pitch_window
+            .unwrap();
+
+        let first_span = first.max.0 - first.min.0;
+        let second_span = second.max.0 - second.min.0;
+        assert!(first_span < broad_span);
+        assert!(second_span < first_span);
+        // Neither step jumps straight to the minimum-span target.
+        assert!(second_span > MIN_PITCH_SPAN_OCTAVES + 0.05);
     }
 
     #[test]
