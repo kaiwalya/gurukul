@@ -20,7 +20,7 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::window::WindowEvent;
 use coach_game::menu::main_menu::NewGameButton;
-use coach_game::trace::TracePlugin;
+use coach_game::trace::{self, TracePlugin};
 use common::{pump, FakeCoach};
 use domain_ports::app_coach::{CoachEvent, FeatureSnapshot};
 use serde_json::Value;
@@ -69,7 +69,7 @@ fn build_recording_app(root: &std::path::Path) -> (App, FakeCoach) {
 
     app.add_plugins(TracePlugin {
         root: root.to_path_buf(),
-        run_dir: "run".to_string(),
+        stamp: "run".to_string(),
         wall_start: "2026-06-10 00:00:00 UTC".to_string(),
         replay_of: None,
     });
@@ -78,7 +78,8 @@ fn build_recording_app(root: &std::path::Path) -> (App, FakeCoach) {
 
 /// Read every record line of the trace as JSON values.
 fn read_records(root: &std::path::Path) -> Vec<Value> {
-    let text = common::decode_trace(&root.join("run"));
+    let path = trace::file_path(root, "run");
+    let text = common::decode_trace(&path);
     text.lines()
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).expect("each line is valid json"))
@@ -205,7 +206,7 @@ fn graceful_exit_writes_a_valid_gzip_trailer() {
     // Strict decoder: `GzDecoder` (not the tolerant `MultiGzDecoder` path the
     // loader uses) errors on a missing trailer. If this reads clean, the
     // trailer is present — exactly what `gzcat` needs.
-    let bytes = fs::read(root.join("run").join("ux.jsonl.gz")).expect("trace file exists");
+    let bytes = fs::read(trace::file_path(&root, "run")).expect("trace file exists");
     let mut s = String::new();
     flate2::read::GzDecoder::new(&bytes[..])
         .read_to_string(&mut s)

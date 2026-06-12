@@ -36,15 +36,16 @@ Bevy logs to **stderr**, not stdout. Capture with `>file 2>&1` (or
 just `2>&1 | tee file`) when smoke-testing — redirecting only stdout
 gives you an empty log file and a misleading "no output" conclusion.
 
-Every run also records a UX trace to `traces/<YYYY-MM-DD-HHMMSS>/ux.jsonl.gz`
-(UTC stamp; latest run = lexicographically greatest dir; flushed every
-frame, so a crashed run's trace is intact). One gzip-compressed JSON object
-per line. A graceful exit (window close / Cmd-Q) finalizes the gzip stream,
-so a normally-closed trace unpacks with plain `gzcat traces/<dir>/ux.jsonl.gz
-| jq …` (or `gunzip -c`). A run that was **killed** (`kill -9`, crash) has no
+Every run also records a UX trace to `traces/<YYYY-MM-DD-HHMMSS-mmm>-ux.jsonl.gz`
+(UTC stamp with millis; latest run = lexicographically greatest file; flushed
+every frame, so a crashed run's trace is intact). One gzip-compressed JSON
+object per line. A graceful exit (window close / Cmd-Q) finalizes the gzip
+stream, so a normally-closed trace unpacks with plain
+`gzcat traces/<stamp>-ux.jsonl.gz | jq …` (or `gunzip -c`). Only a run
+**hard-killed** (`kill -9`, abort — a panic still finalizes on unwind) has no
 gzip trailer — on macOS `gzcat`/`gunzip` then print **nothing**; recover it
 with the tolerant one-liner
-`python3 -c 'import zlib,sys;sys.stdout.write(zlib.decompressobj(31).decompress(open(sys.argv[1],"rb").read()).decode("utf-8","ignore"))' traces/<dir>/ux.jsonl.gz | jq …`
+`python3 -c 'import zlib,sys;sys.stdout.write(zlib.decompressobj(31).decompress(open(sys.argv[1],"rb").read()).decode("utf-8","ignore"))' traces/<stamp>-ux.jsonl.gz | jq …`
 (or just `--replay` it — the loader is tolerant). Kinds and fields in
 `src/trace/record.rs`. **F10** writes a
 `mark` record ("the bug is happening *now*"). Recording is wired in
@@ -53,7 +54,7 @@ To *debug* from a trace, see [`CONTRIBUTING.md`](CONTRIBUTING.md)
 ("Debugging live runs from the trace").
 
 A trace can be re-run: `cargo run -p coach-game -- --replay
-[traces/<dir>]` (default: newest) skips mic and engine entirely and
+[traces/<file>]` (default: newest) skips mic and engine entirely and
 re-runs the app against the recorded inputs, coach reads, and clock
 deltas. The window is forced to the recorded logical size and scale
 factor, live mouse/keyboard input is suppressed (the recorded stream is

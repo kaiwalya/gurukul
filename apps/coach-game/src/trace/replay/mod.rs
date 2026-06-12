@@ -1,4 +1,4 @@
-//! Replay half of the flight recorder: re-run a recorded `ux.jsonl.gz`
+//! Replay half of the flight recorder: re-run a recorded `<stamp>-ux.jsonl.gz`
 //! deterministically with no mic and no DSP engine, emitting a fresh trace, so
 //! "is the bug fixed?" becomes a diff between two `geom` channels.
 //!
@@ -15,4 +15,4 @@ pub mod load;
 
 pub use coach::{ReplayCoach, SharedReplayCoach};
 pub use driver::install;
-pub use load::{newest_dir, LoadedTrace};
+pub use load::LoadedTrace;

@@ -1,6 +1,6 @@
 //! The buffered trace-file writer.
 //!
-//! [`TraceWriter`] owns one gzip encoder over `traces/<launch>/ux.jsonl.gz` and
+//! [`TraceWriter`] owns one gzip encoder over `traces/<stamp>-ux.jsonl.gz` and
 //! appends one JSON line per [`Record`]. Append-only and flushed once per
 //! frame (in `Last`), so a panic mid-run leaves every line up to the crash
 //! intact — the crash-safety the plan relies on.
@@ -12,13 +12,19 @@
 //!
 //! On a graceful exit (window close / Cmd-Q → `AppExit`), [`Self::finish`]
 //! writes the gzip *trailer*, leaving a fully-valid `.gz` that ordinary
-//! `gzcat`/`gunzip` (and `jq`) read with no fuss. Only a hard crash or
-//! `kill -9` skips the trailer; such a trace is still recoverable — every
-//! sync-flushed block decodes — but stock `gzcat` on macOS prints nothing
-//! for a trailerless stream, so the reader ([`super::replay::load`]) and the
-//! docs both provide a tolerant unpack path for that case.
+//! `gzcat`/`gunzip` (and `jq`) read with no fuss. There is also a backstop:
+//! `GzEncoder`'s own `Drop` calls `try_finish()`, so any path that unwinds the
+//! `World` normally — including a **panic** — still flushes the trailer even if
+//! `finish()` was never called. Don't remove either path thinking it redundant:
+//! `finish()` covers the `AppExit`-before-`Last` ordering case, `Drop` covers
+//! the rest. Only an abrupt kill that skips destructors entirely (`kill -9`,
+//! `abort`, `process::exit`) leaves a trailerless stream. Such a trace is still
+//! recoverable — every sync-flushed block decodes — but stock `gzcat` on macOS
+//! prints nothing for a trailerless stream, so the reader
+//! ([`super::replay::load`]) and the docs both provide a tolerant unpack path
+//! for that case.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,37 +32,42 @@ use bevy::prelude::Resource;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use super::paths;
 use super::record::{Body, Record};
 
-/// Buffered gzip writer for one run's `ux.jsonl.gz`. A Bevy resource so the
-/// recording systems can `ResMut` it; flushed in `Last`.
+/// Buffered gzip writer for one run's `<stamp>-ux.jsonl.gz`. A Bevy resource
+/// so the recording systems can `ResMut` it; flushed in `Last`.
 #[derive(Resource)]
 pub struct TraceWriter {
     /// `None` only after [`Self::finish`] has consumed the encoder to write
     /// the gzip trailer. Every other method treats `None` as "already
     /// finalized" and becomes a no-op.
-    out: Option<GzEncoder<BufWriter<File>>>,
-    dir: PathBuf,
+    out: Option<GzEncoder<BufWriter<fs::File>>>,
+    path: PathBuf,
 }
 
 impl TraceWriter {
-    /// Create `<root>/<run_dir>/ux.jsonl.gz`, creating parents. `run_dir` is
-    /// the launch-time directory name (lexicographically sortable → "latest" is
-    /// the greatest name); the caller stamps it so this stays testable with a
-    /// temp dir.
-    pub fn create(root: &Path, run_dir: &str) -> std::io::Result<Self> {
-        let dir = root.join(run_dir);
-        fs::create_dir_all(&dir)?;
-        let file = File::create(dir.join("ux.jsonl.gz"))?;
+    /// Create `<root>/<stamp>-ux.jsonl.gz`, creating the root directory.
+    ///
+    /// `stamp` is the launch-time filename stamp (lexicographically sortable →
+    /// "latest" is the greatest name); the caller stamps it so this stays
+    /// testable with a temp dir.
+    ///
+    /// Uses `create_new` so a trace is never truncated or overwritten. On a
+    /// millisecond collision a numeric tie-breaker is appended via
+    /// [`paths::create_new_file`].
+    pub fn create(root: &Path, stamp: &str) -> std::io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let (file, path) = paths::create_new_file(root, stamp)?;
         Ok(Self {
             out: Some(GzEncoder::new(BufWriter::new(file), Compression::fast())),
-            dir,
+            path,
         })
     }
 
-    /// The directory this run is writing into.
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The file path this run is writing into.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Append one record at frame `f`. Serialization failure is swallowed to a

@@ -3,9 +3,11 @@
 //! UX flight recorder (`trace`) — the recorder is wired *here*, not in
 //! `build_app`, so headless tests never sprout trace directories.
 //!
-//! `--replay [dir]` re-runs a recorded trace deterministically (no mic, no DSP
-//! engine), emitting a fresh trace whose header carries `replay_of`. `--hold`
-//! keeps the window open after the last replayed frame instead of exiting.
+//! `--replay [path]` re-runs a recorded trace deterministically (no mic, no
+//! DSP engine), emitting a fresh trace whose header carries `replay_of`.
+//! `path` is a trace file (`traces/<stamp>-ux.jsonl.gz`); omit it to pick the
+//! newest automatically. `--hold` keeps the window open after the last
+//! replayed frame instead of exiting.
 
 use std::path::PathBuf;
 
@@ -17,7 +19,7 @@ use coach_game::{build_app, coach, font, trace};
 
 /// Parsed CLI: live run, or replay of a specific/newest trace.
 struct Args {
-    /// `Some` in replay mode; the inner option is an explicit trace dir
+    /// `Some` in replay mode; the inner option is an explicit trace file path
     /// (`None` ⇒ newest under `traces/`).
     replay: Option<Option<PathBuf>>,
     /// `--hold`: keep the window after the last replayed frame.
@@ -33,8 +35,8 @@ fn parse_args() -> Args {
             "--replay" => {
                 // Optional path follows, unless it's another flag.
                 let next = it.next();
-                let dir = next.filter(|s| !s.starts_with("--")).map(PathBuf::from);
-                replay = Some(dir);
+                let path = next.filter(|s| !s.starts_with("--")).map(PathBuf::from);
+                replay = Some(path);
             }
             "--hold" => hold = true,
             other => eprintln!("coach-game: ignoring unknown arg {other:?}"),
@@ -46,12 +48,12 @@ fn parse_args() -> Args {
 fn main() {
     let args = parse_args();
     match args.replay {
-        Some(dir) => run_replay(dir, args.hold),
+        Some(path) => run_replay(path, args.hold),
         None => run_live(),
     }
 }
 
-/// Live run: real adapters, recording decorator, fresh trace dir.
+/// Live run: real adapters, recording decorator, fresh trace file.
 fn run_live() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -67,12 +69,12 @@ fn run_live() {
     // of the app still holds a plain `Box<dyn AppCoach>` and is unaware.
     trace::install_recording_coach(app.world_mut(), coach::build_coach());
 
-    // One trace directory per run, under a gitignored `traces/` next to the
+    // One trace file per run, under a gitignored `traces/` next to the
     // working directory. Name + header stamped from wall-clock at launch.
-    let (run_dir, wall_start) = trace::launch_stamp();
+    let (stamp, wall_start) = trace::launch_stamp();
     app.add_plugins(TracePlugin {
-        root: PathBuf::from("traces"),
-        run_dir,
+        root: PathBuf::from(trace::ROOT),
+        stamp,
         wall_start,
         replay_of: None,
     });
@@ -85,9 +87,9 @@ fn run_live() {
 /// recorded frame, drive the clock + inputs + coach from the recording, and
 /// record a *new* trace whose header carries `replay_of`.
 fn run_replay(explicit: Option<PathBuf>, hold: bool) {
-    let root = PathBuf::from("traces");
-    let src = match explicit.or_else(|| replay::newest_dir(&root)) {
-        Some(d) => d,
+    let root = PathBuf::from(trace::ROOT);
+    let src = match explicit.or_else(|| trace::newest(&root)) {
+        Some(p) => p,
         None => {
             eprintln!(
                 "coach-game --replay: no trace found under {}",
@@ -96,6 +98,17 @@ fn run_replay(explicit: Option<PathBuf>, hold: bool) {
             std::process::exit(1);
         }
     };
+
+    // Someone with a pre-flat-layout trace may pass a directory path.
+    if src.is_dir() {
+        eprintln!(
+            "coach-game --replay: {:?} is a directory.\n\
+             The trace layout is now flat: traces/<stamp>-ux.jsonl.gz.\n\
+             Pass the file path directly, e.g. --replay traces/<stamp>-ux.jsonl.gz",
+            src
+        );
+        std::process::exit(1);
+    }
 
     let trace_data = match replay::load::load(&src) {
         Ok(t) => t,
@@ -122,7 +135,7 @@ fn run_replay(explicit: Option<PathBuf>, hold: bool) {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: format!("Gurukul — replay of {}", dir_name(&src)),
+            title: format!("Gurukul — replay of {}", file_label(&src)),
             resolution,
             ..default()
         }),
@@ -134,13 +147,13 @@ fn run_replay(explicit: Option<PathBuf>, hold: bool) {
     // handle, replacing `install_recording_coach`'s job.
     replay::install(&mut app, trace_data, hold);
 
-    // Replay records too: a fresh trace dir whose header points back at `src`.
-    let (run_dir, wall_start) = trace::launch_stamp();
+    // Replay records too: a fresh trace file whose header points back at `src`.
+    let (stamp, wall_start) = trace::launch_stamp();
     app.add_plugins(TracePlugin {
         root: root.clone(),
-        run_dir,
+        stamp,
         wall_start,
-        replay_of: Some(dir_name(&src)),
+        replay_of: Some(file_label(&src)),
     });
     // The recorder needs the shared trace buffer the `RecordingCoach` would have
     // stashed; in replay there is none, so the `coach` channel records empty
@@ -160,9 +173,10 @@ fn finish(app: &mut App) {
     build_app(app);
 }
 
-/// The trailing directory name of a trace path, for the `replay_of` label and
-/// window title.
-fn dir_name(p: &std::path::Path) -> String {
+/// The filename of a trace path, for the `replay_of` label and window title.
+/// A flat trace path's `file_name()` is the stamped filename — a good
+/// `replay_of` label, and directly pasteable as `--replay traces/<that>`.
+fn file_label(p: &std::path::Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())

@@ -25,8 +25,7 @@ use bevy::input::ButtonState;
 use bevy::math::UVec2;
 use bevy::prelude::*;
 use bevy::window::WindowEvent;
-use coach_game::trace::replay;
-use coach_game::trace::TracePlugin;
+use coach_game::trace::{self, replay, TracePlugin};
 use common::{build_layout_test_app, pump, pump_layout};
 use domain_ports::app_coach::FeatureSnapshot;
 use serde_json::Value;
@@ -63,7 +62,8 @@ fn snapshot(hop_index: u64, t_ms: u64, f0_hz: f32) -> FeatureSnapshot {
 type GeomKey = (String, String, String, String, bool);
 
 fn geom_set(root: &Path) -> BTreeMap<GeomKey, ()> {
-    let text = common::decode_trace(&root.join("run"));
+    let path = trace::file_path(root, "run");
+    let text = common::decode_trace(&path);
     let mut out = BTreeMap::new();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let r: Value = serde_json::from_str(line).expect("valid json");
@@ -98,7 +98,7 @@ fn record(root: &Path) {
     coach_game::trace::install_recording_coach_over_existing(app.world_mut());
     app.add_plugins(TracePlugin {
         root: root.to_path_buf(),
-        run_dir: "run".to_string(),
+        stamp: "run".to_string(),
         wall_start: "2026-06-10 00:00:00 UTC".to_string(),
         replay_of: None,
     });
@@ -127,8 +127,8 @@ fn record(root: &Path) {
 /// Replay pass: a 2× layout app with **no** `FakeCoach` — `replay::install`
 /// inserts the `ReplayCoach` + driver — plus the recorder writing into `root`.
 /// Pumped enough frames to serve the whole loaded trace.
-fn replay(src: &Path, root: &Path) {
-    let trace = replay::load::load(src).expect("load the recorded trace");
+fn replay(src_file: &Path, root: &Path) {
+    let trace = replay::load::load(src_file).expect("load the recorded trace");
     let frames = trace.frames.len();
 
     let mut app = App::new();
@@ -174,7 +174,7 @@ fn replay(src: &Path, root: &Path) {
 
     app.add_plugins(TracePlugin {
         root: root.to_path_buf(),
-        run_dir: "run".to_string(),
+        stamp: "run".to_string(),
         wall_start: "2026-06-10 00:00:01 UTC".to_string(),
         replay_of: Some("src".to_string()),
     });
@@ -198,9 +198,8 @@ fn geom_channel_survives_record_then_replay() {
         "the recording pass should paint some geometry"
     );
 
-    // The recorder writes into `<dir_a>/run/`; the loader reads a run dir
-    // directly.
-    replay(&dir_a.join("run"), &dir_b);
+    // The recorder writes `<dir_a>/run-ux.jsonl.gz`; pass the file path.
+    replay(&trace::file_path(&dir_a, "run"), &dir_b);
     let replayed = geom_set(&dir_b);
 
     // The contract: every (path, size, rect, scale, gone) the recording painted

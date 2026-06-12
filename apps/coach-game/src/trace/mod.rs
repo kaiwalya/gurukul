@@ -1,7 +1,7 @@
 //! UX flight recorder: a per-run gzip-compressed JSONL trace of what the app
 //! *saw* (inputs, coach reads, clock) and what it *did on screen* (computed
 //! geometry), so an agent can debug rendering bugs from data instead of a
-//! human's description. Written to `ux.jsonl.gz`; read with `gzcat … | jq`.
+//! human's description. Written to `traces/<stamp>-ux.jsonl.gz`; read with `gzcat … | jq`.
 //!
 //! A non-slice crate-level module (like [`coach`](crate::coach)). Wired in
 //! `main.rs`, **not** `build_app` — headless tests must not sprout trace
@@ -33,6 +33,7 @@
 //! substitute), replay ergonomics (speed control, scrubbing, partial
 //! replay), and any `traces/` retention policy (manual cleanup).
 
+mod paths;
 mod record;
 mod recording_coach;
 pub mod replay;
@@ -51,6 +52,7 @@ use bevy::ui::UiSystems;
 use crate::coach::Coach;
 use domain_ports::app_coach::AppCoach;
 
+pub use paths::{file_name, file_path, newest, ROOT};
 pub use record::SCHEMA_VERSION;
 pub use recording_coach::{RecordingCoach, TraceBuffer, TraceBufferHandle};
 pub use wallclock::launch_stamp;
@@ -93,10 +95,10 @@ pub struct TracePlugin {
     /// Root directory traces are written under (gitignored `traces/` in
     /// production; a temp dir in tests).
     pub root: PathBuf,
-    /// Launch-time run directory name, lexicographically sortable. The caller
-    /// stamps it (production: UTC wall-clock; tests: a fixed name) so the
-    /// module needs no clock of its own.
-    pub run_dir: String,
+    /// Launch-time filename stamp (`YYYY-MM-DD-HHMMSS-mmm`), lexicographically
+    /// sortable. The caller stamps it (production: UTC wall-clock; tests: a
+    /// fixed name) so the module needs no clock of its own.
+    pub stamp: String,
     /// Header `wall_start` string for the `run` record.
     pub wall_start: String,
     /// `replay_of` for the `run` header (replay runs only; `None` for live).
@@ -105,18 +107,14 @@ pub struct TracePlugin {
 
 impl Plugin for TracePlugin {
     fn build(&self, app: &mut App) {
-        let writer = match TraceWriter::create(&self.root, &self.run_dir) {
+        let writer = match TraceWriter::create(&self.root, &self.stamp) {
             Ok(w) => w,
             Err(e) => {
-                bevy::log::error!(
-                    "trace: could not open {:?}/{}: {e}",
-                    self.root,
-                    self.run_dir
-                );
+                bevy::log::error!("trace: could not open {:?}/{}: {e}", self.root, self.stamp);
                 return;
             }
         };
-        bevy::log::info!("trace: recording to {:?}", writer.dir());
+        bevy::log::info!("trace: recording to {:?}", writer.path());
 
         // `FrameCount` drives the `f` field; ensure its plugin is present
         // (DefaultPlugins includes it, but a MinimalPlugins test may not).

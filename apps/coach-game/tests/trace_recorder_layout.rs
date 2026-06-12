@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 use coach_game::menu::main_menu::NewGameButton;
-use coach_game::trace::TracePlugin;
+use coach_game::trace::{self, TracePlugin};
 use coach_game::widgets::time_graph::TimeGraphPitchLane;
 use common::{build_layout_test_app, pump, pump_layout, FakeCoach};
 use domain_ports::app_coach::{CoachEvent, FeatureSnapshot, MusicInfo};
@@ -72,7 +72,8 @@ fn publish_music(fake: &FakeCoach, info: MusicInfo) {
 }
 
 fn read_records(root: &std::path::Path) -> Vec<Value> {
-    let text = common::decode_trace(&root.join("run"));
+    let path = trace::file_path(root, "run");
+    let text = common::decode_trace(&path);
     text.lines()
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).expect("each line is valid json"))
@@ -86,7 +87,7 @@ fn geom_record_carries_physical_size_and_scale_factor_at_2x() {
     coach_game::trace::install_recording_coach_over_existing(app.world_mut());
     app.add_plugins(TracePlugin {
         root: root.clone(),
-        run_dir: "run".to_string(),
+        stamp: "run".to_string(),
         wall_start: "2026-06-10 00:00:00 UTC".to_string(),
         replay_of: None,
     });

@@ -1,7 +1,7 @@
 //! Wall-clock stamping for a trace run, with no extra dependency.
 //!
-//! The trace directory name must be lexicographically sortable so "latest" is
-//! the greatest name, and the `run` header wants a human-readable start time.
+//! The trace stamp must be lexicographically sortable so "latest" is the
+//! greatest name, and the `run` header wants a human-readable start time.
 //! The `Clock` port is monotonic-only (deltas, no civil time), and the crate
 //! pulls in no `chrono`/`time`, so we convert `SystemTime` → UTC civil
 //! datetime here with the standard days-since-epoch algorithm.
@@ -13,17 +13,19 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `(run_dir, wall_start)` for the current launch:
-/// - `run_dir` = `YYYY-MM-DD-HHMMSS` (sortable directory name)
+/// `(stamp, wall_start)` for the current launch:
+/// - `stamp` = `YYYY-MM-DD-HHMMSS-mmm` (sortable filename stamp, 21 chars;
+///   millis appended so two runs in the same second produce distinct names)
 /// - `wall_start` = `YYYY-MM-DD HH:MM:SS UTC` (header label)
 pub fn launch_stamp() -> (String, String) {
-    let secs = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let ms = dur.subsec_millis(); // 0–999
     let (y, mo, d, h, mi, s) = civil_from_unix(secs);
     (
-        format!("{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}{s:02}"),
+        format!("{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}{s:02}-{ms:03}"),
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC"),
     )
 }
@@ -66,9 +68,16 @@ mod tests {
 
     #[test]
     fn run_dir_is_sortable_and_shaped() {
-        let (dir, label) = launch_stamp();
-        // YYYY-MM-DD-HHMMSS = 17 chars, all the separators where expected.
-        assert_eq!(dir.len(), 17, "got {dir}");
+        let (stamp, label) = launch_stamp();
+        // YYYY-MM-DD-HHMMSS-mmm = 21 chars.
+        // Format: date(10) + "-" + time(6) + "-" + millis(3) = 10+1+6+1+3 = 21.
+        assert_eq!(stamp.len(), 21, "got {stamp}");
+        // The millis field is the last 3 chars and must be all digits.
+        let millis_part = &stamp[18..];
+        assert!(
+            millis_part.chars().all(|c| c.is_ascii_digit()),
+            "millis field must be 3 digits, got {millis_part:?} in {stamp}"
+        );
         assert!(label.ends_with(" UTC"));
     }
 }
