@@ -1,4 +1,4 @@
-//! Trace reader: parse a recorded `ux.jsonl` back into typed records the
+//! Trace reader: parse a recorded `ux.jsonl.gz` back into typed records the
 //! replay driver can serve frame by frame.
 //!
 //! The write side ([`super::super::record`]) is `Serialize`-only — its `Body`
@@ -18,8 +18,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use flate2::read::MultiGzDecoder;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -120,15 +122,38 @@ pub enum InputRecord {
     },
 }
 
-/// Load and parse `<dir>/ux.jsonl`. Refuses any schema other than the current
-/// [`SCHEMA_VERSION`] — replay serves reads verbatim, so a reader that can't
-/// guarantee the channel's shape must not pretend to.
-pub fn load(dir: &Path) -> io::Result<LoadedTrace> {
-    let path = dir.join("ux.jsonl");
-    // Carry the path in the error — a bare `os error 2` from `read_to_string`
-    // doesn't say *which* file, unlike every other error this loader returns.
-    let text = fs::read_to_string(&path)
+/// Decode a `ux.jsonl.gz` file to a `String`, tolerating a missing gzip
+/// trailer. A run killed mid-flight leaves a stream whose flushed deflate
+/// blocks all decode but has no final CRC/ISIZE trailer; `MultiGzDecoder`
+/// writes all flushed lines into the buffer and then returns
+/// `UnexpectedEof`. We keep what was decoded and treat that as the end of
+/// the stream — the same loss boundary as today's plain-`BufWriter` flush.
+fn decode_gz(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut text = String::new();
+    match decoder.read_to_string(&mut text) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            // Truncated stream (killed run) — the flushed lines are already in
+            // `text`; only the final partial line (if any) after the last
+            // Z_SYNC_FLUSH boundary is missing. The `.lines()` parse below
+            // handles that cleanly.
+        }
+        Err(e) => {
+            return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display())));
+        }
+    }
+    Ok(text)
+}
+
+/// Load and parse `<dir>/ux.jsonl.gz`. Refuses any schema other than the
+/// current [`SCHEMA_VERSION`] — replay serves reads verbatim, so a reader
+/// that can't guarantee the channel's shape must not pretend to.
+pub fn load(dir: &Path) -> io::Result<LoadedTrace> {
+    let path = dir.join("ux.jsonl.gz");
+    let text = decode_gz(&path)?;
 
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
 
@@ -244,8 +269,12 @@ fn err(msg: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
 
-    /// Write a trace file under a fresh temp dir and return its run directory.
+    /// Write a gzip-compressed trace file under a fresh temp dir and return its
+    /// run directory.
     fn write_trace(tag: &str, lines: &[&str]) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
@@ -254,7 +283,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let dir = root.join("run");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("ux.jsonl"), lines.join("\n")).unwrap();
+        let file = fs::File::create(dir.join("ux.jsonl.gz")).unwrap();
+        let mut gz = GzEncoder::new(file, Compression::fast());
+        gz.write_all(lines.join("\n").as_bytes()).unwrap();
+        gz.finish().unwrap();
         dir
     }
 
@@ -338,6 +370,60 @@ mod tests {
         }
         let newest = newest_dir(&root).expect("a subdirectory");
         assert_eq!(newest.file_name().unwrap(), "2026-06-10-143212");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Crash-recovery contract: sync-flush a few records into a gzip stream,
+    /// then drop the gzip trailer (simulating a killed run). The loader must
+    /// still return every flushed record — the whole point of per-frame flush.
+    ///
+    /// How the truncation is produced: write through a `GzEncoder` with
+    /// `Z_SYNC_FLUSH` after each record (i.e. `flush()` on the encoder), capture
+    /// the raw bytes, then truncate at the end of the last flushed block — before
+    /// the gzip CRC/ISIZE trailer that `finish()` would append. That is exactly
+    /// what the kernel sees for a killed run.
+    #[test]
+    fn truncated_stream_recovers_flushed_lines() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("gurukul-trunc-test-{n}"));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("run");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Build the raw gz bytes with sync-flushes but no trailer.
+        let mut raw: Vec<u8> = Vec::new();
+        {
+            // `IntoInnerError` is infallible here since we flush before finish.
+            let mut gz = GzEncoder::new(&mut raw, Compression::fast());
+            for line in &[
+                HEADER_V3,
+                r#"{"f":1,"k":"frame","delta_s":0.016}"#,
+                r#"{"f":2,"k":"frame","delta_s":0.017}"#,
+            ] {
+                writeln!(gz, "{line}").unwrap();
+                // Z_SYNC_FLUSH: flushes compressed bytes without closing stream.
+                gz.flush().unwrap();
+            }
+            // Deliberately do NOT call gz.finish() — we want a trailerless stream.
+            // Drop the encoder; the raw bytes end after the last sync-flush block.
+        }
+        // `raw` now contains a valid gzip stream body (flushed blocks) with no
+        // CRC/ISIZE trailer — the same bytes a killed process leaves on disk.
+        fs::write(dir.join("ux.jsonl.gz"), &raw).unwrap();
+
+        let trace = load(&dir).expect("truncated stream must still load");
+        assert_eq!(
+            trace.frames.len(),
+            2,
+            "both flushed frame records must be recovered from the truncated stream"
+        );
+        assert_eq!(trace.frames[0].frame, 1);
+        assert_eq!(trace.frames[1].frame, 2);
+        assert_eq!(trace.frames[0].delta_s, Some(0.016));
+        assert_eq!(trace.frames[1].delta_s, Some(0.017));
+
         let _ = fs::remove_dir_all(&root);
     }
 }

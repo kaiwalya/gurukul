@@ -1,9 +1,9 @@
 //! Trace record types — the on-disk JSONL schema.
 //!
-//! Each line of `ux.jsonl` is one [`Record`]: a `{"f": <frame>, "k":
+//! Each line of `ux.jsonl.gz` is one [`Record`]: a `{"f": <frame>, "k":
 //! "<kind>", …}` object. The kinds and their payloads defined here *are* the
 //! on-disk contract. These types are the *writer's* view; a reader (agent
-//! grep/jq, [`super::replay::load`]) parses the same shapes back.
+//! `gzcat … | jq`, [`super::replay::load`]) parses the same shapes back.
 //!
 //! Everything here is plain serde data — no Bevy, no domain logic. The port
 //! payloads (`FeatureSnapshot`, `CoachEvent`, `Command`) are embedded by

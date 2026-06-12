@@ -256,6 +256,20 @@ pub fn flush_writer(mut writer: ResMut<TraceWriter>) {
     writer.flush();
 }
 
+/// `Last`: on a graceful exit (`AppExit` — window close / Cmd-Q), finish the
+/// gzip stream so the trace carries a valid trailer and stock `gzcat`/`gunzip`
+/// read it cleanly. Runs after [`flush_writer`]; finishing also flushes, and
+/// the writer goes inert afterward (subsequent frames don't run on exit). A
+/// hard crash skips this and leaves a recoverable trailerless stream.
+pub fn finish_writer(
+    mut writer: ResMut<TraceWriter>,
+    mut exits: MessageReader<bevy::app::AppExit>,
+) {
+    if exits.read().next().is_some() {
+        writer.finish();
+    }
+}
+
 /// The recorded geometry of one node, pre-hash. Physical pixels throughout.
 struct GeomFields {
     size: Vec2,

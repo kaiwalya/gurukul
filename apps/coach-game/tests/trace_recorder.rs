@@ -78,8 +78,7 @@ fn build_recording_app(root: &std::path::Path) -> (App, FakeCoach) {
 
 /// Read every record line of the trace as JSON values.
 fn read_records(root: &std::path::Path) -> Vec<Value> {
-    let text = fs::read_to_string(root.join("run").join("ux.jsonl"))
-        .expect("trace file should exist after a run");
+    let text = common::decode_trace(&root.join("run"));
     text.lines()
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).expect("each line is valid json"))
@@ -176,6 +175,49 @@ fn records_run_header_frame_coach_and_input_channels() {
         .expect("the injected key press should be recorded");
     assert_eq!(key["key"], "F8");
     assert_eq!(key["state"], "pressed");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A graceful exit (`AppExit`) finishes the gzip stream, so the trace carries a
+/// valid trailer and a *strict* decoder reads it whole. This is the common
+/// case (window close / Cmd-Q); it's what lets stock `gzcat`/`gunzip` read a
+/// normally-closed trace with no tolerance tricks. The recovery path for a
+/// trailerless (killed) stream is proven separately in `replay::load`'s
+/// `truncated_stream_recovers_flushed_lines`.
+#[test]
+fn graceful_exit_writes_a_valid_gzip_trailer() {
+    use std::io::Read;
+
+    let root = temp_root("graceful");
+    let (mut app, _fake) = build_recording_app(&root);
+
+    pump(&mut app);
+    app.world_mut()
+        .spawn((Button, NewGameButton, Interaction::Pressed));
+    pump(&mut app);
+
+    // Signal a graceful shutdown the way a window-close / Cmd-Q does, then run
+    // one more frame so `finish_writer` (in `Last`) sees the `AppExit` message.
+    app.world_mut().write_message(AppExit::Success);
+    app.update();
+
+    // Strict decoder: `GzDecoder` (not the tolerant `MultiGzDecoder` path the
+    // loader uses) errors on a missing trailer. If this reads clean, the
+    // trailer is present — exactly what `gzcat` needs.
+    let bytes = fs::read(root.join("run").join("ux.jsonl.gz")).expect("trace file exists");
+    let mut s = String::new();
+    flate2::read::GzDecoder::new(&bytes[..])
+        .read_to_string(&mut s)
+        .expect("a finalized trace decodes cleanly under a strict decoder");
+    assert!(
+        s.lines()
+            .next()
+            .map(|l| l.contains("\"run\""))
+            .unwrap_or(false),
+        "decoded trace should start with the run header, got: {:?}",
+        s.lines().next()
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

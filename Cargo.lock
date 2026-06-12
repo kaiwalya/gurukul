@@ -2008,6 +2008,7 @@ dependencies = [
  "adapter-telemetry-std",
  "bevy",
  "domain-ports",
+ "flate2",
  "serde",
  "serde_json",
 ]

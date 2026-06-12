@@ -1,4 +1,4 @@
-//! Replay half of the flight recorder: re-run a recorded `ux.jsonl`
+//! Replay half of the flight recorder: re-run a recorded `ux.jsonl.gz`
 //! deterministically with no mic and no DSP engine, emitting a fresh trace, so
 //! "is the bug fixed?" becomes a diff between two `geom` channels.
 //!

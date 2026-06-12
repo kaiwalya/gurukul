@@ -20,8 +20,9 @@
 //!   `systems`); see `ARCHITECTURE.md`.
 //! - `semantic_graph` — crate-level shared pitch/time projection that
 //!   feeds the time-graph widget.
-//! - `trace` — the UX flight recorder (JSONL trace of inputs, coach
-//!   reads, and computed geometry); wired in `main`, not `build_app`.
+//! - `trace` — the UX flight recorder (gzip-compressed JSONL trace of
+//!   inputs, coach reads, and computed geometry); wired in `main`, not
+//!   `build_app`.
 //!
 //! Items are `pub` so integration tests under `tests/` can spawn the
 //! schedule against a fake `AppCoach`.

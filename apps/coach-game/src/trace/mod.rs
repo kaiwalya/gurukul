@@ -1,6 +1,7 @@
-//! UX flight recorder: a per-run JSONL trace of what the app *saw* (inputs,
-//! coach reads, clock) and what it *did on screen* (computed geometry), so an
-//! agent can debug rendering bugs from data instead of a human's description.
+//! UX flight recorder: a per-run gzip-compressed JSONL trace of what the app
+//! *saw* (inputs, coach reads, clock) and what it *did on screen* (computed
+//! geometry), so an agent can debug rendering bugs from data instead of a
+//! human's description. Written to `ux.jsonl.gz`; read with `gzcat … | jq`.
 //!
 //! A non-slice crate-level module (like [`coach`](crate::coach)). Wired in
 //! `main.rs`, **not** `build_app` — headless tests must not sprout trace
@@ -179,7 +180,10 @@ impl Plugin for TracePlugin {
             PostUpdate,
             systems::record_geom.after(UiSystems::PostLayout),
         );
-        app.add_systems(Last, systems::flush_writer);
+        app.add_systems(
+            Last,
+            (systems::flush_writer, systems::finish_writer).chain(),
+        );
     }
 }
 

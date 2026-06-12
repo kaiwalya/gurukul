@@ -72,8 +72,7 @@ fn publish_music(fake: &FakeCoach, info: MusicInfo) {
 }
 
 fn read_records(root: &std::path::Path) -> Vec<Value> {
-    let text = fs::read_to_string(root.join("run").join("ux.jsonl"))
-        .expect("trace file should exist after a run");
+    let text = common::decode_trace(&root.join("run"));
     text.lines()
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).expect("each line is valid json"))

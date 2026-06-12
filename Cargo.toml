@@ -37,3 +37,4 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 cpal = "0.17"
+flate2 = "1"

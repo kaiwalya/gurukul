@@ -121,12 +121,21 @@ Worked example — "the pitch trace looks jumpy, like the zoom is bouncing":
 
 ```sh
 # Symptom: gridlines should repaint only on viewport change, yet…
-jq -r 'select(.k=="geom" and (.path|contains("gridline_layer/")))
-       | "\(.f) \(.rect_px)"' ux.jsonl
+gzcat traces/<dir>/ux.jsonl.gz | \
+  jq -r 'select(.k=="geom" and (.path|contains("gridline_layer/")))
+         | "\(.f) \(.rect_px)"'
 # …they repainted on 34 of ~60 InGame frames, line spacing flapping
 # 151→111→77→66 px: pan AND zoom bouncing. Cause: which frames got data?
-jq -r 'select(.k=="coach") | "\(.f) \(.drained)"' ux.jsonl
+gzcat traces/<dir>/ux.jsonl.gz | \
+  jq -r 'select(.k=="coach") | "\(.f) \(.drained)"'
 ```
+
+(Use `gunzip -c` in place of `gzcat` if preferred. This works because a
+graceful exit — window close / Cmd-Q — finalizes the gzip stream. A run
+that was **killed** (`kill -9`, crash) has no trailer; on macOS `gzcat`
+and `gunzip` then emit **nothing** at all. Recover such a trace with a
+tolerant decoder — `python3 -c 'import zlib,sys;sys.stdout.write(zlib.decompressobj(31).decompress(open(sys.argv[1],"rb").read()).decode("utf-8","ignore"))' traces/<dir>/ux.jsonl.gz | jq …`
+— or simply `--replay` it, since the loader recovers every flushed line.)
 
 Every repaint frame coincided exactly with a voiced pitch sample arriving —
 sparse, low-confidence (0.2–0.4) samples, one a 3-octave outlier. Diagnosis,
@@ -150,8 +159,8 @@ not eyeballing: replay the bug trace on the fixed code and diff the
 `geom` channels —
 
 ```sh
-diff <(jq -c 'select(.k=="geom")' traces/<bug-run>/ux.jsonl) \
-     <(jq -c 'select(.k=="geom")' traces/<replay>/ux.jsonl)
+diff <(gzcat traces/<bug-run>/ux.jsonl.gz | jq -c 'select(.k=="geom")') \
+     <(gzcat traces/<replay>/ux.jsonl.gz  | jq -c 'select(.k=="geom")')
 ```
 
 On unfixed code that diff is empty — bit-for-bit; that is the contract,

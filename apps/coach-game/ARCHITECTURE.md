@@ -257,12 +257,13 @@ the debugging workflow in [`CONTRIBUTING.md`](CONTRIBUTING.md)).
   graph's private model, so it lives at crate level, not inside
   `widgets/time_graph/`. Its Bevy wrapper (`SemanticGraphRes`) lives in
   `game/mod.rs` so the projection module itself stays Bevy-free.
-- **`trace`** — the UX flight recorder: one JSONL trace per run of what the
-  app *saw* (inputs, coach reads, clock deltas) and what it *did on screen*
-  (computed geometry, captured after layout). It exists because every test
-  level above is blind to live-run dynamics — the trace is the observability
-  surface for bugs that only manifest in a real session, and it is what lets
-  an agent debug a visual defect from data (workflow and worked example in
+- **`trace`** — the UX flight recorder: one gzip-compressed JSONL trace per
+  run (`ux.jsonl.gz`) of what the app *saw* (inputs, coach reads, clock
+  deltas) and what it *did on screen* (computed geometry, captured after
+  layout). Read with `gzcat … | jq`. It exists because every test level above
+  is blind to live-run dynamics — the trace is the observability surface for
+  bugs that only manifest in a real session, and it is what lets an agent debug
+  a visual defect from data (workflow and worked example in
   [`CONTRIBUTING.md`](CONTRIBUTING.md); schema in `trace/record.rs`; design
   rationale in `trace/mod.rs`).
   Doctrine notes: recording computed pixels does **not** violate the

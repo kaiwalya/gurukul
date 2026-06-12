@@ -63,8 +63,7 @@ fn snapshot(hop_index: u64, t_ms: u64, f0_hz: f32) -> FeatureSnapshot {
 type GeomKey = (String, String, String, String, bool);
 
 fn geom_set(root: &Path) -> BTreeMap<GeomKey, ()> {
-    let text = fs::read_to_string(root.join("run").join("ux.jsonl"))
-        .expect("trace file should exist after a run");
+    let text = common::decode_trace(&root.join("run"));
     let mut out = BTreeMap::new();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let r: Value = serde_json::from_str(line).expect("valid json");

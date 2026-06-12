@@ -189,6 +189,28 @@ pub fn pump_layout(app: &mut App) {
     }
 }
 
+/// Decode a run directory's `ux.jsonl.gz` and return its contents as a plain
+/// `String` of newline-separated JSON lines. Tolerates a missing gzip trailer
+/// (killed run) by keeping whatever was decoded before `UnexpectedEof`.
+#[allow(dead_code)]
+pub fn decode_trace(run_dir: &std::path::Path) -> String {
+    use flate2::read::MultiGzDecoder;
+    use std::io::Read;
+    let path = run_dir.join("ux.jsonl.gz");
+    let file = std::fs::File::open(&path)
+        .unwrap_or_else(|e| panic!("could not open {}: {e}", path.display()));
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut text = String::new();
+    match decoder.read_to_string(&mut text) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            // Truncated stream (killed run) — use what was decoded.
+        }
+        Err(e) => panic!("could not decode {}: {e}", path.display()),
+    }
+    text
+}
+
 /// Drive the schedule until any pending `NextState` has been applied
 /// AND that new state's `OnEnter` schedule has run. In Bevy 0.18 the
 /// `StateTransition` schedule runs at the START of the next update
