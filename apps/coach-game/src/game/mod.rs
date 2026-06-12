@@ -25,20 +25,98 @@ pub struct SemanticGraphRes(pub SemanticGraph);
 #[derive(Component)]
 pub struct InGameRoot;
 
+#[derive(Component)]
+pub struct HudSlot;
+
+#[derive(Component)]
+pub struct ContentRow;
+
+#[derive(Component)]
+pub struct GraphSlot;
+
+#[derive(Component)]
+pub struct DialSlot;
+
 pub fn spawn_root(mut commands: Commands) {
-    commands.spawn((
-        DespawnOnExit(AppState::InGame),
-        InGameRoot,
-        Name::new("in_game"),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(0),
-            top: px(0),
-            right: px(0),
-            bottom: px(0),
-            ..default()
-        },
-    ));
+    use crate::widgets::note_dial::DIAL_BOX_PX;
+    const BREATHING: f32 = 80.0;
+
+    let hud_slot = commands
+        .spawn((HudSlot, Name::new("hud_slot"), Node { ..default() }))
+        .id();
+
+    let graph_slot = commands
+        .spawn((
+            GraphSlot,
+            Name::new("graph_slot"),
+            Node {
+                flex_grow: 1.0,
+                ..default()
+            },
+        ))
+        .id();
+
+    let dial_slot = commands
+        .spawn((
+            DialSlot,
+            Name::new("dial_slot"),
+            Node {
+                width: px(DIAL_BOX_PX + BREATHING),
+                // Fixed rail: never let a narrow window squeeze the dial
+                // below its intrinsic box (responsive reflow is deferred).
+                flex_shrink: 0.0,
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::FlexEnd,
+                align_items: AlignItems::FlexEnd,
+                padding: UiRect {
+                    right: px(BREATHING),
+                    bottom: px(BREATHING),
+                    ..default()
+                },
+                ..default()
+            },
+        ))
+        .id();
+
+    let content_row = commands
+        .spawn((
+            ContentRow,
+            Name::new("content_row"),
+            Node {
+                flex_direction: FlexDirection::Row,
+                flex_grow: 1.0,
+                column_gap: px(28),
+                ..default()
+            },
+        ))
+        .add_children(&[graph_slot, dial_slot])
+        .id();
+
+    commands
+        .spawn((
+            DespawnOnExit(AppState::InGame),
+            InGameRoot,
+            Name::new("in_game"),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                right: px(0),
+                bottom: px(0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(8),
+                padding: UiRect {
+                    left: px(32),
+                    right: px(0),
+                    top: px(24),
+                    // Match today's 24px breathing room under the graph
+                    // (the dial keeps its own 80px via the rail padding).
+                    bottom: px(24),
+                },
+                ..default()
+            },
+        ))
+        .add_children(&[hud_slot, content_row]);
 }
 
 pub fn on_enter(

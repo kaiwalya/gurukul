@@ -14,7 +14,7 @@
 //! the widget scene ([`HudSceneRes`]); the widget systems paint from there.
 
 use crate::coach::MusicInfoRes;
-use crate::game::InGameRoot;
+use crate::game::HudSlot;
 use crate::widgets::hud::{self, HudSceneRes};
 use bevy::prelude::*;
 
@@ -29,7 +29,7 @@ use bevy::prelude::*;
 pub fn spawn(
     mut commands: Commands,
     music: Res<MusicInfoRes>,
-    root: Single<Entity, With<InGameRoot>>,
+    root: Single<Entity, With<HudSlot>>,
 ) {
     hud::spawn(&mut commands, *root);
     commands.insert_resource(scene_from(music.0));

@@ -10,7 +10,7 @@
 //! No frequency math lives here — the model spent the music.
 
 use crate::coach::{Coach, LatestFeatures, MusicInfoRes};
-use crate::game::InGameRoot;
+use crate::game::DialSlot;
 use crate::state::{AppSettings, SongTonality};
 use crate::widgets::note_dial::{
     self, hub_colors, hub_visual_state, is_capture_voiced, DialHub, DialHubLabel, DialScale,
@@ -19,27 +19,15 @@ use crate::widgets::note_dial::{
 use bevy::prelude::*;
 use domain_ports::app_coach::Command;
 
-/// Spawn the dial widget under the InGame root and apply the route's
-/// bottom-right overlay placement to the returned shell entity.
+/// Spawn the dial widget under the `DialSlot` rail.
 ///
-/// The widget builds itself placement-agnostic (neutral layout); InGame is
-/// route vocabulary, so the absolute `right`/`bottom` positioning is set
-/// here, on the existing `Node` (no `Transform` — UI nodes use `Node`).
+/// The widget builds itself placement-agnostic (neutral layout); placement
+/// is a property of the `DialSlot` scaffold node, not of the widget itself.
 /// The shell spawns empty: the tuning + tonality come from the coach's read
 /// model ([`MusicInfoRes`]), which may not have landed yet. [`repaint_slots`]
 /// fills the slots in as soon as the snapshot is available.
-pub fn spawn(mut commands: Commands, root: Single<Entity, With<InGameRoot>>) {
-    let dial = note_dial::spawn(&mut commands, *root);
-    // Apply InGame overlay placement on the just-spawned shell's Node. The
-    // widget set width/height/centering; keep those, add absolute placement.
-    commands
-        .entity(dial)
-        .entry::<Node>()
-        .and_modify(|mut node| {
-            node.position_type = PositionType::Absolute;
-            node.right = px(80);
-            node.bottom = px(80);
-        });
+pub fn spawn(mut commands: Commands, root: Single<Entity, With<DialSlot>>) {
+    note_dial::spawn(&mut commands, *root);
 }
 
 /// Paint the dial's slots from the [`MusicInfoRes`] read model. Writes a

@@ -56,7 +56,7 @@ const NEEDLE_WIDTH_SECONDARY_PX: f32 = 2.0;
 const DIAL_CENTRE_PX: f32 = DIAL_RADIUS_PX + SLOT_SIZE_PX;
 /// The shell's intrinsic side length: wide enough to hold the ring plus a
 /// slot on each side.
-const DIAL_BOX_PX: f32 = 324.0;
+pub const DIAL_BOX_PX: f32 = 324.0;
 /// The hub's diameter.
 const HUB_SIZE_PX: f32 = 64.0;
 

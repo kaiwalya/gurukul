@@ -30,9 +30,6 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
             Name::new("hud"),
             Button,
             Node {
-                position_type: PositionType::Absolute,
-                left: px(32),
-                top: px(24),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(4),
                 padding: UiRect::all(px(6)),

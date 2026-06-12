@@ -115,11 +115,20 @@ fn semantic_graph_projects_into_tree_and_lane_nodes() {
             .collect::<Vec<_>>()
     };
 
+    let graph_slots = {
+        world
+            .query_filtered::<Entity, With<coach_game::game::GraphSlot>>()
+            .iter(world)
+            .collect::<Vec<_>>()
+    };
+
     assert_eq!(roots.len(), 1);
+    assert_eq!(graph_slots.len(), 1);
     assert_eq!(graph_roots.len(), 1);
     assert_eq!(pitch_lane.len(), 1);
     assert_eq!(events_lane.len(), 1);
-    assert_eq!(graph_roots[0].0, roots[0]);
+    // graph root's parent is GraphSlot, not InGameRoot directly
+    assert_eq!(graph_roots[0].0, graph_slots[0]);
     assert_eq!(pitch_lane[0].0, graph_roots[0].1);
     assert_eq!(events_lane[0].0, graph_roots[0].1);
 

@@ -3,13 +3,13 @@
 //! This bridges the semantic graph model to the normalized scene
 //! consumed by the UI widget.
 
-use crate::game::{InGameRoot, SemanticGraphRes};
+use crate::game::{GraphSlot, SemanticGraphRes};
 use crate::widgets::time_graph::{
     project_scene, spawn as spawn_widget, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
 };
 use bevy::prelude::*;
 
-pub fn spawn(mut commands: Commands, root: Single<Entity, With<InGameRoot>>) {
+pub fn spawn(mut commands: Commands, root: Single<Entity, With<GraphSlot>>) {
     spawn_widget(&mut commands, *root);
 }
 

@@ -16,4 +16,4 @@ pub use model::{
     CAPTURE_CONF_GATE,
 };
 pub use scene::{DialScale, DialSlot, DialState, HubState, Needle, NeedleStyle};
-pub use systems::{hub_colors, spawn, DialHub, DialHubLabel, NoteDialRoot};
+pub use systems::{hub_colors, spawn, DialHub, DialHubLabel, NoteDialRoot, DIAL_BOX_PX};

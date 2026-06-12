@@ -82,6 +82,26 @@ with the nodes they tag, and a widget's tree shape is assertable in a headless
 test against the widget alone. Marker names carry no route vocabulary — a dial
 root is `NoteDialRoot`, not `InGameDial`.
 
+### Route-owns-partition: in-flow widgets
+
+Widgets that share a screen are partitioned by an in-flow flex scaffold
+**owned by the route** (`game/mod.rs`); absolute positioning is reserved
+for true overlays. A *partitioned* widget never hard-codes its own route
+placement — its `spawn` builds the tree in neutral/relative layout and
+returns the root entity; the route's scaffold node is the placement.
+
+The InGame scaffold (`spawn_root`) is a flex column that fills the
+viewport, with a `HudSlot` row at the top and a `ContentRow` below.
+`ContentRow` holds `GraphSlot` (flex-grow) and `DialSlot` (fixed-width
+rail). Each glue spawn (`game/hud.rs`, `game/time_graph.rs`,
+`game/note_dial.rs`) queries its slot marker and parents the widget
+there — the non-overlap invariant holds by flex construction, not by
+shared arithmetic.
+
+**Scope**: this rule binds the in-flow widgets. It does **not** bind
+true overlays — the scale picker legitimately owns absolute positioning
+in its own `spawn` and is exempt.
+
 ### Child ownership: a repaint system despawns only what it spawned
 
 Marker ownership has a corollary for *destruction*. A system that clears and

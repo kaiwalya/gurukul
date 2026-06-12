@@ -10,10 +10,6 @@ use super::scene::{
     TimeGraphPitchLaneSize,
 };
 
-const ROOT_LEFT: f32 = 32.0;
-const ROOT_TOP: f32 = 96.0;
-const ROOT_RIGHT: f32 = 376.0;
-const ROOT_BOTTOM: f32 = 24.0;
 const LANE_GAP: f32 = 12.0;
 const LANE_PADDING: f32 = 10.0;
 const GROOVE_HEIGHT: f32 = 1.0;
@@ -83,11 +79,8 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
             // `Entity` id. They also help any future inspector tooling.
             Name::new("time_graph"),
             Node {
-                position_type: PositionType::Absolute,
-                left: px(ROOT_LEFT),
-                top: px(ROOT_TOP),
-                right: px(ROOT_RIGHT),
-                bottom: px(ROOT_BOTTOM),
+                width: percent(100),
+                height: percent(100),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(LANE_GAP),
                 padding: UiRect::all(px(LANE_PADDING)),

@@ -11,9 +11,12 @@ resource and the always-on event drain. `state` defines `AppState`
 `KnownDevices` resources. `menu::main_menu` and `menu::settings` are
 the menu screens. `game` runs the session (`StartSession` on enter,
 `StopSession` on exit, feature snapshots logged each frame) and holds the
-InGame route glue, one `game/<name>.rs` per widget. InGame UI lives in
-`widgets/<name>/` vertical slices; `semantic_graph` is the crate-level
-shared pitch/time projection that feeds them.
+InGame route glue, one `game/<name>.rs` per widget. Route-level slot
+markers (`HudSlot`, `ContentRow`, `GraphSlot`, `DialSlot`) live in
+`game/mod.rs`; each glue spawn queries its slot to parent the widget —
+see the route-owns-partition rule in `ARCHITECTURE.md`. InGame UI lives
+in `widgets/<name>/` vertical slices; `semantic_graph` is the
+crate-level shared pitch/time projection that feeds them.
 
 Crate structure and the widget-slice doctrine live in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) (the *what/why*); the build workflow

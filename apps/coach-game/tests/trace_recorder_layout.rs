@@ -124,7 +124,12 @@ fn geom_record_carries_physical_size_and_scale_factor_at_2x() {
     let lane = records
         .iter()
         .filter(|r| r["k"] == "geom")
-        .find(|r| r["path"].as_str() == Some("in_game/time_graph/pitch_lane"))
+        .find(|r| {
+            r["path"]
+                .as_str()
+                .map(|p| p.ends_with("time_graph/pitch_lane"))
+                .unwrap_or(false)
+        })
         .expect("a geom record for the pitch lane keyed by widget path");
 
     // Scale factor recorded.
