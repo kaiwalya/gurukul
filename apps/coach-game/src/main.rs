@@ -13,7 +13,10 @@
 //! WAV file. The engine, worker, UI, and trace recorder all run exactly as in
 //! a real session; only the audio source is replaced. Unlike `--replay`, the
 //! DSP engine runs — this is the correct tool for visually verifying an engine
-//! change against a known recording.
+//! change against a known recording. When the WAV drains the run is treated as
+//! a finished session and returns to the main menu (the WAV adapter models a
+//! never-ending mic, so the drain is detected here, app-side; see
+//! [`replay_audio`](coach_game::replay_audio)) — start again to replay it.
 //!
 //! `--replay` and `--replay-audio` are mutually exclusive (different execution
 //! modes: bypass-engine vs swap-mic). Passing both is an error.
