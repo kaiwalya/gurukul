@@ -24,6 +24,10 @@ const COLOR_GROOVE_INACTIVE: Color = Color::srgba(0.56, 0.56, 0.63, 0.03);
 const COLOR_ONSET: Color = Color::srgb(1.0, 0.86, 0.44);
 const COLOR_BREATH: Color = Color::srgba(0.88, 0.64, 0.95, 0.34);
 const COLOR_TRACE: Color = Color::srgb(0.94, 0.94, 0.98);
+/// Coral/salmon tint shown where stable vibrato is detected. Intentionally
+/// warmer and more saturated than the amber `COLOR_ONSET` so the two remain
+/// visually separable at a glance.
+const COLOR_VIBRATO: Color = Color::srgb(1.0, 0.45, 0.42);
 const TRACE_MIN_ALPHA: f32 = 0.25;
 const TRACE_MAX_ALPHA: f32 = 0.95;
 
@@ -279,8 +283,10 @@ pub fn apply_trace(
             let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
                 continue;
             };
-            let color =
-                trace_color(((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0));
+            let avg_confidence = ((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0);
+            let avg_vibrato =
+                ((pair[0].vibrato_strength + pair[1].vibrato_strength) * 0.5).clamp(0.0, 1.0);
+            let color = trace_color(avg_confidence, avg_vibrato);
             commands.spawn((
                 TraceSegmentBody,
                 ChildOf(layer_entity),
@@ -352,10 +358,12 @@ fn trace_segment_geom(
     })
 }
 
-fn trace_color(confidence: f32) -> Color {
-    COLOR_TRACE.with_alpha(
-        (TRACE_MIN_ALPHA + confidence * (TRACE_MAX_ALPHA - TRACE_MIN_ALPHA)).clamp(0.0, 1.0),
-    )
+fn trace_color(confidence: f32, vibrato_strength: f32) -> Color {
+    let alpha =
+        (TRACE_MIN_ALPHA + confidence * (TRACE_MAX_ALPHA - TRACE_MIN_ALPHA)).clamp(0.0, 1.0);
+    COLOR_TRACE
+        .mix(&COLOR_VIBRATO, vibrato_strength)
+        .with_alpha(alpha)
 }
 
 #[cfg(test)]

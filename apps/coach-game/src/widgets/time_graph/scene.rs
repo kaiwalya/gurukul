@@ -48,8 +48,10 @@ pub struct NormalizedPoint {
 pub struct NormalizedTracePoint {
     pub point: NormalizedPoint,
     pub confidence: f32,
-    pub vibrato_rate: f32,
-    pub vibrato_depth: f32,
+    /// Dimensionless [0, 1] scalar computed by the model layer. Combines
+    /// depth gate, rate band, and confidence into a single tint signal.
+    /// Music-blind: no Hz or cents here — the model has already spent those.
+    pub vibrato_strength: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
