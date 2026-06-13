@@ -49,6 +49,12 @@ pub struct FeatureHistoryRes(pub FeatureHistory);
 #[derive(Resource, Default)]
 pub struct FeatureDrainScratch(Vec<FeatureSnapshot>);
 
+/// Number of feature hops drained from the coach in the most recent
+/// `drain_events` call. Written unconditionally every frame; read by the
+/// `--replay-audio` end-detector to know whether audio is still flowing.
+#[derive(Resource, Default)]
+pub struct FeatureDrainCount(pub usize);
+
 #[derive(SystemParam)]
 pub struct DrainReadModels<'w> {
     known: ResMut<'w, KnownDevices>,
@@ -58,6 +64,7 @@ pub struct DrainReadModels<'w> {
     state: Res<'w, State<AppState>>,
     history: ResMut<'w, FeatureHistoryRes>,
     feature_scratch: ResMut<'w, FeatureDrainScratch>,
+    drain_count: ResMut<'w, FeatureDrainCount>,
 }
 
 /// Construct the real adapter-backed coach, optionally substituting the WAV
@@ -141,6 +148,7 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
         state,
         mut history,
         mut feature_scratch,
+        mut drain_count,
     } = models;
     let mut events = Vec::new();
     coach.0.poll_events(&mut events);
@@ -186,6 +194,9 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
 
     feature_scratch.0.clear();
     coach.0.drain_features(&mut feature_scratch.0);
+    // Capture the count *after* drain_features fills the scratch but *before*
+    // the drain(..) below empties it — otherwise the count is always zero.
+    drain_count.0 = feature_scratch.0.len();
     if *state.get() == AppState::InGame {
         history
             .0

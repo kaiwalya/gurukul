@@ -33,6 +33,7 @@ pub mod feature_types;
 pub mod font;
 pub mod game;
 pub mod menu;
+pub mod replay_audio;
 pub mod semantic_graph;
 pub mod state;
 pub mod trace;
@@ -67,6 +68,7 @@ pub fn build_app(app: &mut App) {
         .init_resource::<coach::LatestFeatures>()
         .init_resource::<coach::FeatureHistoryRes>()
         .init_resource::<coach::FeatureDrainScratch>()
+        .init_resource::<coach::FeatureDrainCount>()
         .init_resource::<game::GraphProjectorRes>()
         .init_resource::<game::SemanticGraphRes>()
         .init_resource::<widgets::time_graph::scene::TimeGraphPitchLaneSize>()

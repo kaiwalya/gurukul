@@ -24,7 +24,7 @@ use bevy::prelude::*;
 use bevy::window::{Window, WindowResolution};
 use coach_game::trace::replay;
 use coach_game::trace::TracePlugin;
-use coach_game::{build_app, coach, font, trace};
+use coach_game::{build_app, coach, font, replay_audio, trace};
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -139,7 +139,10 @@ fn run_live(replay_audio: Option<PathBuf>) {
     // decorator *before* it becomes the `Coach` handle, then stash the shared
     // trace buffer. The rest of the app still holds a plain `Box<dyn AppCoach>`
     // and is unaware.
-    trace::install_recording_coach(app.world_mut(), coach::build_coach_with_audio(replay_audio));
+    trace::install_recording_coach(
+        app.world_mut(),
+        coach::build_coach_with_audio(replay_audio.clone()),
+    );
 
     // One trace file per run, under a gitignored `traces/` next to the
     // working directory. Name + header stamped from wall-clock at launch.
@@ -152,6 +155,22 @@ fn run_live(replay_audio: Option<PathBuf>) {
     });
 
     finish(&mut app);
+
+    // Wire the WAV-end detector only when a WAV was supplied.  These systems
+    // must be added AFTER `finish` (which calls `build_app`) so the
+    // `FeatureDrainCount` resource they depend on is already registered.
+    if replay_audio.is_some() {
+        use coach_game::state::AppState;
+        app.insert_resource(replay_audio::ReplayAudioEnd::default())
+            .add_systems(OnEnter(AppState::InGame), replay_audio::reset_detector)
+            .add_systems(
+                Update,
+                replay_audio::detect_wav_end
+                    .after(coach::drain_events)
+                    .run_if(bevy::prelude::in_state(AppState::InGame)),
+            );
+    }
+
     app.run();
 }
 
