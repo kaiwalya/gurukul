@@ -19,6 +19,8 @@
 //! assert!(out.coverage_voiced("pitch_yin.f0") > 0.5);
 //! ```
 
+pub mod audio_trace;
+
 use anyhow::{Context, Result};
 use engine::{Engine, NodeRegistry, World};
 use std::collections::HashMap;
@@ -328,30 +330,13 @@ impl Captured {
 
     /// Fraction of hops on `path` that are voiced (finite and > 0).
     pub fn coverage_voiced(&self, path: &str) -> f32 {
-        let hops = self.per_hop(path);
-        if hops.is_empty() {
-            return 0.0;
-        }
-        let voiced = hops.iter().filter(|h| h.is_finite() && **h > 0.0).count();
-        voiced as f32 / hops.len() as f32
+        audio_trace::coverage_voiced_of(&self.per_hop(path))
     }
 
     /// Count of voiced-to-voiced hop transitions on `path` whose pitch jumps by
     /// more than 600 cents (half an octave) — YIN's classic octave-error mode.
     pub fn octave_jumps(&self, path: &str) -> usize {
-        let hops = self.per_hop(path);
-        let mut prev: Option<f32> = None;
-        let mut jumps = 0;
-        for &hz in &hops {
-            let voiced = hz.is_finite() && hz > 0.0;
-            if let (Some(p), true) = (prev, voiced)
-                && (1200.0 * (hz / p).log2()).abs() > 600.0
-            {
-                jumps += 1;
-            }
-            prev = if voiced { Some(hz) } else { None };
-        }
-        jumps
+        audio_trace::count_octave_jumps(&self.per_hop(path), 600.0)
     }
 
     /// The last captured value of an internal wire. Useful for steady-state
@@ -384,17 +369,7 @@ impl Captured {
     /// Median absolute frame-to-frame jitter in cents within voiced runs on
     /// `path`. A robust "how steady is the trace" number.
     pub fn median_jitter_cents(&self, path: &str) -> f32 {
-        let hops = self.per_hop(path);
-        let mut deltas = Vec::new();
-        let mut prev: Option<f32> = None;
-        for &hz in &hops {
-            let voiced = hz.is_finite() && hz > 0.0;
-            if let (Some(p), true) = (prev, voiced) {
-                deltas.push((1200.0 * (hz / p).log2()).abs());
-            }
-            prev = if voiced { Some(hz) } else { None };
-        }
-        percentile(&mut deltas, 50.0)
+        audio_trace::median_jitter_cents_of(&self.per_hop(path))
     }
 }
 
@@ -403,18 +378,9 @@ fn split_wire(wire: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("invalid wire '{wire}': expected '<node_id>.<port>'"))
 }
 
-fn percentile(samples: &mut [f32], p: f32) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((p / 100.0) * (samples.len() - 1) as f32).round() as usize;
-    samples[idx.min(samples.len() - 1)]
-}
-
 /// Read a mono WAV at the expected sample rate. Panics if the file isn't mono
 /// or isn't at `sample_rate` — convert with `afconvert` before benching.
-fn read_wav_mono(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
+pub fn read_wav_mono(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening wav {}", path.display()))?;
     let spec = reader.spec();

@@ -49,6 +49,7 @@
 //!   `Drop` glue, and the `#[cfg(test)]` test module covering the
 //!   end-to-end boundary.
 
+mod audio_recorder;
 mod control_plane;
 mod data_plane;
 mod helpers;
@@ -540,6 +541,10 @@ mod tests {
 
     #[test]
     fn start_then_stop_runs_through_state_machine() {
+        // DataPlane worker calls Recorder::from_env; hold the lock so it
+        // cannot accidentally pick up GURUKUL_AUDIO_TRACE_DIR set by a
+        // concurrent audio-trace test.
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -685,6 +690,7 @@ mod tests {
 
     #[test]
     fn configure_while_running_keeps_running_and_snapshot_is_sticky() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -763,6 +769,7 @@ mod tests {
 
     #[test]
     fn audio_info_is_some_only_while_running() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -817,6 +824,7 @@ mod tests {
 
     #[test]
     fn open_failure_lands_in_error_state_with_unsupported_config() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::FailUnsupported, Arc::clone(&opens));
         let coach = new(deps);
@@ -859,6 +867,7 @@ mod tests {
 
     #[test]
     fn capture_open_failure_returns_feature_producer_for_retry() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::FailOnceThenOk, Arc::clone(&opens));
         let coach = new(deps);
@@ -920,6 +929,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_idempotent() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -936,6 +946,7 @@ mod tests {
 
     #[test]
     fn start_while_running_is_silent_no_op() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -988,6 +999,7 @@ mod tests {
 
     #[test]
     fn stale_device_id_fails_with_device_unavailable() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -1047,6 +1059,7 @@ mod tests {
 
     #[test]
     fn start_stop_start_round_trip_resets_cleanly() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -1124,6 +1137,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_shutdown_respects_contract() {
+        let _guard = crate::audio_recorder::test_env_lock();
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);

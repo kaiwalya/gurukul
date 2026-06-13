@@ -15,6 +15,7 @@ use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapsho
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
 use domain_ports::tuning::Tuning;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct Coach(pub Box<dyn AppCoach>);
@@ -59,15 +60,32 @@ pub struct DrainReadModels<'w> {
     feature_scratch: ResMut<'w, FeatureDrainScratch>,
 }
 
-/// Construct the real adapter-backed coach. Split out of [`spawn_coach`] so a
-/// recording build (`main.rs` + the `trace` module) can wrap this in a
-/// `RecordingCoach` before it becomes the [`Coach`] handle, without the trace
-/// module knowing how the adapter is wired.
-pub fn build_coach() -> Box<dyn AppCoach> {
+/// Construct the real adapter-backed coach, optionally substituting the WAV
+/// adapter for the microphone.
+///
+/// `replay_audio = None`  → today's behavior (cpal devices + capture).
+/// `replay_audio = Some(wav)` → WAV-backed devices + capture in place of the
+/// microphone; everything else (engine, worker, UI) runs unchanged.
+///
+/// The same `Arc<dyn Clock>` is shared across telemetry, the WAV feeder, and
+/// `AppCoachDeps` so all `t_ms` stamps share one epoch.
+pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach> {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
-    let audio_devices = Arc::new(adapter_audio_cpal::new_devices());
-    let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
+
+    let (audio_devices, audio_capture): (
+        Arc<dyn domain_ports::audio_devices::AudioDevices>,
+        Arc<dyn domain_ports::audio_capture::AudioCapture>,
+    ) = match replay_audio {
+        None => (
+            Arc::new(adapter_audio_cpal::new_devices()),
+            Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock))),
+        ),
+        Some(wav) => (
+            Arc::new(adapter_audio_wav::new_devices(wav)),
+            Arc::new(adapter_audio_wav::new_capture(Arc::clone(&clock))),
+        ),
+    };
 
     Box::new(adapter_app_coach::new(AppCoachDeps {
         clock,
@@ -76,6 +94,12 @@ pub fn build_coach() -> Box<dyn AppCoach> {
         audio_capture,
         host_version: env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Construct the real adapter-backed coach with the live microphone.
+/// Thin wrapper around [`build_coach_with_audio`] so existing callers are untouched.
+pub fn build_coach() -> Box<dyn AppCoach> {
+    build_coach_with_audio(None)
 }
 
 pub fn spawn_coach(world: &mut World) {

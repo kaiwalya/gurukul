@@ -1,0 +1,12 @@
+[package]
+name = "adapter-audio-wav"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain-ports = { path = "../../domain-ports" }
+hound = "3.5"
+
+[dev-dependencies]
+domain-ports = { path = "../../domain-ports", features = ["test-util"] }
+tempfile = "3"

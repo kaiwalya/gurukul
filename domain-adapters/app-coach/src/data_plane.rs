@@ -37,8 +37,11 @@
 //! Publishing the latest value through `ArcSwap` allocates an `Arc` per
 //! hop; that worker-thread cost is intentionally outside the RT callback.
 
+use crate::audio_recorder::Recorder;
 use crate::pitch_world::build_pitch_engine;
+use crate::pitch_world::COACH_WORLD_JSON;
 use arc_swap::ArcSwap;
+use audio_trace_format::SidecarHop;
 use domain_ports::app_coach::FeatureSnapshot;
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
@@ -306,6 +309,9 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         block_frames = BLOCK_FRAMES as u32,
     );
 
+    let mut recorder =
+        Recorder::from_env(sample_rate, clock.now_ms(), COACH_WORLD_JSON, "coach.json");
+
     // Scratch buffer for one block worth of samples drained from the
     // ring. Heap-allocated once, before the hot loop.
     let mut block: Vec<f32> = vec![0.0; BLOCK_FRAMES];
@@ -315,7 +321,7 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
     // Session-local sequence for the published feature stream.
     let mut hop_index: u64 = 0;
 
-    while !quit.load(Ordering::Acquire) {
+    'worker: while !quit.load(Ordering::Acquire) {
         // Wait until at least one block is available, or quit.
         if consumer.slots() < BLOCK_FRAMES {
             // No full block yet — sleep briefly (back off scheduling
@@ -334,11 +340,16 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
             match consumer.pop() {
                 Ok(v) => *slot = v,
                 Err(_) => {
-                    // Producer dropped (cpal stream ended). Drain what
-                    // we have, then exit on the next loop tick.
-                    return;
+                    // Producer dropped (cpal stream ended). Break out so
+                    // the single exit point after the loop can finish().
+                    break 'worker;
                 }
             }
+        }
+
+        // Tap the filled block for the audio trace before feeding the engine.
+        if let Some(r) = recorder.as_mut() {
+            r.record_block(&block);
         }
 
         // Feed the engine.
@@ -354,19 +365,41 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         // Always publish — heads can tell voiced from unvoiced via
         // the f0_hz == 0.0 sentinel. Publishing unvoiced too lets
         // heads detect "alive but silent" vs "stalled".
+        let f0_hz = engine.out_port(ports.pitch)[0];
+        let confidence = engine.out_port(ports.confidence)[0];
+        let onset = engine.out_port(ports.onset)[0];
+        let breath = engine.out_port(ports.breath)[0];
+        let vibrato_rate = engine.out_port(ports.vibrato_rate)[0];
+        let vibrato_depth = engine.out_port(ports.vibrato_depth)[0];
+
         let snapshot = FeatureSnapshot {
             hop_index,
-            f0_hz: engine.out_port(ports.pitch)[0],
-            confidence: engine.out_port(ports.confidence)[0],
-            onset: engine.out_port(ports.onset)[0],
-            breath: engine.out_port(ports.breath)[0],
-            vibrato_rate: engine.out_port(ports.vibrato_rate)[0],
-            vibrato_depth: engine.out_port(ports.vibrato_depth)[0],
+            f0_hz,
+            confidence,
+            onset,
+            breath,
+            vibrato_rate,
+            vibrato_depth,
             t_ms: clock.now_ms(),
         };
+        if let Some(r) = recorder.as_mut() {
+            r.record_hop(SidecarHop {
+                hop: hop_index,
+                f0_hz,
+                confidence,
+                onset,
+                breath,
+                vibrato_rate,
+                vibrato_depth,
+            });
+        }
         hop_index = hop_index.wrapping_add(1);
         feature_publisher.store(Arc::new(Some(snapshot)));
         push_feature(feature_producer, snapshot);
+    }
+
+    if let Some(r) = recorder.take() {
+        r.finish(&*telemetry);
     }
 
     tel_info!(&*telemetry, "data-plane: worker down");
@@ -533,6 +566,11 @@ mod tests {
     fn feature_producer_is_reused_and_queued_sessions_expose_reset() {
         const SR: u32 = 48_000;
 
+        // Hold the env lock: this DataPlane's worker calls Recorder::from_env.
+        // Prevent it from accidentally picking up GURUKUL_AUDIO_TRACE_DIR set
+        // by a concurrent audio-trace test.
+        let _guard = crate::audio_recorder::test_env_lock();
+
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(11));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
         let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
@@ -606,6 +644,13 @@ mod tests {
     fn sine_440_round_trips_to_publisher() {
         const SR: u32 = 48_000;
         const F0: f32 = 440.0;
+
+        // Hold the env lock for the full DataPlane lifetime: the worker calls
+        // Recorder::from_env on its thread. Without the lock, a concurrent
+        // worker_records_audio_trace_when_env_set can have the env var set to
+        // its tempdir while this worker reads it, creating a colliding recorder
+        // in that dir (same stamp=0) and producing a corrupt/empty WAV.
+        let _guard = crate::audio_recorder::test_env_lock();
 
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
@@ -688,5 +733,146 @@ mod tests {
             "feature producer returns on stop"
         );
         assert_eq!(dropped.load(Ordering::Acquire), 0, "no drops expected");
+    }
+
+    /// End-to-end live-path check for the audio-trace recorder: drive a real
+    /// `DataPlane` worker (real thread, real engine) with the env var set, then
+    /// confirm the WAV / sidecar / manifest land with a coherent shape. Unlike
+    /// the `audio_recorder` unit tests (which exercise `Recorder` in isolation),
+    /// this proves the worker wiring — the block tap, the six `out_port[0]`
+    /// reads, and the single-`finish` exit — through genuine concurrency.
+    #[test]
+    fn worker_records_audio_trace_when_env_set() {
+        use audio_trace_format::{Manifest, SidecarHop};
+        use std::io::BufRead;
+
+        const SR: u32 = 48_000;
+        const F0: f32 = 440.0;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The env var is process-global; serialize against the recorder unit
+        // tests that also touch it.
+        let _guard = crate::audio_recorder::test_env_lock();
+        std::env::set_var("GURUKUL_AUDIO_TRACE_DIR", dir.path().to_str().unwrap());
+
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
+        let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
+        let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+        let (feature_producer, _feature_consumer) =
+            RingBuffer::<FeatureSnapshot>::new(FEATURE_RING_CAPACITY);
+        let mut feature_producer = Some(feature_producer);
+
+        let DataPlaneStartup {
+            data_plane,
+            mut producer,
+            samples_dropped: _dropped,
+        } = DataPlane::start(
+            DataPlaneDeps {
+                sample_rate: SR,
+                feature_publisher: Arc::clone(&feature_publisher),
+                clock,
+                telemetry: Arc::clone(&telemetry),
+                inspect: crate::inspect::InspectShared::new(),
+            },
+            &mut feature_producer,
+        )
+        .expect("data plane starts");
+
+        // Feed a whole number of 512-blocks so the recorded WAV length is
+        // predictable. 8192 = 16 blocks.
+        let mut phase: f32 = 0.0;
+        let step = 2.0 * std::f32::consts::PI * F0 / SR as f32;
+        let mut chunk = [0.0_f32; 256];
+        let total_samples = 8192;
+        let mut pushed = 0;
+        while pushed < total_samples {
+            for s in chunk.iter_mut() {
+                *s = phase.sin() * 0.5;
+                phase += step;
+            }
+            // Generous deadline: under `cargo test --workspace` the box can be
+            // saturated by parallel release builds, so the worker drains
+            // slowly. This test asserts *what* lands on disk, not *how fast*.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut written = 0;
+            while written < chunk.len() {
+                if producer.push(chunk[written]).is_ok() {
+                    written += 1;
+                } else if Instant::now() > deadline {
+                    panic!("ring stayed full; worker not draining");
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            pushed += chunk.len();
+        }
+
+        // Wait until the worker has published at least one hop, so we know
+        // blocks were consumed before we tear down. Generous deadline for the
+        // same contended-CI reason as above.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while feature_publisher.load().is_none() {
+            assert!(Instant::now() <= deadline, "worker never published a hop");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(producer);
+        data_plane.stop(&*telemetry);
+        std::env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
+
+        // Exactly one of each artifact, sharing one stamp prefix.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read trace dir")
+            .map(|e| e.expect("dir entry").file_name().into_string().unwrap())
+            .collect();
+        let manifest_name = entries
+            .iter()
+            .find(|n| n.ends_with("-engine-input.manifest.json"))
+            .expect("a manifest must have been written (valid run)");
+
+        let manifest: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(manifest_name)).expect("read manifest"),
+        )
+        .expect("manifest parses as the shared type");
+        assert_eq!(manifest.schema, 1);
+        assert_eq!(manifest.block_size, 512);
+        assert_eq!(manifest.channels, 1);
+        assert_eq!(manifest.sample_rate, SR);
+        assert_eq!(manifest.world, "coach.json");
+        assert_eq!(manifest.world_sha256.len(), 64);
+        assert!(manifest.n_hops > 0, "at least one block must be recorded");
+        assert_eq!(manifest.total_samples, manifest.n_hops * 512);
+
+        // WAV length matches n_hops * block_size exactly.
+        let wav_name = entries
+            .iter()
+            .find(|n| n.ends_with("-engine-input.wav"))
+            .expect("WAV exists");
+        let mut reader = hound::WavReader::open(dir.path().join(wav_name)).expect("open WAV");
+        let n_samples = reader.samples::<f32>().count();
+        assert_eq!(
+            n_samples,
+            manifest.n_hops * 512,
+            "WAV sample count must equal n_hops * block_size"
+        );
+
+        // Sidecar has n_hops lines, each a parseable SidecarHop with contiguous
+        // hop indices from 0.
+        let sidecar_name = entries
+            .iter()
+            .find(|n| n.ends_with("-engine-input.features.jsonl"))
+            .expect("sidecar exists");
+        let sidecar = std::fs::File::open(dir.path().join(sidecar_name)).expect("open sidecar");
+        let hops: Vec<SidecarHop> = std::io::BufReader::new(sidecar)
+            .lines()
+            .map(|l| l.expect("line"))
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(&l).expect("hop parses"))
+            .collect();
+        assert_eq!(hops.len(), manifest.n_hops, "one sidecar line per hop");
+        for (i, hop) in hops.iter().enumerate() {
+            assert_eq!(hop.hop, i as u64, "hop indices are contiguous from 0");
+        }
     }
 }

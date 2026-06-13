@@ -2,6 +2,7 @@
 members = [
     "dsp/engine",
     "dsp/bench",
+    "dsp/audio-trace-format",
     "dsp/node-synth-sine",
     "dsp/node-synth-vibrato-sine",
     "dsp/node-synth-pink-noise",
@@ -23,6 +24,7 @@ members = [
     "domain-adapters/telemetry-std",
     "domain-adapters/app-coach",
     "domain-adapters/audio-cpal",
+    "domain-adapters/audio-wav",
     "apps/coach-cli",
     "apps/coach-game",
 ]
@@ -38,3 +40,4 @@ thiserror = "2"
 anyhow = "1"
 cpal = "0.17"
 flate2 = "1"
+sha2 = "0.10"

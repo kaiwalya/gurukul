@@ -11,8 +11,13 @@ node-onset = { path = "../../dsp/node-onset" }
 node-breath = { path = "../../dsp/node-breath" }
 node-vibrato = { path = "../../dsp/node-vibrato" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 arc-swap = "1.7"
 rtrb = "0.3"
+audio-trace-format = { path = "../../dsp/audio-trace-format" }
+sha2 = { workspace = true }
+hound = "3.5"
 
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
+tempfile = "3"

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dsp_bench::build_registry;
+use dsp_bench::audio_trace::{self, SidecarHop};
+use dsp_bench::{build_registry, read_wav_mono};
 use engine::{Connection, Engine, NodeDef, NodeRegistry, World};
 use schemars::schema_for;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -80,6 +82,34 @@ enum Command {
 
     /// Emit the JSON Schema for world files to stdout.
     EmitSchema,
+
+    /// Replay a recorded mono WAV through a world's pitch engine and write a
+    /// feature sidecar (<stem>.features.jsonl) + manifest (<stem>.manifest.json).
+    ReplayAudio {
+        /// Path to the input mono WAV (engine-input samples).
+        wav: PathBuf,
+        /// World JSON to mount (default: dsp/worlds/coach.json).
+        #[arg(long, default_value = "dsp/worlds/coach.json")]
+        world: PathBuf,
+        /// Output stem. Sidecar/manifest are <stem>.features.jsonl and
+        /// <stem>.manifest.json. Default: the WAV path with extension stripped.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Sample rate the WAV must be at (asserted, not resampled).
+        #[arg(long, default_value_t = 48000)]
+        sample_rate: u32,
+        /// Block size (must equal PitchYin hop; default 512).
+        #[arg(long, default_value_t = 512)]
+        block_size: usize,
+    },
+
+    /// Diff two feature sidecars (baseline vs candidate) and report changes.
+    DiffFeatures {
+        /// Baseline sidecar (.features.jsonl), e.g. the recorded run.
+        baseline: PathBuf,
+        /// Candidate sidecar, e.g. the same audio through a changed engine.
+        candidate: PathBuf,
+    },
 }
 
 fn load_world(path: &PathBuf) -> Result<World> {
@@ -521,6 +551,198 @@ fn cmd_emit_schema(registry: &NodeRegistry) -> Result<()> {
     Ok(())
 }
 
+fn cmd_replay_audio(
+    wav: &Path,
+    world: &Path,
+    out: &Option<PathBuf>,
+    sample_rate: u32,
+    block_size: usize,
+) -> Result<()> {
+    use std::io::Write;
+
+    anyhow::ensure!(block_size > 0, "block_size must be > 0");
+
+    // 1. Read WAV samples.
+    let mut samples = read_wav_mono(wav, sample_rate)
+        .with_context(|| format!("reading WAV {}", wav.display()))?;
+
+    // 2. Floor-divide; bail if shorter than one block.
+    let n_hops = samples.len() / block_size;
+    if n_hops == 0 {
+        anyhow::bail!(
+            "WAV shorter than one block ({} samples < block_size {})",
+            samples.len(),
+            block_size
+        );
+    }
+    samples.truncate(n_hops * block_size);
+
+    // 3. Compute world SHA-256.
+    let world_bytes =
+        std::fs::read(world).with_context(|| format!("reading world {}", world.display()))?;
+    let world_sha256 = format!("{:x}", Sha256::digest(&world_bytes));
+
+    // 4. Basename of the WAV for the manifest.
+    let wav_basename = wav
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| wav.to_string_lossy().into_owned());
+
+    // 5. Run the replay core.
+    let (hops, manifest) = audio_trace::replay_samples(
+        &samples,
+        sample_rate,
+        block_size,
+        world,
+        &world_sha256,
+        &wav_basename,
+    )?;
+
+    // 6. Derive output paths.
+    let stem = match out {
+        Some(p) => p.clone(),
+        None => wav.with_extension(""),
+    };
+    let stem_str = stem.to_string_lossy();
+    let sidecar_path = PathBuf::from(format!("{stem_str}.features.jsonl"));
+    let manifest_path = PathBuf::from(format!("{stem_str}.manifest.json"));
+
+    // 7. Write sidecar (one JSON line per hop).
+    {
+        let file = std::fs::File::create(&sidecar_path)
+            .with_context(|| format!("creating {}", sidecar_path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        for hop in &hops {
+            let line = serde_json::to_string(hop).context("serializing SidecarHop")?;
+            writeln!(writer, "{line}").context("writing sidecar line")?;
+        }
+    }
+
+    // 8. Write manifest.
+    {
+        let json = serde_json::to_string_pretty(&manifest).context("serializing manifest")?;
+        std::fs::write(&manifest_path, json)
+            .with_context(|| format!("writing {}", manifest_path.display()))?;
+    }
+
+    // 9. One-line summary to stderr.
+    let f0s: Vec<f32> = hops.iter().map(|h| h.f0_hz).collect();
+    let jumps = audio_trace::count_octave_jumps(&f0s, 600.0);
+    eprintln!(
+        "wrote {} hops, {} octave jumps → {} + {}",
+        hops.len(),
+        jumps,
+        sidecar_path.display(),
+        manifest_path.display()
+    );
+
+    Ok(())
+}
+
+fn load_sidecar(path: &Path) -> Result<Vec<SidecarHop>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading sidecar {}", path.display()))?;
+    let hops: Vec<SidecarHop> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<SidecarHop>(l).context("parsing sidecar line"))
+        .collect::<Result<_>>()?;
+    // The diff aligns frames by position, which is only valid if `hop` is
+    // contiguous from 0. Reject a sidecar with a missing/reordered hop rather
+    // than silently comparing the wrong frames.
+    for (i, hop) in hops.iter().enumerate() {
+        if hop.hop != i as u64 {
+            anyhow::bail!(
+                "{}: hop field {} at line {} is not contiguous from 0 (expected {})",
+                path.display(),
+                hop.hop,
+                i + 1,
+                i
+            );
+        }
+    }
+    Ok(hops)
+}
+
+fn cmd_diff_features(baseline: &Path, candidate: &Path) -> Result<()> {
+    let base_hops = load_sidecar(baseline)?;
+    let cand_hops = load_sidecar(candidate)?;
+
+    let common = base_hops.len().min(cand_hops.len());
+
+    if base_hops.len() != cand_hops.len() {
+        println!(
+            "WARNING: length mismatch: baseline={} candidate={}, diffing common prefix={}",
+            base_hops.len(),
+            cand_hops.len(),
+            common
+        );
+    }
+
+    let base_f0: Vec<f32> = base_hops[..common].iter().map(|h| h.f0_hz).collect();
+    let cand_f0: Vec<f32> = cand_hops[..common].iter().map(|h| h.f0_hz).collect();
+
+    let base_jumps = audio_trace::count_octave_jumps(&base_f0, 600.0);
+    let cand_jumps = audio_trace::count_octave_jumps(&cand_f0, 600.0);
+
+    let base_jitter = audio_trace::median_jitter_cents_of(&base_f0);
+    let cand_jitter = audio_trace::median_jitter_cents_of(&cand_f0);
+
+    let base_coverage = audio_trace::coverage_voiced_of(&base_f0);
+    let cand_coverage = audio_trace::coverage_voiced_of(&cand_f0);
+
+    // Per-hop f0 divergence over common prefix.
+    let mut diverge_count = 0usize;
+    let mut max_diverge_cents = 0.0_f32;
+    for (b, c) in base_f0.iter().zip(cand_f0.iter()) {
+        let b_voiced = b.is_finite() && *b > 0.0;
+        let c_voiced = c.is_finite() && *c > 0.0;
+        if b_voiced && c_voiced {
+            let diff = (1200.0 * (*c / *b).log2()).abs();
+            if diff > 1.0 {
+                diverge_count += 1;
+            }
+            if diff > max_diverge_cents {
+                max_diverge_cents = diff;
+            }
+        } else if b_voiced != c_voiced {
+            // One voiced, other not — count as divergence.
+            diverge_count += 1;
+        }
+    }
+
+    println!("feature diff report");
+    println!("-------------------");
+    println!("{:<30} {:>12} {:>12}", "metric", "baseline", "candidate");
+    println!(
+        "{:<30} {:>12} {:>12}",
+        "hop count",
+        base_hops.len(),
+        cand_hops.len()
+    );
+    println!(
+        "{:<30} {:>12} {:>12}",
+        "diffed hops (common prefix)", common, common
+    );
+    println!(
+        "{:<30} {:>12} {:>12}",
+        "octave jumps", base_jumps, cand_jumps
+    );
+    println!(
+        "{:<30} {:>12.2} {:>12.2}",
+        "median jitter (cents)", base_jitter, cand_jitter
+    );
+    println!(
+        "{:<30} {:>12.3} {:>12.3}",
+        "voiced coverage", base_coverage, cand_coverage
+    );
+    println!("-------------------");
+    println!("hops with f0 divergence > 1 cent : {diverge_count}");
+    println!("max f0 divergence (cents)         : {max_diverge_cents:.2}");
+
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let registry = build_registry();
@@ -554,6 +776,17 @@ fn main() -> ExitCode {
             block_size,
         } => cmd_render(world, &registry, *sample_rate, *block_size),
         Command::EmitSchema => cmd_emit_schema(&registry),
+        Command::ReplayAudio {
+            wav,
+            world,
+            out,
+            sample_rate,
+            block_size,
+        } => cmd_replay_audio(wav, world, out, *sample_rate, *block_size),
+        Command::DiffFeatures {
+            baseline,
+            candidate,
+        } => cmd_diff_features(baseline, candidate),
     };
 
     match result {

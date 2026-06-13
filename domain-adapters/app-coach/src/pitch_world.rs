@@ -8,7 +8,7 @@ use engine::{Engine, EngineError, NodeRegistry, World};
 
 /// The world spec that wires `audio_in` → PitchYin → `f0_hz`. Embedded
 /// at compile time so the adapter is self-contained.
-const COACH_WORLD_JSON: &str = include_str!("../../../dsp/worlds/coach.json");
+pub(crate) const COACH_WORLD_JSON: &str = include_str!("../../../dsp/worlds/coach.json");
 
 /// Build the pitch-detection engine.
 ///
