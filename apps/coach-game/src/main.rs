@@ -238,6 +238,20 @@ fn run_replay(explicit: Option<PathBuf>, hold: bool) {
 
 /// Shared startup wiring (camera, font, game systems) for both modes.
 fn finish(app: &mut App) {
+    // Render every frame regardless of window focus. Bevy's default
+    // (`WinitSettings::game()`) drops an *unfocused* window into a low-power
+    // reactive loop that only wakes on events. Our window opens behind the
+    // terminal (unbundled binary, see CLAUDE.md), so it is usually unfocused;
+    // as long as audio keeps producing per-frame UI churn the loop stays awake,
+    // but the instant the audio source goes quiet — exactly what happens when a
+    // `--replay-audio` WAV drains — the loop sleeps and never services the
+    // Cmd-Q `AppExit` frame, so `shutdown_on_exit` never runs and the process
+    // appears hung. A live coaching session wants continuous rendering anyway.
+    app.insert_resource(bevy::winit::WinitSettings {
+        focused_mode: bevy::winit::UpdateMode::Continuous,
+        unfocused_mode: bevy::winit::UpdateMode::Continuous,
+    });
+
     app.add_systems(Startup, (spawn_camera, font::load));
     // Promote the Devanagari font to the default slot once it loads.
     // Runs every frame until the asset lands, then removes its marker.
