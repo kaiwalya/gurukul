@@ -15,15 +15,16 @@ use domain_ports::pitch::PitchLog2;
 // ---------------------------------------------------------------------------
 
 /// Depth below which we treat the pitch wobble as noise, not vibrato
-/// (semitones — matching the `vibrato_depth` port contract in
-/// `domain_ports::app_coach`). Typical sung vibrato is ~0.25–0.5 st
-/// peak-to-peak, so a 0.10 st floor gives margin against gentle ornamentation.
-const VIBRATO_DEPTH_FLOOR_ST: f32 = 0.10;
+/// (cents — the `vibrato_depth` feature is emitted in cents by `node-vibrato`,
+/// which builds the contour as `1200 × log2(f)`). Typical sung vibrato is
+/// ~20–50 cents peak-to-peak (≈ 0.2–0.5 st), so a 20-cent floor gives margin
+/// against gentle ornamentation and pitch jitter.
+const VIBRATO_DEPTH_FLOOR_CENTS: f32 = 20.0;
 
-/// Depth at which the gate reaches 1.0 (semitones). A ramp from 0.10 to 0.30
-/// covers the bottom of the typical vibrato range; depth above 0.30 st is
-/// unambiguously intentional vibrato.
-const VIBRATO_DEPTH_FULL_ST: f32 = 0.30;
+/// Depth at which the gate reaches 1.0 (cents). A ramp from 20 to 50 covers the
+/// typical vibrato range; depth above 50 cents is unambiguously intentional
+/// vibrato.
+const VIBRATO_DEPTH_FULL_CENTS: f32 = 50.0;
 
 /// Lower edge of the musical vibrato rate band (Hz). Below ~4 Hz the wobble
 /// is too slow to be perceived as vibrato (more like a slow wavering).
@@ -178,8 +179,8 @@ fn normalize_pitch(pitch: PitchLog2, window: PitchWindow) -> Option<f32> {
 /// Compute a [0, 1] vibrato-tint signal from the raw analyzer outputs.
 ///
 /// Three gates are multiplied together:
-/// - `depth_gate`: ramps 0 → 1 between [`VIBRATO_DEPTH_FLOOR_ST`] and
-///   [`VIBRATO_DEPTH_FULL_ST`] (semitones). Below the floor the signal is
+/// - `depth_gate`: ramps 0 → 1 between [`VIBRATO_DEPTH_FLOOR_CENTS`] and
+///   [`VIBRATO_DEPTH_FULL_CENTS`] (cents). Below the floor the signal is
 ///   just noise.
 /// - `rate_band`: 1 inside the musical vibrato band (~4.5–6.5 Hz), ramping
 ///   to 0 outside it. Prevents slow waver or fast flutter from tinting.
@@ -188,9 +189,9 @@ fn normalize_pitch(pitch: PitchLog2, window: PitchWindow) -> Option<f32> {
 /// Non-finite inputs (NaN / ±inf) are treated as 0 so strength is always a
 /// clean [0, 1] value. Intentionally instantaneous — no temporal windowing
 /// (that would be Stage-2 interpretation, explicitly deferred).
-fn vibrato_strength(rate_hz: f32, depth_st: f32, confidence: f32) -> f32 {
-    let depth_gate = ((depth_st - VIBRATO_DEPTH_FLOOR_ST)
-        / (VIBRATO_DEPTH_FULL_ST - VIBRATO_DEPTH_FLOOR_ST))
+fn vibrato_strength(rate_hz: f32, depth_cents: f32, confidence: f32) -> f32 {
+    let depth_gate = ((depth_cents - VIBRATO_DEPTH_FLOOR_CENTS)
+        / (VIBRATO_DEPTH_FULL_CENTS - VIBRATO_DEPTH_FLOOR_CENTS))
         .clamp(0.0, 1.0);
 
     let rate_band = if !(VIBRATO_RATE_LOW_ZERO..=VIBRATO_RATE_HIGH_ZERO).contains(&rate_hz) {
@@ -259,7 +260,7 @@ mod tests {
                         pitch: PitchLog2(9.0),
                         confidence: 0.8,
                         vibrato_rate: 5.5,
-                        vibrato_depth: 0.35,
+                        vibrato_depth: 60.0,
                     },
                 ],
             }],
@@ -506,22 +507,22 @@ mod tests {
 
     // --- vibrato_strength scalar tests ---
     //
-    // Shorthand: FULL depth = VIBRATO_DEPTH_FULL_ST (0.30 st), band-centre
-    // rate = 5.5 Hz, high confidence = 0.9.  Each group of assertions uses
-    // these "high" values for the factors under test so exactly one axis is
-    // varied at a time.
+    // Shorthand: FULL depth = 60 cents (above VIBRATO_DEPTH_FULL_CENTS = 50),
+    // band-centre rate = 5.5 Hz, high confidence = 0.9.  Each group of
+    // assertions uses these "high" values for the factors under test so exactly
+    // one axis is varied at a time.
 
     // Interior: band-centre rate, depth above full-gate, high confidence.
     #[test]
     fn vibrato_strength_at_band_centre_with_good_depth_is_near_one() {
-        let s = vibrato_strength(5.5, 0.35, 0.9);
+        let s = vibrato_strength(5.5, 60.0, 0.9);
         assert!(s > 0.85, "expected ~1, got {s}");
     }
 
     // Rate band — exact boundary values.
     #[test]
     fn vibrato_strength_rate_band_edges() {
-        let depth = 0.35;
+        let depth = 60.0;
         let conf = 1.0;
 
         // At the hard zero edges the result must be exactly 0.
@@ -554,19 +555,19 @@ mod tests {
 
         // At or below the floor the gate is 0.
         assert_eq!(
-            vibrato_strength(rate, VIBRATO_DEPTH_FLOOR_ST, conf),
+            vibrato_strength(rate, VIBRATO_DEPTH_FLOOR_CENTS, conf),
             0.0,
             "depth=floor → 0"
         );
 
         // At or above the full threshold the gate is 1 → result equals conf.
         assert!(
-            (vibrato_strength(rate, VIBRATO_DEPTH_FULL_ST, conf) - 1.0).abs() < 1e-5,
+            (vibrato_strength(rate, VIBRATO_DEPTH_FULL_CENTS, conf) - 1.0).abs() < 1e-5,
             "depth=full → 1"
         );
 
         // Midpoint of the depth ramp → ~0.5.
-        let mid_depth = (VIBRATO_DEPTH_FLOOR_ST + VIBRATO_DEPTH_FULL_ST) * 0.5;
+        let mid_depth = (VIBRATO_DEPTH_FLOOR_CENTS + VIBRATO_DEPTH_FULL_CENTS) * 0.5;
         let s = vibrato_strength(rate, mid_depth, conf);
         assert!((s - 0.5).abs() < 0.02, "depth midpoint → ~0.5, got {s}");
     }
@@ -576,18 +577,18 @@ mod tests {
     #[test]
     fn vibrato_strength_off_band_rate_is_zero() {
         // 9 Hz is strictly outside the band (> 7.5).
-        assert_eq!(vibrato_strength(9.0, 0.35, 0.9), 0.0);
+        assert_eq!(vibrato_strength(9.0, 60.0, 0.9), 0.0);
     }
 
     #[test]
     fn vibrato_strength_sub_floor_depth_is_zero() {
-        // 0.02 st is below the 0.10 st floor.
-        assert_eq!(vibrato_strength(5.5, 0.02, 0.9), 0.0);
+        // 5 cents is below the 20-cent floor.
+        assert_eq!(vibrato_strength(5.5, 5.0, 0.9), 0.0);
     }
 
     #[test]
     fn vibrato_strength_near_zero_confidence_is_near_zero() {
-        let s = vibrato_strength(5.5, 0.35, 0.02);
+        let s = vibrato_strength(5.5, 60.0, 0.02);
         assert!(s < 0.05, "near-zero confidence → ~0, got {s}");
     }
 
@@ -598,8 +599,8 @@ mod tests {
     // the `is_finite` guard catches them and returns 0.
     #[test]
     fn vibrato_strength_nan_inputs_yield_zero() {
-        assert_eq!(vibrato_strength(f32::NAN, 0.35, 0.9), 0.0);
+        assert_eq!(vibrato_strength(f32::NAN, 60.0, 0.9), 0.0);
         assert_eq!(vibrato_strength(5.5, f32::NAN, 0.9), 0.0);
-        assert_eq!(vibrato_strength(5.5, 0.35, f32::NAN), 0.0);
+        assert_eq!(vibrato_strength(5.5, 60.0, f32::NAN), 0.0);
     }
 }

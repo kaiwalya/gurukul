@@ -216,6 +216,6 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureH
     };
     let onset_marker = if onset > 0.0 { "•" } else { " " };
     info!(
-        "hop={hop_index:>8}  t={t_ms:>8}ms  f0 {f0_str}  conf {confidence:>4.2}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>4.2}st  {onset_marker}"
+        "hop={hop_index:>8}  t={t_ms:>8}ms  f0 {f0_str}  conf {confidence:>4.2}  br {breath:>4.2}  vib {vibrato_rate:>4.1}Hz/{vibrato_depth:>5.0}c  {onset_marker}"
     );
 }

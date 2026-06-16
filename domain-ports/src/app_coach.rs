@@ -352,9 +352,10 @@ pub struct FeatureSnapshot {
     /// silence will report `0.0` until the window fills.
     pub vibrato_rate: f32,
 
-    /// Vibrato depth in semitones over the most recent analysis
-    /// window. Pairs with `vibrato_rate`; both go to `0.0` together
-    /// when vibrato detection is inactive.
+    /// Vibrato depth in cents over the most recent analysis window
+    /// (the analyzer builds the f0 contour as `1200 × log2(f)` and
+    /// reports half its peak-to-peak range). Pairs with `vibrato_rate`;
+    /// both go to `0.0` together when vibrato detection is inactive.
     pub vibrato_depth: f32,
 
     /// Wall-clock milliseconds (from the coach's [`Clock`]) at which
