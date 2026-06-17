@@ -133,7 +133,7 @@ fn run_live(replay_audio: Option<PathBuf>) {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "Gurukul".to_string(),
-            ..default()
+            ..ios_window()
         }),
         ..default()
     }));
@@ -293,6 +293,27 @@ fn file_label(p: &std::path::Path) -> String {
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
+}
+
+/// Base `Window` for the live app. On iOS the OS owns the surface: a
+/// default (windowed) `Window` is created at 0×0 and never reflows, so
+/// the whole UI lays out into a zero rect and the screen stays blank.
+/// `BorderlessFullscreen` makes winit size the window to the screen.
+/// On every other platform this is just `Window::default()`, so Mac
+/// behaviour is unchanged.
+#[cfg(target_os = "ios")]
+fn ios_window() -> Window {
+    use bevy::window::{MonitorSelection, WindowMode};
+    Window {
+        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
+        resizable: false,
+        ..default()
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn ios_window() -> Window {
+    Window::default()
 }
 
 #[cfg(test)]
