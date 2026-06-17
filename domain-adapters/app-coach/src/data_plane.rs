@@ -120,6 +120,7 @@ impl DataPlane {
         let dropped_for_callback = Arc::clone(&samples_dropped);
         let sample_rate = deps.sample_rate;
 
+        let session_prefix = deps.session_prefix;
         let worker = thread::Builder::new()
             .name("app-coach-data".into())
             .spawn(move || {
@@ -136,6 +137,7 @@ impl DataPlane {
                             clock,
                             telemetry,
                             inspect,
+                            session_prefix,
                         },
                         feature_producer,
                     );
@@ -203,6 +205,8 @@ pub(crate) struct DataPlaneDeps {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
     pub(crate) inspect: Arc<crate::inspect::InspectShared>,
+    /// Path prefix for this session's audio trace, or `None` to skip recording.
+    pub(crate) session_prefix: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -237,6 +241,7 @@ struct WorkerArgs {
     clock: Arc<dyn Clock>,
     telemetry: Arc<dyn Telemetry>,
     inspect: Arc<crate::inspect::InspectShared>,
+    session_prefix: Option<std::path::PathBuf>,
 }
 
 struct WorkerExit {
@@ -267,6 +272,7 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         clock,
         telemetry,
         inspect,
+        session_prefix,
     } = args;
 
     // Build the engine on this thread. Errors here go nowhere visible
@@ -309,8 +315,8 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         block_frames = BLOCK_FRAMES as u32,
     );
 
-    let mut recorder =
-        Recorder::from_env(sample_rate, clock.now_ms(), COACH_WORLD_JSON, "coach.json");
+    let mut recorder = session_prefix
+        .and_then(|prefix| Recorder::new(prefix, sample_rate, COACH_WORLD_JSON, "coach.json"));
 
     // Scratch buffer for one block worth of samples drained from the
     // ring. Heap-allocated once, before the hot loop.
@@ -566,11 +572,6 @@ mod tests {
     fn feature_producer_is_reused_and_queued_sessions_expose_reset() {
         const SR: u32 = 48_000;
 
-        // Hold the env lock: this DataPlane's worker calls Recorder::from_env.
-        // Prevent it from accidentally picking up GURUKUL_AUDIO_TRACE_DIR set
-        // by a concurrent audio-trace test.
-        let _guard = crate::audio_recorder::test_env_lock();
-
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(11));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
         let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
@@ -592,6 +593,7 @@ mod tests {
                     clock: Arc::clone(&clock),
                     telemetry: Arc::clone(&telemetry),
                     inspect: crate::inspect::InspectShared::new(),
+                    session_prefix: None,
                 },
                 &mut feature_producer,
             )
@@ -645,13 +647,6 @@ mod tests {
         const SR: u32 = 48_000;
         const F0: f32 = 440.0;
 
-        // Hold the env lock for the full DataPlane lifetime: the worker calls
-        // Recorder::from_env on its thread. Without the lock, a concurrent
-        // worker_records_audio_trace_when_env_set can have the env var set to
-        // its tempdir while this worker reads it, creating a colliding recorder
-        // in that dir (same stamp=0) and producing a corrupt/empty WAV.
-        let _guard = crate::audio_recorder::test_env_lock();
-
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
         let feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>> =
@@ -671,6 +666,7 @@ mod tests {
                 clock,
                 telemetry: Arc::clone(&telemetry),
                 inspect: crate::inspect::InspectShared::new(),
+                session_prefix: None,
             },
             &mut feature_producer,
         )
@@ -736,7 +732,7 @@ mod tests {
     }
 
     /// End-to-end live-path check for the audio-trace recorder: drive a real
-    /// `DataPlane` worker (real thread, real engine) with the env var set, then
+    /// `DataPlane` worker (real thread, real engine) with a session prefix, then
     /// confirm the WAV / sidecar / manifest land with a coherent shape. Unlike
     /// the `audio_recorder` unit tests (which exercise `Recorder` in isolation),
     /// this proves the worker wiring — the block tap, the six `out_port[0]`
@@ -750,10 +746,7 @@ mod tests {
         const F0: f32 = 440.0;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        // The env var is process-global; serialize against the recorder unit
-        // tests that also touch it.
-        let _guard = crate::audio_recorder::test_env_lock();
-        std::env::set_var("GURUKUL_AUDIO_TRACE_DIR", dir.path().to_str().unwrap());
+        let prefix = dir.path().join("test-engine-input");
 
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
         let telemetry: Arc<dyn Telemetry> = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
@@ -774,6 +767,7 @@ mod tests {
                 clock,
                 telemetry: Arc::clone(&telemetry),
                 inspect: crate::inspect::InspectShared::new(),
+                session_prefix: Some(prefix),
             },
             &mut feature_producer,
         )
@@ -819,22 +813,18 @@ mod tests {
 
         drop(producer);
         data_plane.stop(&*telemetry);
-        std::env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
 
-        // Exactly one of each artifact, sharing one stamp prefix.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read trace dir")
-            .map(|e| e.expect("dir entry").file_name().into_string().unwrap())
-            .collect();
-        let manifest_name = entries
-            .iter()
-            .find(|n| n.ends_with("-engine-input.manifest.json"))
-            .expect("a manifest must have been written (valid run)");
+        // Use the path helpers to find artifacts by the known prefix.
+        let prefix = dir.path().join("test-engine-input");
+        let manifest_path = audio_trace_format::manifest_path(&prefix);
+        assert!(
+            manifest_path.exists(),
+            "a manifest must have been written (valid run)"
+        );
 
-        let manifest: Manifest = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(manifest_name)).expect("read manifest"),
-        )
-        .expect("manifest parses as the shared type");
+        let manifest: Manifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("manifest parses as the shared type");
         assert_eq!(manifest.schema, 1);
         assert_eq!(manifest.block_size, 512);
         assert_eq!(manifest.channels, 1);
@@ -845,11 +835,8 @@ mod tests {
         assert_eq!(manifest.total_samples, manifest.n_hops * 512);
 
         // WAV length matches n_hops * block_size exactly.
-        let wav_name = entries
-            .iter()
-            .find(|n| n.ends_with("-engine-input.wav"))
-            .expect("WAV exists");
-        let mut reader = hound::WavReader::open(dir.path().join(wav_name)).expect("open WAV");
+        let wav_path = audio_trace_format::wav_path(&prefix);
+        let mut reader = hound::WavReader::open(&wav_path).expect("open WAV");
         let n_samples = reader.samples::<f32>().count();
         assert_eq!(
             n_samples,
@@ -859,11 +846,8 @@ mod tests {
 
         // Sidecar has n_hops lines, each a parseable SidecarHop with contiguous
         // hop indices from 0.
-        let sidecar_name = entries
-            .iter()
-            .find(|n| n.ends_with("-engine-input.features.jsonl"))
-            .expect("sidecar exists");
-        let sidecar = std::fs::File::open(dir.path().join(sidecar_name)).expect("open sidecar");
+        let sidecar_path = audio_trace_format::features_path(&prefix);
+        let sidecar = std::fs::File::open(&sidecar_path).expect("open sidecar");
         let hops: Vec<SidecarHop> = std::io::BufReader::new(sidecar)
             .lines()
             .map(|l| l.expect("line"))

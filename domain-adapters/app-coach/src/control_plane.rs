@@ -235,6 +235,7 @@ impl ControlPlane {
                 clock: Arc::clone(&self.deps.clock),
                 telemetry: Arc::clone(&self.deps.telemetry),
                 inspect: Arc::clone(&self.inspect),
+                session_prefix: cfg.session_label.clone(),
             },
             &mut self.feature_producer,
         ) {

@@ -178,6 +178,14 @@ pub struct AudioConfig {
     /// [`CoachEvent::SessionError`] with
     /// [`SessionErrorKind::UnsupportedConfig`].
     pub buffer_frames: Option<u32>,
+
+    /// When `Some`, the engine records this session's input audio + per-hop
+    /// features + manifest under this path prefix (the recorder appends
+    /// `.wav` / `.features.jsonl` / `.manifest.json`).
+    /// The HEAD owns naming and uniqueness — for repeated sessions in one
+    /// run it must supply a FRESH prefix each `StartSession`. `None`
+    /// disables recording.
+    pub session_label: Option<std::path::PathBuf>,
 }
 
 /// The coach's current *musical* frame of reference — the snapshot

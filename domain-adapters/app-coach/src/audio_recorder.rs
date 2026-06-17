@@ -1,6 +1,6 @@
 //! Audio-trace recorder for one live coach session.
 //!
-//! When the env var `GURUKUL_AUDIO_TRACE_DIR` is set, records:
+//! When the caller supplies a path prefix, records:
 //! - a float32 mono WAV of every 512-sample block fed to the engine
 //! - a `.features.jsonl` sidecar with one hop-feature JSON line per block
 //! - a `.manifest.json` after the session ends cleanly
@@ -14,13 +14,13 @@ use domain_ports::tel_warn;
 use domain_ports::telemetry::Telemetry;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::{env, fs};
 
 /// Bounded channel capacity. Large enough to absorb disk hiccups, small
 /// enough to bound memory (~256 * (512 * 4 + overhead) ≈ a few MB).
@@ -43,35 +43,33 @@ pub(crate) struct Recorder {
 }
 
 struct ManifestMeta {
-    dir: PathBuf,
-    stamp: u64,
+    prefix: PathBuf,
     sample_rate: u32,
     world_name: String,
     world_sha256: String,
 }
 
 impl Recorder {
-    /// Returns `Some` only if `GURUKUL_AUDIO_TRACE_DIR` is set and non-empty.
+    /// Returns `Some` only if the prefix parent directory can be created and the
+    /// WAV/sidecar files can be opened for writing.
     ///
-    /// `stamp_ms` must come from the worker's `clock.now_ms()` — this function
-    /// does NOT read a wall clock. `world_json` is the embedded world bytes
-    /// (for SHA-256). `world_name` is the logical basename (e.g. `"coach.json"`).
-    pub(crate) fn from_env(
+    /// `prefix` is the full path stem for this session (the recorder appends
+    /// `.wav`, `.features.jsonl`, `.manifest.json`). `world_json` is the
+    /// embedded world bytes (for SHA-256). `world_name` is the logical basename
+    /// (e.g. `"coach.json"`).
+    pub(crate) fn new(
+        prefix: PathBuf,
         sample_rate: u32,
-        stamp_ms: u64,
         world_json: &str,
         world_name: &str,
     ) -> Option<Self> {
-        let dir_str = env::var("GURUKUL_AUDIO_TRACE_DIR").ok()?;
-        if dir_str.is_empty() {
-            return None;
-        }
-        let dir = PathBuf::from(&dir_str);
-        if let Err(e) = fs::create_dir_all(&dir) {
-            // Best-effort: if we can't create the dir, silently skip recording.
-            // The worker must not fail to start just because of a bad trace dir.
-            eprintln!("audio-trace: could not create dir {dir_str}: {e}");
-            return None;
+        // Best-effort: create parent dir. If it fails, skip recording rather
+        // than taking down the worker.
+        if let Some(parent) = prefix.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("audio-trace: could not create dir {parent:?}: {e}");
+                return None;
+            }
         }
 
         // Compute SHA-256 of the world JSON.
@@ -79,8 +77,8 @@ impl Recorder {
         hasher.update(world_json.as_bytes());
         let world_sha256 = format!("{:x}", hasher.finalize());
 
-        let wav_path = dir.join(format!("{stamp_ms}-engine-input.wav"));
-        let sidecar_path = dir.join(format!("{stamp_ms}-engine-input.features.jsonl"));
+        let wav_path = audio_trace_format::wav_path(&prefix);
+        let sidecar_path = audio_trace_format::features_path(&prefix);
 
         let wav_spec = WavSpec {
             channels: 1,
@@ -179,8 +177,7 @@ impl Recorder {
             invalid,
             writer_thread: Some(writer_thread),
             manifest_meta: ManifestMeta {
-                dir,
-                stamp: stamp_ms,
+                prefix,
                 sample_rate,
                 world_name: world_name.to_string(),
                 world_sha256,
@@ -254,10 +251,12 @@ impl Recorder {
 
         let meta = &self.manifest_meta;
         let n_hops = self.n_hops_sent;
-        let wav_basename = format!("{}-engine-input.wav", meta.stamp);
-        let manifest_path = meta
-            .dir
-            .join(format!("{}-engine-input.manifest.json", meta.stamp));
+        let wav_basename = audio_trace_format::wav_path(&meta.prefix)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let manifest_path = audio_trace_format::manifest_path(&meta.prefix);
 
         let manifest = Manifest {
             schema: 1,
@@ -295,23 +294,12 @@ impl Recorder {
 
 impl Drop for Recorder {
     /// If `finish` was never called (e.g. the worker panicked between
-    /// `from_env` and `finish`), still join the writer thread rather than
+    /// `new` and `finish`), still join the writer thread rather than
     /// detaching it. No manifest is written — a recording without a manifest
     /// is fail-closed: the replay tooling refuses it.
     fn drop(&mut self) {
         self.join_writer();
     }
-}
-
-/// Shared lock for any test that mutates the process-global
-/// `GURUKUL_AUDIO_TRACE_DIR` env var. Lives at module scope (not inside
-/// `mod tests`) so the data-plane worker test in `data_plane.rs` can serialize
-/// against these tests through the SAME mutex — two separate mutexes wouldn't.
-#[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -321,7 +309,7 @@ mod tests {
 
     /// Telemetry stub that ignores everything (shared across tests).
     struct NullTelemetry;
-    impl Telemetry for NullTelemetry {
+    impl domain_ports::telemetry::Telemetry for NullTelemetry {
         fn log(
             &self,
             _level: domain_ports::telemetry::Level,
@@ -329,46 +317,35 @@ mod tests {
             _fields: &domain_ports::telemetry::Fields,
         ) {
         }
-        fn child(&self, _fields: domain_ports::telemetry::Fields) -> std::sync::Arc<dyn Telemetry> {
+        fn child(
+            &self,
+            _fields: domain_ports::telemetry::Fields,
+        ) -> std::sync::Arc<dyn domain_ports::telemetry::Telemetry> {
             std::sync::Arc::new(NullTelemetry)
         }
         fn event(&self, _e: &domain_ports::telemetry::Event) {}
     }
 
-    // Test 1: Recorder off by default
-    #[test]
-    fn recorder_off_by_default() {
-        let _guard = super::test_env_lock();
-        // Ensure env var is not set.
-        // (In CI/dev it shouldn't be; we remove it to be safe.)
-        env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
-        let recorder = Recorder::from_env(48_000, 0, "{}", "coach.json");
-        assert!(
-            recorder.is_none(),
-            "from_env must return None when env var is unset"
-        );
-    }
+    // Test 1: Recorder off when prefix is None (callers pass None → no recorder)
+    // This is now tested implicitly via data_plane — when session_label is None,
+    // no Recorder::new is called. The unit test exercises the new constructor directly.
 
     // Test 2: Records a known signal
     #[test]
     fn records_a_known_signal() {
         use std::io::BufRead;
 
-        let _guard = super::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
-        let dir_path = dir.path().to_str().unwrap().to_string();
+        let prefix = dir.path().join("test-session");
 
-        env::set_var("GURUKUL_AUDIO_TRACE_DIR", &dir_path);
-
-        let stamp_ms: u64 = 12345;
         let world_json = r#"{"nodes":[],"edges":[]}"#;
         let world_name = "coach.json";
         let sample_rate: u32 = 48_000;
         const N_HOPS: usize = 4;
         const BLOCK: usize = 512;
 
-        let mut recorder = Recorder::from_env(sample_rate, stamp_ms, world_json, world_name)
-            .expect("recorder must be Some when env var is set");
+        let mut recorder = Recorder::new(prefix.clone(), sample_rate, world_json, world_name)
+            .expect("recorder must be Some");
 
         // Generate a simple sine-ish block.
         let block: Vec<f32> = (0..BLOCK)
@@ -393,10 +370,8 @@ mod tests {
 
         recorder.finish(&NullTelemetry);
 
-        env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
-
         // Check WAV exists and has N_HOPS * BLOCK samples.
-        let wav_path = dir.path().join(format!("{stamp_ms}-engine-input.wav"));
+        let wav_path = audio_trace_format::wav_path(&prefix);
         assert!(wav_path.exists(), "WAV file must exist");
         let mut wav_reader = hound::WavReader::open(&wav_path).expect("open WAV");
         let samples: Vec<f32> = wav_reader
@@ -410,9 +385,7 @@ mod tests {
         );
 
         // Check sidecar has N_HOPS lines each parseable as SidecarHop.
-        let sidecar_path = dir
-            .path()
-            .join(format!("{stamp_ms}-engine-input.features.jsonl"));
+        let sidecar_path = audio_trace_format::features_path(&prefix);
         assert!(sidecar_path.exists(), "sidecar must exist");
         let sidecar_file = fs::File::open(&sidecar_path).expect("open sidecar");
         let lines: Vec<String> = std::io::BufReader::new(sidecar_file)
@@ -426,9 +399,7 @@ mod tests {
         }
 
         // Check manifest.
-        let manifest_path = dir
-            .path()
-            .join(format!("{stamp_ms}-engine-input.manifest.json"));
+        let manifest_path = audio_trace_format::manifest_path(&prefix);
         assert!(manifest_path.exists(), "manifest must exist");
         let manifest_str = fs::read_to_string(&manifest_path).expect("read manifest");
         let manifest: Manifest = serde_json::from_str(&manifest_str).expect("manifest must parse");
@@ -449,19 +420,15 @@ mod tests {
     fn round_trips_with_shared_crate() {
         use std::io::BufRead;
 
-        let _guard = super::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
-        let dir_path = dir.path().to_str().unwrap().to_string();
+        let prefix = dir.path().join("round-trip-session");
 
-        env::set_var("GURUKUL_AUDIO_TRACE_DIR", &dir_path);
-
-        let stamp_ms: u64 = 99999;
         let world_json = r#"{"nodes":[],"edges":[]}"#;
         let sample_rate: u32 = 48_000;
         const N_HOPS: usize = 2;
         const BLOCK: usize = 512;
 
-        let mut recorder = Recorder::from_env(sample_rate, stamp_ms, world_json, "coach.json")
+        let mut recorder = Recorder::new(prefix.clone(), sample_rate, world_json, "coach.json")
             .expect("recorder must be Some");
 
         let block = vec![0.0_f32; BLOCK];
@@ -479,12 +446,9 @@ mod tests {
         }
 
         recorder.finish(&NullTelemetry);
-        env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
 
         // Deserialize sidecar with audio_trace_format types (same as Phase 1).
-        let sidecar_path = dir
-            .path()
-            .join(format!("{stamp_ms}-engine-input.features.jsonl"));
+        let sidecar_path = audio_trace_format::features_path(&prefix);
         let sidecar_file = fs::File::open(&sidecar_path).expect("open sidecar");
         let hops: Vec<SidecarHop> = std::io::BufReader::new(sidecar_file)
             .lines()
@@ -496,9 +460,7 @@ mod tests {
         assert!((hops[0].f0_hz - 220.0).abs() < f32::EPSILON);
 
         // Deserialize manifest with audio_trace_format::Manifest.
-        let manifest_path = dir
-            .path()
-            .join(format!("{stamp_ms}-engine-input.manifest.json"));
+        let manifest_path = audio_trace_format::manifest_path(&prefix);
         let manifest_str = fs::read_to_string(&manifest_path).expect("read manifest");
         let manifest: Manifest =
             serde_json::from_str(&manifest_str).expect("Manifest round-trip parse");
@@ -514,12 +476,10 @@ mod tests {
     // is deterministic.
     #[test]
     fn invalid_run_omits_manifest() {
-        let _guard = super::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
-        env::set_var("GURUKUL_AUDIO_TRACE_DIR", dir.path().to_str().unwrap());
+        let prefix = dir.path().join("invalid-session");
 
-        let stamp_ms: u64 = 7;
-        let mut recorder = Recorder::from_env(48_000, stamp_ms, "{}", "coach.json")
+        let mut recorder = Recorder::new(prefix.clone(), 48_000, "{}", "coach.json")
             .expect("recorder must be Some");
 
         let block = vec![0.0_f32; 512];
@@ -538,11 +498,8 @@ mod tests {
         // error would do).
         recorder.invalid.store(true, Ordering::Release);
         recorder.finish(&NullTelemetry);
-        env::remove_var("GURUKUL_AUDIO_TRACE_DIR");
 
-        let manifest_path = dir
-            .path()
-            .join(format!("{stamp_ms}-engine-input.manifest.json"));
+        let manifest_path = audio_trace_format::manifest_path(&prefix);
         assert!(
             !manifest_path.exists(),
             "an invalidated run must NOT write a manifest (fail-closed)"

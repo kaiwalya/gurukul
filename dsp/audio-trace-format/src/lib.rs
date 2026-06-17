@@ -2,6 +2,7 @@
 //! replay/diff and written by the app-coach recorder.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// One hop's feature snapshot written to `.features.jsonl`.
 ///
@@ -38,4 +39,27 @@ pub struct Manifest {
     pub source_wav: String,
     /// Crate version of the writer at build time.
     pub recorder_version: String,
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+/// Append `.wav` to a session prefix path.
+pub fn wav_path(prefix: &Path) -> PathBuf {
+    suffix_path(prefix, ".wav")
+}
+
+/// Append `.features.jsonl` to a session prefix path.
+pub fn features_path(prefix: &Path) -> PathBuf {
+    suffix_path(prefix, ".features.jsonl")
+}
+
+/// Append `.manifest.json` to a session prefix path.
+pub fn manifest_path(prefix: &Path) -> PathBuf {
+    suffix_path(prefix, ".manifest.json")
+}
+
+fn suffix_path(prefix: &Path, ext: &str) -> PathBuf {
+    let mut s = prefix.as_os_str().to_os_string();
+    s.push(ext);
+    PathBuf::from(s)
 }

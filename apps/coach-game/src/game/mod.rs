@@ -12,9 +12,23 @@ use crate::semantic_graph::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
+use std::path::PathBuf;
 
 #[derive(Resource, Default)]
 pub struct LastFeatureHop(Option<u64>);
+
+/// The UX-trace stamp for this run — the `<YYYY-MM-DD-HHMMSS-mmm>` string used
+/// in the UX trace filename. Inserted by `main.rs` so `on_enter` can pair the
+/// engine-input audio prefix with the UX trace.
+#[derive(Resource, Clone)]
+pub struct LaunchStamp(pub String);
+
+/// Counts how many `StartSession` calls have been issued this run. Starts at
+/// `0`; incremented each time `on_enter` fires. Used to disambiguate repeated
+/// sessions: the first session uses `<stamp>-engine-input`, the second uses
+/// `<stamp>-engine-input-s2`, etc.
+#[derive(Resource, Default)]
+pub struct SessionCounter(pub u32);
 
 #[derive(Resource, Default)]
 pub struct GraphProjectorRes(pub GraphProjector);
@@ -124,6 +138,8 @@ pub fn on_enter(
     selected: Res<SelectedDevice>,
     tonality: Res<SongTonality>,
     mut has_paused: ResMut<HasPausedSession>,
+    stamp: Option<Res<LaunchStamp>>,
+    mut counter: ResMut<SessionCounter>,
 ) {
     // Configure the musical frame of reference *before* starting audio,
     // so the coach holds the scale the moment a session is live. The two
@@ -132,10 +148,27 @@ pub fn on_enter(
     coach
         .0
         .send_command(Command::ConfigureSession { scale: tonality.0 });
+
+    // Build the audio-input recording prefix from the same stamp used for the
+    // UX trace, so both artifacts share the same run identity.
+    let session_label = stamp.map(|s| {
+        counter.0 += 1;
+        let base = format!("{}-engine-input", s.0);
+        let name = if counter.0 == 1 {
+            base
+        } else {
+            format!("{}-s{}", base, counter.0)
+        };
+        let prefix = PathBuf::from(crate::trace::ROOT).join(&name);
+        info!("recording engine input → {}.wav", prefix.display());
+        prefix
+    });
+
     coach.0.send_command(Command::StartSession(AudioConfig {
         device_id: selected.0.clone(),
         sample_rate: None,
         buffer_frames: None,
+        session_label,
     }));
     // Whether we got here from MainMenu (Free Practice / Continue) or from
     // Paused (Resume), a session is now live and there's no separate

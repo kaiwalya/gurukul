@@ -150,6 +150,7 @@ fn run_live(replay_audio: Option<PathBuf>) {
     // One trace file per run, under a gitignored `traces/` next to the
     // working directory. Name + header stamped from wall-clock at launch.
     let (stamp, wall_start) = trace::launch_stamp();
+    app.insert_resource(coach_game::game::LaunchStamp(stamp.clone()));
     app.add_plugins(TracePlugin {
         root: PathBuf::from(trace::ROOT),
         stamp,

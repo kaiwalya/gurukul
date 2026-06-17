@@ -133,6 +133,7 @@ fn clone_command(cmd: &Command) -> Command {
             device_id: cfg.device_id.clone(),
             sample_rate: cfg.sample_rate,
             buffer_frames: cfg.buffer_frames,
+            session_label: cfg.session_label.clone(),
         }),
         Command::StopSession => Command::StopSession,
         Command::ConfigureSession { scale } => Command::ConfigureSession { scale: *scale },

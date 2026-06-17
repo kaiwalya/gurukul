@@ -97,10 +97,21 @@ fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
 
     let coach = build_coach();
 
+    let session_label = std::env::var("GURUKUL_AUDIO_TRACE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|dir| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            std::path::PathBuf::from(dir).join(format!("{now_ms}-engine-input"))
+        });
     let cfg = AudioConfig {
         device_id: persistent_id.map(DeviceId),
         sample_rate: None,
         buffer_frames: None,
+        session_label,
     };
     coach.send_command(Command::StartSession(cfg));
 
