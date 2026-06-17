@@ -2,7 +2,8 @@
 
 *What is where, and why.* For how to **build** a widget, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md). For Bevy mechanics and local app
-conventions, see [`AGENTS.md`](AGENTS.md).
+conventions, see [`AGENTS.md`](AGENTS.md). For how the head compiles and
+packages per platform (iOS/Android), see [`BUILD.md`](BUILD.md).
 
 ## The unit is the widget slice
 

@@ -2,7 +2,8 @@
 
 *How to build a widget.* For **what** the layers are and **why** the crate is
 shaped this way (the slice doctrine, music quarantine, scene shapes, marker
-ownership), see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+ownership), see [`ARCHITECTURE.md`](ARCHITECTURE.md). For how the head
+compiles and packages per platform (iOS/Android), see [`BUILD.md`](BUILD.md).
 
 Build UI in isolated pieces before stitching it into the screen. A widget
 should be useful and testable through its own model, scene contract, and ECS

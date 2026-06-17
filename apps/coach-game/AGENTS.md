@@ -20,8 +20,9 @@ crate-level shared pitch/time projection that feeds them.
 
 Crate structure and the widget-slice doctrine live in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) (the *what/why*); the build workflow
-lives in [`CONTRIBUTING.md`](CONTRIBUTING.md) (the *how*). This file owns
-the Bevy mechanics and local app conventions.
+lives in [`CONTRIBUTING.md`](CONTRIBUTING.md) (the *how*); per-platform
+compile + packaging (iOS/Android) lives in [`BUILD.md`](BUILD.md). This file
+owns the Bevy mechanics and local app conventions.
 
 ## Running it
 
