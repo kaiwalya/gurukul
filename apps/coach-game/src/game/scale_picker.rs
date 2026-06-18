@@ -5,18 +5,18 @@
 //! # Flow
 //!
 //! 1. User clicks the HUD badge ([`HudBadge`](crate::widgets::hud::HudBadge)).
-//! 2. [`handle_hud_click`] sends `Command::ListScales` (populates
+//! 2. [`handle_hud_click`] sends `Command::MusicListScales` (populates
 //!    [`KnownScales`] via the CQRS round-trip) and sets
 //!    [`ShowingScalePicker`] to `true`.
 //! 3. [`sync_picker`] detects the flag flip and spawns the widget overlay.
 //! 4. [`sync_rows`] repopulates the rows when [`KnownScales`] arrives (the
-//!    `ListScales` reply lands asynchronously) while the overlay is open.
+//!    `MusicListScales` reply lands asynchronously) while the overlay is open.
 //! 5. [`handle_row_click`] computes the selected [`Scale`] via the widget
-//!    model, writes it to [`SongTonality`], sends `ConfigureSession`, and
+//!    model, writes it to [`SongTonality`], sends `MusicConfigureSession`, and
 //!    closes the overlay.
 //!
 //! The session stays live throughout — this is a plain overlay, not a
-//! pause. `ConfigureSession` is decoupled from the audio lifecycle.
+//! pause. `MusicConfigureSession` is decoupled from the audio lifecycle.
 //!
 //! Open/closed visibility ([`ShowingScalePicker`]) is a route/interaction
 //! concern and stays in glue, not the widget scene: the scene describes the
@@ -40,7 +40,7 @@ use domain_ports::tuning::Tuning;
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct ShowingScalePicker(pub bool);
 
-/// Open the picker: send `ListScales` to populate [`KnownScales`] and show
+/// Open the picker: send `MusicListScales` to populate [`KnownScales`] and show
 /// the overlay. Runs only when the HUD badge is pressed and the picker is
 /// not already open.
 pub fn handle_hud_click(
@@ -50,7 +50,7 @@ pub fn handle_hud_click(
 ) {
     for i in q.iter() {
         if *i == Interaction::Pressed && !showing.0 {
-            coach.0.send_command(Command::ListScales);
+            coach.0.send_command(Command::MusicListScales);
             showing.0 = true;
         }
     }
@@ -82,7 +82,7 @@ pub fn sync_picker(
 }
 
 /// Repopulate the row list when [`KnownScales`] changes while the picker is
-/// open (the `ListScales` reply arrives asynchronously after the overlay
+/// open (the `MusicListScales` reply arrives asynchronously after the overlay
 /// spawns). No-ops unless both the overlay is visible and the catalogue
 /// just changed.
 pub fn sync_rows(
@@ -104,7 +104,7 @@ pub fn sync_rows(
 
 /// On a scale row click: compute the new [`Scale`] via the widget model
 /// (keeping the current Sa rotation + register, swapping the tooth
-/// pattern), write it to [`SongTonality`], send `ConfigureSession`, and
+/// pattern), write it to [`SongTonality`], send `MusicConfigureSession`, and
 /// close the overlay.
 pub fn handle_row_click(
     q: Query<(&Interaction, &ScaleRow), Changed<Interaction>>,
@@ -124,7 +124,7 @@ pub fn handle_row_click(
         tonality.0 = new_scale;
         coach
             .0
-            .send_command(Command::ConfigureSession { scale: new_scale });
+            .send_command(Command::MusicConfigureSession { scale: new_scale });
         showing.0 = false;
         return; // one selection per frame
     }

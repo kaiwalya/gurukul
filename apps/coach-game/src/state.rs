@@ -37,16 +37,16 @@ pub struct HasPausedSession(pub bool);
 #[derive(Resource, Default, Debug, Clone)]
 pub struct SelectedDevice(pub Option<DeviceId>);
 
-/// The most recent device list from `CoachEvent::DevicesListed`. The
-/// Settings → Audio screen populates it on enter (via `ListDevices`)
+/// The most recent device list from `CoachEvent::AudioDevicesListed`. The
+/// Settings → Audio screen populates it on enter (via `AudioListDevices`)
 /// and renders one row per device.
 #[derive(Resource, Default)]
 pub struct KnownDevices(pub Vec<InputDevice>);
 
-/// The most recent scale catalogue from [`CoachEvent::ScalesListed`].
+/// The most recent scale catalogue from [`CoachEvent::MusicScalesListed`].
 /// Populated by [`drain_events`](crate::coach::drain_events) in response
-/// to [`Command::ListScales`] — the read side of the CQRS split, same
-/// pattern as [`KnownDevices`]. Empty until the first `ListScales` reply
+/// to [`Command::MusicListScales`] — the read side of the CQRS split, same
+/// pattern as [`KnownDevices`]. Empty until the first `MusicListScales` reply
 /// arrives (honest absence: the picker waits for `KnownScales` to be
 /// non-empty before rendering rows).
 #[derive(Resource, Default)]
@@ -93,7 +93,7 @@ impl Default for AppSettings {
 /// The song's musical frame, head-side: a fully-placed [`Scale`] (tooth
 /// pattern + rotated tuning carrying Sa + integer octave). The head holds
 /// the same value it sends the coach via
-/// [`Command::ConfigureSession`](domain_ports::app_coach::Command), and the
+/// [`Command::MusicConfigureSession`](domain_ports::app_coach::Command), and the
 /// dial reads it to paint the scale ring.
 ///
 /// The dial's *geometry* (how many slots, where they sit) lives in the

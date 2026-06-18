@@ -22,7 +22,7 @@ pub struct Coach(pub Box<dyn AppCoach>);
 
 /// The head-side **read model** for the coach's musical frame of
 /// reference (tuning + tonality). Written *only* by [`drain_events`] in
-/// response to a [`CoachEvent::SessionConfigured`]; read by every UI
+/// response to a [`CoachEvent::MusicSessionConfigured`]; read by every UI
 /// system (HUD, dial) via `Res<MusicInfoRes>`.
 ///
 /// This is the read side of the CQRS split: UI never holds the
@@ -134,8 +134,8 @@ pub fn shutdown_on_exit(mut exits: MessageReader<bevy::app::AppExit>, coach: Non
 /// here keeps the `!Send` handle off every render system (which can then
 /// run as ordinary `Res` readers).
 ///
-/// - `DevicesListed` → [`KnownDevices`] (Settings → Audio screen).
-/// - `SessionConfigured` → refresh [`MusicInfoRes`] from `music_info()`
+/// - `AudioDevicesListed` → [`KnownDevices`] (Settings → Audio screen).
+/// - `MusicSessionConfigured` → refresh [`MusicInfoRes`] from `music_info()`
 ///   (the read side of the config CQRS round-trip).
 /// - lifecycle / errors / drops → logs.
 /// - every tick → poll `latest_features()` into [`LatestFeatures`].
@@ -154,25 +154,25 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
     coach.0.poll_events(&mut events);
     for ev in events {
         match ev {
-            CoachEvent::DevicesListed { devices } => {
+            CoachEvent::AudioDevicesListed { devices } => {
                 known.0 = devices;
             }
-            CoachEvent::ScalesListed { shapes } => {
+            CoachEvent::MusicScalesListed { shapes } => {
                 scales.0 = shapes;
             }
-            CoachEvent::SessionStateChanged { new_state } => {
+            CoachEvent::AudioSessionStateChanged { new_state } => {
                 info!("session state: {new_state:?}");
             }
-            CoachEvent::SessionError { kind, reason } => {
+            CoachEvent::AudioSessionError { kind, reason } => {
                 error!("session error: {kind:?} — {reason}");
             }
             CoachEvent::EventsDropped { count } => {
                 warn!("events dropped: {count}");
             }
-            CoachEvent::DefaultInputChanged { .. } => {}
+            CoachEvent::AudioDefaultInputChanged { .. } => {}
             // The musical frame was (re)configured. Pull the fresh
             // snapshot and republish it for the UI to read.
-            CoachEvent::SessionConfigured { scale } => {
+            CoachEvent::MusicSessionConfigured { scale } => {
                 // Compact one-liner: log Sa's pitch, the slot count, and the
                 // in-scale degrees rather than dumping the whole `Scale`.
                 info!(

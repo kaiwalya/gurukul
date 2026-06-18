@@ -58,7 +58,10 @@ fn new_game_transitions_to_in_game_and_starts_session() {
     assert!(
         matches!(
             cmds.as_slice(),
-            [Command::ConfigureSession { .. }, Command::StartSession(_)]
+            [
+                Command::MusicConfigureSession { .. },
+                Command::AudioStartSession(_)
+            ]
         ),
         "expected ConfigureSession then StartSession after entering InGame, got {} commands",
         cmds.len()
@@ -79,7 +82,7 @@ fn start_session_uses_selected_device_id() {
 
     let cmds = drain_commands(&fake);
     match cmds.as_slice() {
-        [Command::ConfigureSession { .. }, Command::StartSession(cfg)] => {
+        [Command::MusicConfigureSession { .. }, Command::AudioStartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(id));
         }
         other => panic!(
@@ -101,7 +104,7 @@ fn settings_button_transitions_to_settings_and_lists_devices() {
     assert_eq!(current_state(&app), AppState::Settings);
     let cmds = drain_commands(&fake);
     assert!(
-        matches!(cmds.as_slice(), [Command::ListDevices]),
+        matches!(cmds.as_slice(), [Command::AudioListDevices]),
         "expected exactly one ListDevices after entering Settings, got {} commands",
         cmds.len()
     );
@@ -188,7 +191,7 @@ fn exiting_in_game_stops_session() {
 
     let cmds = drain_commands(&fake);
     assert!(
-        matches!(cmds.as_slice(), [Command::StopSession]),
+        matches!(cmds.as_slice(), [Command::AudioStopSession]),
         "expected exactly one StopSession after exiting InGame, got {} commands",
         cmds.len()
     );
@@ -279,7 +282,7 @@ fn entering_paused_stops_session_via_on_exit_in_game() {
     assert!(app.world().resource::<HasPausedSession>().0);
     let cmds = drain_commands(&fake);
     assert!(
-        matches!(cmds.as_slice(), [Command::StopSession]),
+        matches!(cmds.as_slice(), [Command::AudioStopSession]),
         "expected exactly one StopSession on pause, got {} commands",
         cmds.len()
     );
@@ -303,7 +306,10 @@ fn resuming_from_paused_starts_a_fresh_session() {
     assert!(
         matches!(
             cmds.as_slice(),
-            [Command::ConfigureSession { .. }, Command::StartSession(_)]
+            [
+                Command::MusicConfigureSession { .. },
+                Command::AudioStartSession(_)
+            ]
         ),
         "expected ConfigureSession then StartSession on resume, got {} commands",
         cmds.len()
@@ -468,7 +474,7 @@ fn full_device_selection_flow_carries_to_start_session() {
     {
         let mut g = fake.inner.lock().unwrap();
         g.pending_events
-            .push(domain_ports::app_coach::CoachEvent::DevicesListed {
+            .push(domain_ports::app_coach::CoachEvent::AudioDevicesListed {
                 devices: vec![
                     fake_device("usb-condenser", "USB Condenser"),
                     fake_device("airpods", "AirPods Pro"),
@@ -522,7 +528,7 @@ fn full_device_selection_flow_carries_to_start_session() {
 
     let cmds = drain_commands(&fake);
     match cmds.as_slice() {
-        [Command::ConfigureSession { .. }, Command::StartSession(cfg)] => {
+        [Command::MusicConfigureSession { .. }, Command::AudioStartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(airpods_id));
         }
         other => panic!(

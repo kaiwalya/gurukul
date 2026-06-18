@@ -7,7 +7,7 @@
 //! `FeatureDrainCount` (the number of feature hops drained this frame).
 //! Once the WAV has been seen flowing (≥1 hop since entering InGame) and then
 //! goes silent for `WAV_END_THRESHOLD_SECS`, it sets `NextState(MainMenu)`.
-//! `OnExit(InGame)` already sends `Command::StopSession`, so no extra cleanup
+//! `OnExit(InGame)` already sends `Command::AudioStopSession`, so no extra cleanup
 //! is needed.
 
 use crate::coach::FeatureDrainCount;

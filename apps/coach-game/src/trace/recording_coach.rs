@@ -127,38 +127,46 @@ impl AppCoach for RecordingCoach {
 fn clone_command(cmd: &Command) -> Command {
     use domain_ports::app_coach::AudioConfig;
     match cmd {
-        Command::ListDevices => Command::ListDevices,
-        Command::ListScales => Command::ListScales,
-        Command::StartSession(cfg) => Command::StartSession(AudioConfig {
+        Command::AudioListDevices => Command::AudioListDevices,
+        Command::MusicListScales => Command::MusicListScales,
+        Command::AudioStartSession(cfg) => Command::AudioStartSession(AudioConfig {
             device_id: cfg.device_id.clone(),
             sample_rate: cfg.sample_rate,
             buffer_frames: cfg.buffer_frames,
             session_label: cfg.session_label.clone(),
         }),
-        Command::StopSession => Command::StopSession,
-        Command::ConfigureSession { scale } => Command::ConfigureSession { scale: *scale },
+        Command::AudioStopSession => Command::AudioStopSession,
+        Command::MusicConfigureSession { scale } => {
+            Command::MusicConfigureSession { scale: *scale }
+        }
     }
 }
 
 fn clone_event(ev: &CoachEvent) -> CoachEvent {
     match ev {
-        CoachEvent::DevicesListed { devices } => CoachEvent::DevicesListed {
+        CoachEvent::AudioDevicesListed { devices } => CoachEvent::AudioDevicesListed {
             devices: devices.clone(),
         },
-        CoachEvent::ScalesListed { shapes } => CoachEvent::ScalesListed {
+        CoachEvent::MusicScalesListed { shapes } => CoachEvent::MusicScalesListed {
             shapes: shapes.clone(),
         },
-        CoachEvent::SessionStateChanged { new_state } => CoachEvent::SessionStateChanged {
-            new_state: *new_state,
-        },
-        CoachEvent::SessionConfigured { scale } => CoachEvent::SessionConfigured { scale: *scale },
-        CoachEvent::SessionError { kind, reason } => CoachEvent::SessionError {
+        CoachEvent::AudioSessionStateChanged { new_state } => {
+            CoachEvent::AudioSessionStateChanged {
+                new_state: *new_state,
+            }
+        }
+        CoachEvent::MusicSessionConfigured { scale } => {
+            CoachEvent::MusicSessionConfigured { scale: *scale }
+        }
+        CoachEvent::AudioSessionError { kind, reason } => CoachEvent::AudioSessionError {
             kind: *kind,
             reason: reason.clone(),
         },
-        CoachEvent::DefaultInputChanged { new_default } => CoachEvent::DefaultInputChanged {
-            new_default: new_default.clone(),
-        },
+        CoachEvent::AudioDefaultInputChanged { new_default } => {
+            CoachEvent::AudioDefaultInputChanged {
+                new_default: new_default.clone(),
+            }
+        }
         CoachEvent::EventsDropped { count } => CoachEvent::EventsDropped { count: *count },
     }
 }

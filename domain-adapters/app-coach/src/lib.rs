@@ -174,13 +174,13 @@ struct CoachImpl {
     /// `&mut self` pop API without adding a lock.
     feature_consumer: RefCell<Consumer<FeatureSnapshot>>,
     /// Lock-free snapshot of the negotiated session parameters. Written
-    /// by the control plane before emitting `SessionStateChanged(Running)`
+    /// by the control plane before emitting `AudioSessionStateChanged(Running)`
     /// and cleared before the next transition out — see [`AudioInfo`]
     /// for the ordering contract.
     audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
     /// Lock-free sticky snapshot of the musical frame of reference.
     /// Written by the control plane in the configure handler (before
-    /// the `SessionConfigured` event); survives start/stop. See
+    /// the `MusicSessionConfigured` event); survives start/stop. See
     /// [`MusicInfo`].
     music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
@@ -275,7 +275,7 @@ impl Drop for CoachImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_ports::app_coach::{AudioConfig, SessionErrorKind, SessionState};
+    use domain_ports::app_coach::{AudioConfig, AudioSessionErrorKind, AudioSessionState};
     use domain_ports::audio_capture::{
         AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureSession,
     };
@@ -534,19 +534,19 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::ListDevices);
+        coach.send_command(Command::AudioListDevices);
         let events = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::DevicesListed { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioDevicesListed { .. }))
         });
 
         let listed = events
             .iter()
             .find_map(|e| match e {
-                CoachEvent::DevicesListed { devices } => Some(devices),
+                CoachEvent::AudioDevicesListed { devices } => Some(devices),
                 _ => None,
             })
-            .expect("DevicesListed");
+            .expect("AudioDevicesListed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "fake mic");
 
@@ -562,49 +562,49 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        // ListScales requires a configured tuning to know which octave
-        // division is active. Without ConfigureSession first it returns empty.
-        coach.send_command(Command::ListScales);
+        // MusicListScales requires a configured tuning to know which octave
+        // division is active. Without MusicConfigureSession first it returns empty.
+        coach.send_command(Command::MusicListScales);
         let events_before = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::ScalesListed { .. }))
+                .any(|e| matches!(e, CoachEvent::MusicScalesListed { .. }))
         });
         let shapes_before = events_before
             .iter()
             .find_map(|e| match e {
-                CoachEvent::ScalesListed { shapes } => Some(shapes),
+                CoachEvent::MusicScalesListed { shapes } => Some(shapes),
                 _ => None,
             })
-            .expect("ScalesListed (before configure)");
+            .expect("MusicScalesListed (before configure)");
         assert!(
             shapes_before.is_empty(),
-            "before ConfigureSession, ScalesListed must be empty (no tuning known)"
+            "before MusicConfigureSession, MusicScalesListed must be empty (no tuning known)"
         );
 
-        // Configure a 12-TET session; now ListScales returns 15 shapes.
-        coach.send_command(Command::ConfigureSession {
+        // Configure a 12-TET session; now MusicListScales returns 15 shapes.
+        coach.send_command(Command::MusicConfigureSession {
             scale: bilawal_scale(0),
         });
-        coach.send_command(Command::ListScales);
+        coach.send_command(Command::MusicListScales);
         let events_after = poll_until(&coach, |evs| {
-            // Wait for a second ScalesListed (the non-empty one).
+            // Wait for a second MusicScalesListed (the non-empty one).
             evs.iter()
-                .filter(|e| matches!(e, CoachEvent::ScalesListed { .. }))
+                .filter(|e| matches!(e, CoachEvent::MusicScalesListed { .. }))
                 .count()
                 >= 2
         });
         let shapes_after = events_after
             .iter()
             .filter_map(|e| match e {
-                CoachEvent::ScalesListed { shapes } => Some(shapes),
+                CoachEvent::MusicScalesListed { shapes } => Some(shapes),
                 _ => None,
             })
             .next_back()
-            .expect("second ScalesListed (after configure)");
+            .expect("second MusicScalesListed (after configure)");
         assert_eq!(
             shapes_after.len(),
             15,
-            "after 12-TET ConfigureSession, catalogue must have 15 shapes"
+            "after 12-TET MusicConfigureSession, catalogue must have 15 shapes"
         );
 
         assert_eq!(
@@ -619,7 +619,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -629,47 +629,47 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
         });
-        let states: Vec<SessionState> = after_start
+        let states: Vec<AudioSessionState> = after_start
             .iter()
             .filter_map(|e| match e {
-                CoachEvent::SessionStateChanged { new_state } => Some(*new_state),
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
                 _ => None,
             })
             .collect();
         assert_eq!(
             states,
-            vec![SessionState::Starting, SessionState::Running],
+            vec![AudioSessionState::Starting, AudioSessionState::Running],
             "start should pass through Starting → Running"
         );
         assert_eq!(opens.load(Ordering::SeqCst), 1);
 
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         let after_stop = poll_until(&coach, |evs| {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Idle
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
                     }
                 )
             })
         });
-        let stop_states: Vec<SessionState> = after_stop
+        let stop_states: Vec<AudioSessionState> = after_stop
             .iter()
             .filter_map(|e| match e {
-                CoachEvent::SessionStateChanged { new_state } => Some(*new_state),
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
                 _ => None,
             })
             .collect();
         assert_eq!(
             stop_states,
-            vec![SessionState::Stopping, SessionState::Idle]
+            vec![AudioSessionState::Stopping, AudioSessionState::Idle]
         );
 
         assert_eq!(
@@ -694,23 +694,23 @@ mod tests {
         Scale::new(intervals, tuning.shift_up(shift), octave)
     }
 
-    /// Drain the coach once past a known reply (a `DevicesListed` from a
-    /// `ListDevices` we send) so we can assert what did *not* arrive
-    /// before it. Used to prove `ConfigureSession` emits no event: a
+    /// Drain the coach once past a known reply (a `AudioDevicesListed` from a
+    /// `AudioListDevices` we send) so we can assert what did *not* arrive
+    /// before it. Used to prove `MusicConfigureSession` emits no event: a
     /// configure can't be polled *for* (it's silent), so we sandwich it
     /// before a command that does reply and check the accumulated events.
     fn drain_past_list_devices(coach: &impl AppCoach) -> Vec<CoachEvent> {
-        coach.send_command(Command::ListDevices);
+        coach.send_command(Command::AudioListDevices);
         poll_until(coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::DevicesListed { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioDevicesListed { .. }))
         })
     }
 
     fn no_state_changes(events: &[CoachEvent]) -> bool {
         !events
             .iter()
-            .any(|e| matches!(e, CoachEvent::SessionStateChanged { .. }))
+            .any(|e| matches!(e, CoachEvent::AudioSessionStateChanged { .. }))
     }
 
     #[test]
@@ -723,29 +723,29 @@ mod tests {
         assert!(coach.music_info().is_none());
 
         let scale = bilawal_scale(0);
-        coach.send_command(Command::ConfigureSession { scale });
+        coach.send_command(Command::MusicConfigureSession { scale });
 
         // Configure causes no *audio* state change, but it does emit a
-        // SessionConfigured event. Sandwich it before a ListDevices and
+        // MusicSessionConfigured event. Sandwich it before a AudioListDevices and
         // inspect the accumulated events.
         let events = drain_past_list_devices(&coach);
         assert!(
             no_state_changes(&events),
-            "ConfigureSession in Idle must not change session state",
+            "MusicConfigureSession in Idle must not change session state",
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, CoachEvent::SessionError { .. })),
-            "ConfigureSession must not error",
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. })),
+            "MusicConfigureSession must not error",
         );
         // It DID emit the configure event with the payload we sent.
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CoachEvent::SessionConfigured { scale: s } if *s == scale
+                CoachEvent::MusicSessionConfigured { scale: s } if *s == scale
             )),
-            "ConfigureSession must emit SessionConfigured with the new scale",
+            "MusicConfigureSession must emit MusicSessionConfigured with the new scale",
         );
         // And published the sticky snapshot — readable now, in Idle.
         let info = coach.music_info().expect("snapshot set after configure");
@@ -766,7 +766,7 @@ mod tests {
         let coach = new(deps);
 
         // Start audio → Running.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -776,30 +776,30 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
         });
 
         // Reconfigure mid-session. Decoupled: no *audio* state change,
-        // but it does emit SessionConfigured + update the snapshot.
+        // but it does emit MusicSessionConfigured + update the snapshot.
         // A different tonic (Sa two slots up), to make the swap meaningful.
         let scale = bilawal_scale(2);
-        coach.send_command(Command::ConfigureSession { scale });
+        coach.send_command(Command::MusicConfigureSession { scale });
 
         let events = drain_past_list_devices(&coach);
         assert!(
             no_state_changes(&events),
-            "ConfigureSession while Running must not change session state",
+            "MusicConfigureSession while Running must not change session state",
         );
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CoachEvent::SessionConfigured { scale: s } if *s == scale
+                CoachEvent::MusicSessionConfigured { scale: s } if *s == scale
             )),
-            "reconfigure must emit SessionConfigured with the new tonic",
+            "reconfigure must emit MusicSessionConfigured with the new tonic",
         );
         // Audio was opened exactly once (the start); configure didn't
         // touch the audio lifecycle.
@@ -811,13 +811,13 @@ mod tests {
         // Snapshot reflects the latest configure.
         assert_eq!(coach.music_info().unwrap().scale, scale);
 
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         let _ = poll_until(&coach, |evs| {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Idle
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
                     }
                 )
             })
@@ -849,7 +849,7 @@ mod tests {
             "Idle should have no session info"
         );
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -859,8 +859,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
@@ -871,13 +871,13 @@ mod tests {
         assert_eq!(info.sample_rate, 48_000);
         assert_eq!(info.channels, 1);
 
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         let _ = poll_until(&coach, |evs| {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Idle
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
                     }
                 )
             })
@@ -899,7 +899,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::FailUnsupported, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -907,28 +907,31 @@ mod tests {
         }));
         let events = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
         });
 
         let kind = events
             .iter()
             .find_map(|e| match e {
-                CoachEvent::SessionError { kind, .. } => Some(*kind),
+                CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
                 _ => None,
             })
-            .expect("SessionError");
-        assert_eq!(kind, SessionErrorKind::UnsupportedConfig);
+            .expect("AudioSessionError");
+        assert_eq!(kind, AudioSessionErrorKind::UnsupportedConfig);
 
         // State should have reached Error.
         let saw_error = events.iter().any(|e| {
             matches!(
                 e,
-                CoachEvent::SessionStateChanged {
-                    new_state: SessionState::Error
+                CoachEvent::AudioSessionStateChanged {
+                    new_state: AudioSessionState::Error
                 }
             )
         });
-        assert!(saw_error, "should have emitted SessionStateChanged(Error)");
+        assert!(
+            saw_error,
+            "should have emitted AudioSessionStateChanged(Error)"
+        );
 
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),
@@ -942,7 +945,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::FailOnceThenOk, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -950,22 +953,22 @@ mod tests {
         }));
         let _ = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
         });
 
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         let _ = poll_until(&coach, |evs| {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Idle
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
                     }
                 )
             })
         });
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -975,8 +978,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
@@ -984,8 +987,8 @@ mod tests {
         assert!(
             events.iter().all(|e| !matches!(
                 e,
-                CoachEvent::SessionError {
-                    kind: SessionErrorKind::Other,
+                CoachEvent::AudioSessionError {
+                    kind: AudioSessionErrorKind::Other,
                     ..
                 }
             )),
@@ -1022,7 +1025,7 @@ mod tests {
         let coach = new(deps);
 
         // Reach Running.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1032,8 +1035,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
@@ -1042,7 +1045,7 @@ mod tests {
 
         // Second Start: should be ignored. No new state event, no
         // new open call.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1055,8 +1058,8 @@ mod tests {
         assert!(
             buf.iter().all(|e| !matches!(
                 e,
-                CoachEvent::SessionStateChanged {
-                    new_state: SessionState::Starting
+                CoachEvent::AudioSessionStateChanged {
+                    new_state: AudioSessionState::Starting
                 }
             )),
             "ignored Start must not emit a state change"
@@ -1075,7 +1078,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: Some(DeviceId("does-not-exist".into())),
             sample_rate: None,
             buffer_frames: None,
@@ -1083,17 +1086,17 @@ mod tests {
         }));
         let events = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
         });
 
         let (kind, _reason) = events
             .iter()
             .find_map(|e| match e {
-                CoachEvent::SessionError { kind, reason } => Some((*kind, reason.clone())),
+                CoachEvent::AudioSessionError { kind, reason } => Some((*kind, reason.clone())),
                 _ => None,
             })
-            .expect("SessionError");
-        assert_eq!(kind, SessionErrorKind::DeviceUnavailable);
+            .expect("AudioSessionError");
+        assert_eq!(kind, AudioSessionErrorKind::DeviceUnavailable);
         // Capture must not have been opened for a stale id.
         assert_eq!(opens.load(Ordering::SeqCst), 0);
 
@@ -1109,7 +1112,7 @@ mod tests {
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
 
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         // Give the control plane a beat to (not) emit anything.
         thread::sleep(Duration::from_millis(50));
 
@@ -1117,7 +1120,7 @@ mod tests {
         coach.poll_events(&mut buf);
         let saw_state_change = buf
             .iter()
-            .any(|e| matches!(e, CoachEvent::SessionStateChanged { .. }));
+            .any(|e| matches!(e, CoachEvent::AudioSessionStateChanged { .. }));
         assert!(
             !saw_state_change,
             "Stop while Idle must not emit a state change"
@@ -1136,7 +1139,7 @@ mod tests {
         let coach = new(deps);
 
         // Cycle 1: Start → Running.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1146,8 +1149,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
@@ -1155,20 +1158,20 @@ mod tests {
         assert_eq!(opens.load(Ordering::SeqCst), 1);
 
         // Stop → Idle.
-        coach.send_command(Command::StopSession);
+        coach.send_command(Command::AudioStopSession);
         let _ = poll_until(&coach, |evs| {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Idle
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
                     }
                 )
             })
         });
 
         // Cycle 2: Start again — must reopen capture and reach Running.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1178,22 +1181,22 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
         });
-        let states: Vec<SessionState> = after
+        let states: Vec<AudioSessionState> = after
             .iter()
             .filter_map(|e| match e {
-                CoachEvent::SessionStateChanged { new_state } => Some(*new_state),
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
                 _ => None,
             })
             .collect();
         assert_eq!(
             states,
-            vec![SessionState::Starting, SessionState::Running],
+            vec![AudioSessionState::Starting, AudioSessionState::Running],
             "second Start must transition Idle → Starting → Running"
         );
         assert_eq!(
@@ -1227,7 +1230,7 @@ mod tests {
         );
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None, // would default to 48000 via preferred_sample_rate
             buffer_frames: None,
@@ -1238,8 +1241,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })
@@ -1289,7 +1292,7 @@ mod tests {
     }
 
     /// Test B: negotiate() returns Err(UnsupportedConfig). The session must
-    /// land in Error with SessionErrorKind::UnsupportedConfig and open() must
+    /// land in Error with AudioSessionErrorKind::UnsupportedConfig and open() must
     /// NEVER be called.
     #[test]
     fn negotiate_failure_lands_in_error_before_open() {
@@ -1301,7 +1304,7 @@ mod tests {
         );
         let coach = new(deps);
 
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1310,20 +1313,20 @@ mod tests {
 
         let events = poll_until(&coach, |evs| {
             evs.iter()
-                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
         });
 
         // Must have errored with UnsupportedConfig.
         let kind = events
             .iter()
             .find_map(|e| match e {
-                CoachEvent::SessionError { kind, .. } => Some(*kind),
+                CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
                 _ => None,
             })
-            .expect("SessionError must be emitted");
+            .expect("AudioSessionError must be emitted");
         assert_eq!(
             kind,
-            SessionErrorKind::UnsupportedConfig,
+            AudioSessionErrorKind::UnsupportedConfig,
             "negotiate failure must map to UnsupportedConfig"
         );
 
@@ -1331,8 +1334,8 @@ mod tests {
         let saw_error = events.iter().any(|e| {
             matches!(
                 e,
-                CoachEvent::SessionStateChanged {
-                    new_state: SessionState::Error
+                CoachEvent::AudioSessionStateChanged {
+                    new_state: AudioSessionState::Error
                 }
             )
         });
@@ -1364,7 +1367,7 @@ mod tests {
         let coach = new(deps);
 
         // Reach Running so there's actual state to tear down.
-        coach.send_command(Command::StartSession(AudioConfig {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
             device_id: None,
             sample_rate: None,
             buffer_frames: None,
@@ -1374,8 +1377,8 @@ mod tests {
             evs.iter().any(|e| {
                 matches!(
                     e,
-                    CoachEvent::SessionStateChanged {
-                        new_state: SessionState::Running
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
                     }
                 )
             })

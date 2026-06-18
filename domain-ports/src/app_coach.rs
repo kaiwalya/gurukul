@@ -65,28 +65,28 @@ pub struct AppCoachDeps {
 /// command is enqueued and processed by the coach's control plane;
 /// the resulting state change surfaces as a [`CoachEvent`].
 ///
-/// Commands in unexpected states (e.g. [`Command::StartSession`] while
+/// Commands in unexpected states (e.g. [`Command::AudioStartSession`] while
 /// already running) are silent no-ops — the coach logs at `Debug`
 /// level via telemetry and discards. Heads do not need to track which
 /// commands are legal in which states.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
     /// Enumerate input devices. The coach replies with
-    /// [`CoachEvent::DevicesListed`].
-    ListDevices,
+    /// [`CoachEvent::AudioDevicesListed`].
+    AudioListDevices,
 
     /// Enumerate the built-in scale shapes the coach can coach against.
-    /// The coach replies with [`CoachEvent::ScalesListed`].
+    /// The coach replies with [`CoachEvent::MusicScalesListed`].
     ///
     /// The response is a flat catalogue of [`ScaleIntervals`] — tooth
     /// patterns only, no names. Names are the deferred note-system axis
     /// (see `docs/MUSIC_MODEL.md`); the coach is vocabulary-free.
-    ListScales,
+    MusicListScales,
 
     /// Open the selected device and start a session.
     /// `Idle → Starting → Running` on success;
     /// `Idle → Starting → Error` on failure.
-    StartSession(AudioConfig),
+    AudioStartSession(AudioConfig),
 
     /// Tear down the current session.
     /// `Running → Stopping → Idle`.
@@ -94,7 +94,7 @@ pub enum Command {
     /// Issued while `Starting` (before the data plane has acked
     /// `CaptureStarted`): cancels the in-flight start and transitions
     /// `Starting → Stopping → Idle` with no spurious `Running` flash.
-    StopSession,
+    AudioStopSession,
 
     /// Set the *musical* frame of reference: the [`Scale`] the singer is
     /// in — a tooth pattern dropped onto a concrete tuning at a concrete
@@ -108,7 +108,7 @@ pub enum Command {
     /// split — the geometry layer folds both into `Scale`.
     ///
     /// **Decoupled from the audio lifecycle.** Valid in *any* state and
-    /// causes **no** [`SessionState`] change: the musical lifecycle
+    /// causes **no** [`AudioSessionState`] change: the musical lifecycle
     /// (configure) is independent of the audio lifecycle (start/stop).
     /// Reconfiguring mid-session just swaps the frame of reference.
     /// Heads may configure before, after, or without ever starting
@@ -116,11 +116,11 @@ pub enum Command {
     ///
     /// **Published as state.** Each configure updates the sticky
     /// [`MusicInfo`] snapshot ([`AppCoach::music_info`]) *and* emits a
-    /// [`CoachEvent::SessionConfigured`] carrying the new config — the
+    /// [`CoachEvent::MusicSessionConfigured`] carrying the new config — the
     /// snapshot/event pair of one transition (snapshot written first).
     /// A head can read current state via the snapshot or fold the event
     /// stream to reconstruct it; the two never drift.
-    ConfigureSession { scale: Scale },
+    MusicConfigureSession { scale: Scale },
 }
 
 /// Negotiated parameters of the currently-running session.
@@ -132,8 +132,8 @@ pub enum Command {
 ///
 /// **Lifecycle invariant:** [`AppCoach::audio_info`] returns
 /// `Some(_)` if and only if the most recent
-/// [`CoachEvent::SessionStateChanged`] reported
-/// [`SessionState::Running`]. It is `None` in `Idle`, `Starting`,
+/// [`CoachEvent::AudioSessionStateChanged`] reported
+/// [`AudioSessionState::Running`]. It is `None` in `Idle`, `Starting`,
 /// `Stopping`, and `Error` — including before the `Running` event has
 /// landed. The adapter publishes a fresh `AudioInfo` *before*
 /// emitting the `Running` transition and clears it *before* emitting
@@ -159,7 +159,7 @@ pub struct AudioInfo {
 /// What the host wants to capture from — the *audio* parameters of a
 /// session (device + stream format). Distinct from the *musical*
 /// configuration of a session (the [`Scale`]), which is carried by
-/// [`Command::ConfigureSession`] and is decoupled from the audio
+/// [`Command::MusicConfigureSession`] and is decoupled from the audio
 /// lifecycle.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioConfig {
@@ -167,8 +167,8 @@ pub struct AudioConfig {
     /// multimedia-role default input.
     ///
     /// Heads pass through a [`DeviceId`] they obtained from a prior
-    /// [`CoachEvent::DevicesListed`] or
-    /// [`CoachEvent::DefaultInputChanged`] — they cannot fabricate one.
+    /// [`CoachEvent::AudioDevicesListed`] or
+    /// [`CoachEvent::AudioDefaultInputChanged`] — they cannot fabricate one.
     pub device_id: Option<DeviceId>,
 
     /// `None` lets the coach pick (today: prefer 48000 if supported,
@@ -178,31 +178,31 @@ pub struct AudioConfig {
     /// `None` lets the adapter pick. Smaller values lower IO callback
     /// latency at the cost of more frequent wakeups; sizes outside the
     /// device's supported range surface as
-    /// [`CoachEvent::SessionError`] with
-    /// [`SessionErrorKind::UnsupportedConfig`].
+    /// [`CoachEvent::AudioSessionError`] with
+    /// [`AudioSessionErrorKind::UnsupportedConfig`].
     pub buffer_frames: Option<u32>,
 
     /// When `Some`, the engine records this session's input audio + per-hop
     /// features + manifest under this path prefix (the recorder appends
     /// `.wav` / `.features.jsonl` / `.manifest.json`).
     /// The HEAD owns naming and uniqueness — for repeated sessions in one
-    /// run it must supply a FRESH prefix each `StartSession`. `None`
+    /// run it must supply a FRESH prefix each `AudioStartSession`. `None`
     /// disables recording.
     pub session_label: Option<std::path::PathBuf>,
 }
 
 /// The coach's current *musical* frame of reference — the snapshot
-/// face of [`Command::ConfigureSession`]. Carries the configured
+/// face of [`Command::MusicConfigureSession`]. Carries the configured
 /// [`Scale`] directly.
 ///
 /// This is the materialized read-cache of the musical config: a head
 /// that just wants "what scale is the coach holding right now?" reads
 /// [`AppCoach::music_info`]; a head doing event-sourcing folds the
-/// [`CoachEvent::SessionConfigured`] stream to the same value. Both are
+/// [`CoachEvent::MusicSessionConfigured`] stream to the same value. Both are
 /// written in the same place (the configure handler), snapshot before
 /// event, so they cannot drift.
 ///
-/// **Lifecycle:** `None` only before the first `ConfigureSession`.
+/// **Lifecycle:** `None` only before the first `MusicConfigureSession`.
 /// Once set it is **sticky** — it persists across start/stop/error,
 /// because the musical configuration is decoupled from the audio
 /// lifecycle (unlike [`AudioInfo`], which clears on stop). Each
@@ -226,43 +226,43 @@ pub struct MusicInfo {
 /// bounded — see [`CoachEvent::EventsDropped`]).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CoachEvent {
-    /// Reply to [`Command::ListDevices`].
-    DevicesListed { devices: Vec<InputDevice> },
+    /// Reply to [`Command::AudioListDevices`].
+    AudioDevicesListed { devices: Vec<InputDevice> },
 
-    /// Reply to [`Command::ListScales`]. Carries the full built-in
+    /// Reply to [`Command::MusicListScales`]. Carries the full built-in
     /// catalogue of [`ScaleIntervals`] — tooth patterns only, no names.
     /// Names are the deferred note-system axis (see
     /// `docs/MUSIC_MODEL.md`); the catalogue here is vocabulary-free
     /// and stable across any note-system choice.
-    ScalesListed { shapes: Vec<ScaleIntervals> },
+    MusicScalesListed { shapes: Vec<ScaleIntervals> },
 
     /// The session state machine moved.
-    SessionStateChanged { new_state: SessionState },
+    AudioSessionStateChanged { new_state: AudioSessionState },
 
     /// The *musical* frame of reference was (re)configured via
-    /// [`Command::ConfigureSession`]. Carries the full new
+    /// [`Command::MusicConfigureSession`]. Carries the full new
     /// configuration so a head can update from the payload alone —
     /// this is the log entry whose fold reconstructs
     /// [`AppCoach::music_info`]. Emitted on *every* configure (not just
     /// the first), independent of the audio lifecycle.
-    SessionConfigured { scale: Scale },
+    MusicSessionConfigured { scale: Scale },
 
     /// Accompanies an `→ Error` transition with detail. `kind` lets
     /// heads branch / localize; `reason` is free-form for logs.
-    SessionError {
-        kind: SessionErrorKind,
+    AudioSessionError {
+        kind: AudioSessionErrorKind,
         reason: String,
     },
 
     /// The OS-default input device changed (hotplug, user pref).
     /// Unsolicited; the host did not trigger it. Payload is the new
-    /// default id; heads re-issue [`Command::ListDevices`] if they
+    /// default id; heads re-issue [`Command::AudioListDevices`] if they
     /// need the full updated list.
     ///
     /// **v1 note:** no device-listener port exists yet, so the coach
     /// never emits this in v1. The variant exists so heads can match
     /// exhaustively today and the Phase-2 emitter is non-breaking.
-    DefaultInputChanged { new_default: Option<DeviceId> },
+    AudioDefaultInputChanged { new_default: Option<DeviceId> },
 
     /// The outbound queue overflowed and the coach dropped events.
     /// Surfaced as a single event per drop-burst (not one per dropped
@@ -273,24 +273,24 @@ pub enum CoachEvent {
 /// Where the session is in its lifecycle. Heads render UI off this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SessionState {
+pub enum AudioSessionState {
     Idle,
-    /// `StartSession` accepted; data plane round-trip in flight.
+    /// `AudioStartSession` accepted; data plane round-trip in flight.
     Starting,
     Running,
-    /// `StopSession` accepted; data plane teardown in flight.
+    /// `AudioStopSession` accepted; data plane teardown in flight.
     Stopping,
-    /// Terminal error state. Recoverable only via `StopSession` (→
-    /// `Idle`) followed by a new `StartSession`.
+    /// Terminal error state. Recoverable only via `AudioStopSession` (→
+    /// `Idle`) followed by a new `AudioStartSession`.
     Error,
 }
 
-/// Why the session entered [`SessionState::Error`]. Closed set so
+/// Why the session entered [`AudioSessionState::Error`]. Closed set so
 /// heads can match exhaustively; an accompanying `reason: String`
 /// carries adapter-specific detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SessionErrorKind {
+pub enum AudioSessionErrorKind {
     /// Device gone / refused open / requested id is stale.
     DeviceUnavailable,
     /// Rate / channels / buffer rejected by the device.
@@ -452,10 +452,10 @@ pub trait AppCoach {
     /// Negotiated parameters of the currently-running session, or
     /// `None` when no session is running.
     ///
-    /// Lifecycle: `Some(_)` iff state is [`SessionState::Running`].
+    /// Lifecycle: `Some(_)` iff state is [`AudioSessionState::Running`].
     /// `None` everywhere else (`Idle`, `Starting`, `Stopping`,
     /// `Error`). See [`AudioInfo`] for the ordering guarantees
-    /// against `CoachEvent::SessionStateChanged`.
+    /// against `CoachEvent::AudioSessionStateChanged`.
     ///
     /// Non-blocking, lock-free. Heads poll this whenever they need a
     /// sample-rate-dependent constant (scope window math, downsampling,
@@ -463,7 +463,7 @@ pub trait AppCoach {
     fn audio_info(&self) -> Option<AudioInfo>;
 
     /// The coach's current musical frame of reference (the [`Scale`]),
-    /// or `None` before the first [`Command::ConfigureSession`].
+    /// or `None` before the first [`Command::MusicConfigureSession`].
     ///
     /// Unlike [`audio_info`](Self::audio_info), this is **sticky**: it
     /// survives start/stop/error because the musical config is

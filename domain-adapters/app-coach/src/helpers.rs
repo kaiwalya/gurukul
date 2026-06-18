@@ -1,21 +1,21 @@
 //! Small helpers shared across the control plane: capture-error
-//! classification (port-level error → [`SessionErrorKind`]) and the
+//! classification (port-level error → [`AudioSessionErrorKind`]) and the
 //! default sample-rate picker.
 
-use domain_ports::app_coach::SessionErrorKind;
+use domain_ports::app_coach::AudioSessionErrorKind;
 use domain_ports::audio_capture::CaptureError;
 use domain_ports::audio_devices::SampleRateSupport;
 
-pub(crate) fn classify_open_error(e: CaptureError) -> (SessionErrorKind, String) {
+pub(crate) fn classify_open_error(e: CaptureError) -> (AudioSessionErrorKind, String) {
     match e {
-        CaptureError::InvalidHandle => (SessionErrorKind::DeviceUnavailable, e.to_string()),
+        CaptureError::InvalidHandle => (AudioSessionErrorKind::DeviceUnavailable, e.to_string()),
         CaptureError::DeviceUnavailable { .. } => {
-            (SessionErrorKind::DeviceUnavailable, e.to_string())
+            (AudioSessionErrorKind::DeviceUnavailable, e.to_string())
         }
         CaptureError::UnsupportedConfig { .. } => {
-            (SessionErrorKind::UnsupportedConfig, e.to_string())
+            (AudioSessionErrorKind::UnsupportedConfig, e.to_string())
         }
-        CaptureError::Other(_) => (SessionErrorKind::Other, e.to_string()),
+        CaptureError::Other(_) => (AudioSessionErrorKind::Other, e.to_string()),
     }
 }
 

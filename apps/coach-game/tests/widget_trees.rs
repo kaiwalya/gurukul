@@ -35,7 +35,7 @@ fn publish_music(fake: &FakeCoach, info: MusicInfo) {
     state.music_info = Some(info);
     state
         .pending_events
-        .push(CoachEvent::SessionConfigured { scale: info.scale });
+        .push(CoachEvent::MusicSessionConfigured { scale: info.scale });
 }
 
 fn enter_in_game(app: &mut App) {
@@ -112,7 +112,7 @@ fn hud_repaints_on_reentry_with_unchanged_music() {
     app.update();
 
     // Leave InGame (despawns the HUD tree) and re-enter with the SAME music
-    // info — no SessionConfigured event, so MusicInfoRes is unchanged.
+    // info — no MusicSessionConfigured event, so MusicInfoRes is unchanged.
     app.world_mut()
         .resource_mut::<NextState<AppState>>()
         .set(AppState::MainMenu);
@@ -137,7 +137,7 @@ fn hud_repaints_on_reentry_with_unchanged_music() {
 // --- scale picker -----------------------------------------------------
 
 fn open_picker_with(app: &mut App, fake: &FakeCoach, shapes: Vec<ScaleIntervals>) {
-    // Press the HUD badge → handle_hud_click sends ListScales, opens picker.
+    // Press the HUD badge → handle_hud_click sends MusicListScales, opens picker.
     let badge = {
         let world = app.world_mut();
         world
@@ -153,7 +153,7 @@ fn open_picker_with(app: &mut App, fake: &FakeCoach, shapes: Vec<ScaleIntervals>
         .lock()
         .unwrap()
         .pending_events
-        .push(CoachEvent::ScalesListed { shapes });
+        .push(CoachEvent::MusicScalesListed { shapes });
     pump(app);
 }
 
@@ -186,7 +186,7 @@ fn scale_picker_opens_repopulates_and_closes() {
         .lock()
         .unwrap()
         .pending_events
-        .push(CoachEvent::ScalesListed {
+        .push(CoachEvent::MusicScalesListed {
             shapes: vec![ScaleIntervals::from_widths(&[2, 2, 1, 2, 2, 2, 1])],
         });
     app.update();

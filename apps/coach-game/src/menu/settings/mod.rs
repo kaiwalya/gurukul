@@ -75,7 +75,7 @@ pub fn on_enter(
 
     // Kick off a fresh enumeration. `KnownDevices` will be populated
     // within a frame or two by `coach::drain_events`.
-    coach.0.send_command(Command::ListDevices);
+    coach.0.send_command(Command::AudioListDevices);
 
     let root = commands
         .spawn((

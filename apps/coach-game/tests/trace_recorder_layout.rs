@@ -68,7 +68,7 @@ fn publish_music(fake: &FakeCoach, info: MusicInfo) {
     state.music_info = Some(info);
     state
         .pending_events
-        .push(CoachEvent::SessionConfigured { scale: info.scale });
+        .push(CoachEvent::MusicSessionConfigured { scale: info.scale });
 }
 
 fn read_records(root: &std::path::Path) -> Vec<Value> {

@@ -147,7 +147,7 @@ pub fn on_enter(
     // first means the reference is never momentarily absent while Running.
     coach
         .0
-        .send_command(Command::ConfigureSession { scale: tonality.0 });
+        .send_command(Command::MusicConfigureSession { scale: tonality.0 });
 
     // Build the audio-input recording prefix from the same stamp used for the
     // UX trace, so both artifacts share the same run identity.
@@ -164,12 +164,14 @@ pub fn on_enter(
         prefix
     });
 
-    coach.0.send_command(Command::StartSession(AudioConfig {
-        device_id: selected.0.clone(),
-        sample_rate: None,
-        buffer_frames: None,
-        session_label,
-    }));
+    coach
+        .0
+        .send_command(Command::AudioStartSession(AudioConfig {
+            device_id: selected.0.clone(),
+            sample_rate: None,
+            buffer_frames: None,
+            session_label,
+        }));
     // Whether we got here from MainMenu (Free Practice / Continue) or from
     // Paused (Resume), a session is now live and there's no separate
     // paused-session to keep around.
@@ -185,7 +187,7 @@ pub fn on_exit(
     mut grid: ResMut<crate::widgets::time_graph::TimeGraphGridSceneRes>,
     mut live: ResMut<crate::widgets::time_graph::TimeGraphLiveSceneRes>,
 ) {
-    coach.0.send_command(Command::StopSession);
+    coach.0.send_command(Command::AudioStopSession);
     last.0 = None;
     history.0.clear();
     projector.0.clear();

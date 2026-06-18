@@ -70,7 +70,7 @@ impl ReplayCoach {
     /// is cloned (the port keeps events move-only).
     pub fn load_frame(&self, read: CoachRead) {
         for ev in &read.events {
-            if let CoachEvent::SessionConfigured { scale } = ev {
+            if let CoachEvent::MusicSessionConfigured { scale } = ev {
                 *self.music.borrow_mut() = Some(MusicInfo { scale: *scale });
             }
         }

@@ -9,7 +9,7 @@
 
 use clap::{Parser, Subcommand};
 use domain_ports::app_coach::{
-    AppCoach, AppCoachDeps, AudioConfig, CoachEvent, Command, FeatureSnapshot, SessionState,
+    AppCoach, AppCoachDeps, AudioConfig, AudioSessionState, CoachEvent, Command, FeatureSnapshot,
     ShutdownResult,
 };
 use domain_ports::audio_devices::{DeviceId, InputDevice, SampleRateSupport};
@@ -84,7 +84,7 @@ fn build_coach() -> impl AppCoach {
 fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
     // Install a Ctrl-C handler before we open the mic. The handler
     // flips an atomic that the pitch loop polls — this keeps shutdown
-    // graceful (the loop falls out, we StopSession, then shutdown the
+    // graceful (the loop falls out, we AudioStopSession, then shutdown the
     // coach) instead of leaving an open cpal stream when the process
     // exits.
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -113,13 +113,13 @@ fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
         buffer_frames: None,
         session_label,
     };
-    coach.send_command(Command::StartSession(cfg));
+    coach.send_command(Command::AudioStartSession(cfg));
 
     let started = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
-        CoachEvent::SessionStateChanged {
-            new_state: SessionState::Running,
+        CoachEvent::AudioSessionStateChanged {
+            new_state: AudioSessionState::Running,
         } => Some(Ok(())),
-        CoachEvent::SessionError { kind, reason } => Some(Err((*kind, reason.clone()))),
+        CoachEvent::AudioSessionError { kind, reason } => Some(Err((*kind, reason.clone()))),
         _ => None,
     });
 
@@ -139,10 +139,10 @@ fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
 
     run_pitch_loop(&coach, duration_ms.map(Duration::from_millis), &interrupted);
 
-    coach.send_command(Command::StopSession);
+    coach.send_command(Command::AudioStopSession);
     let _ = wait_for(&coach, Duration::from_secs(2), |ev| match ev {
-        CoachEvent::SessionStateChanged {
-            new_state: SessionState::Idle,
+        CoachEvent::AudioSessionStateChanged {
+            new_state: AudioSessionState::Idle,
         } => Some(()),
         _ => None,
     });
@@ -152,21 +152,21 @@ fn run(duration_ms: Option<u64>, persistent_id: Option<String>) {
 
 fn list_devices() {
     let coach = build_coach();
-    coach.send_command(Command::ListDevices);
+    coach.send_command(Command::AudioListDevices);
 
     let devices = match wait_for(
         &coach,
         Duration::from_secs(2),
         |ev| -> Option<Vec<InputDevice>> {
             match ev {
-                CoachEvent::DevicesListed { devices } => Some(devices.clone()),
+                CoachEvent::AudioDevicesListed { devices } => Some(devices.clone()),
                 _ => None,
             }
         },
     ) {
         Some(d) => d,
         None => {
-            eprintln!("list-devices: timed out waiting for DevicesListed");
+            eprintln!("list-devices: timed out waiting for AudioDevicesListed");
             shutdown(&coach);
             return;
         }

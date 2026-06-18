@@ -47,7 +47,7 @@ fn enter_in_game(app: &mut App, fake: &common::FakeCoach) {
         let m = test_music();
         g.music_info = Some(m);
         g.pending_events
-            .push(CoachEvent::SessionConfigured { scale: m.scale });
+            .push(CoachEvent::MusicSessionConfigured { scale: m.scale });
     }
     app.world_mut()
         .spawn((Button, NewGameButton, Interaction::Pressed));

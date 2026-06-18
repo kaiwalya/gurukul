@@ -1,7 +1,7 @@
 //! The control plane: a single owned thread that drains [`Input`]s and
 //! owns the session state machine.
 //!
-//! Every mutation of [`SessionState`] happens on this thread — there is
+//! Every mutation of [`AudioSessionState`] happens on this thread — there is
 //! no `Mutex` around the state, no race, no ordering question. The
 //! [`Input`] enum unifies head commands (delivered via
 //! [`AppCoach::send_command`]) and (in Phase 2) internal acks from the
@@ -13,8 +13,8 @@ use crate::inspect::InspectShared;
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
-    AppCoachDeps, AudioConfig, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo,
-    SessionErrorKind, SessionState,
+    AppCoachDeps, AudioConfig, AudioInfo, AudioSessionErrorKind, AudioSessionState, CoachEvent,
+    Command, FeatureSnapshot, MusicInfo,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{DeviceId, InputStream};
@@ -52,14 +52,14 @@ pub(crate) struct ControlPlane {
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     /// Holds the negotiated `AudioInfo` while a session is `Running`,
     /// `None` otherwise. The control plane writes it *before* emitting
-    /// `SessionStateChanged(Running)` and clears it *before* emitting
+    /// `AudioSessionStateChanged(Running)` and clears it *before* emitting
     /// the next transition out, so a head reacting to the state event
     /// observes coherent info.
     audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
-    /// The sticky snapshot face of [`Command::ConfigureSession`]: the
+    /// The sticky snapshot face of [`Command::MusicConfigureSession`]: the
     /// current [`MusicInfo`] (tuning spec + tonality), `None` until the
     /// first configure. Written *before* emitting
-    /// [`CoachEvent::SessionConfigured`] so a head reacting to the event
+    /// [`CoachEvent::MusicSessionConfigured`] so a head reacting to the event
     /// reads coherent state. Never cleared by start/stop — the musical
     /// config is decoupled from the audio lifecycle.
     music_info_publisher: Arc<ArcSwap<Option<MusicInfo>>>,
@@ -68,9 +68,9 @@ pub(crate) struct ControlPlane {
     /// Cloned and handed to each new data-plane worker.
     inspect: Arc<InspectShared>,
 
-    state: SessionState,
+    state: AudioSessionState,
     /// The musical frame of reference — the [`Scale`] the singer is in —
-    /// set by [`Command::ConfigureSession`]. `None` until the head first
+    /// set by [`Command::MusicConfigureSession`]. `None` until the head first
     /// configures. Decoupled from the audio lifecycle: it is *not*
     /// cleared by start/stop, only by shutdown. The data plane does not
     /// consume it yet (pitch *scoring* against the scale is a later
@@ -108,7 +108,7 @@ impl ControlPlane {
             audio_info_publisher,
             music_info_publisher,
             inspect,
-            state: SessionState::Idle,
+            state: AudioSessionState::Idle,
             session_model: None,
             capture: None,
             data_plane: None,
@@ -167,11 +167,11 @@ impl ControlPlane {
     fn apply(&mut self, input: Input) {
         match input {
             Input::Quit => { /* handled in run() */ }
-            Input::FromHead(Command::ListDevices) => self.do_list_devices(),
-            Input::FromHead(Command::ListScales) => self.do_list_scales(),
-            Input::FromHead(Command::StartSession(cfg)) => self.do_start_session(cfg),
-            Input::FromHead(Command::StopSession) => self.do_stop_session(),
-            Input::FromHead(Command::ConfigureSession { scale }) => {
+            Input::FromHead(Command::AudioListDevices) => self.do_list_devices(),
+            Input::FromHead(Command::MusicListScales) => self.do_list_scales(),
+            Input::FromHead(Command::AudioStartSession(cfg)) => self.do_start_session(cfg),
+            Input::FromHead(Command::AudioStopSession) => self.do_stop_session(),
+            Input::FromHead(Command::MusicConfigureSession { scale }) => {
                 self.do_configure_session(scale)
             }
         }
@@ -179,34 +179,34 @@ impl ControlPlane {
 
     fn do_list_devices(&mut self) {
         let devices = self.deps.audio_devices.list_devices();
-        self.push_event(CoachEvent::DevicesListed { devices });
+        self.push_event(CoachEvent::AudioDevicesListed { devices });
     }
 
     fn do_list_scales(&mut self) {
-        self.push_event(CoachEvent::ScalesListed {
+        self.push_event(CoachEvent::MusicScalesListed {
             shapes: scales_for(self.session_model.as_ref().map(|s| s.tuning().len())),
         });
     }
 
     fn do_start_session(&mut self, cfg: AudioConfig) {
-        if self.state != SessionState::Idle {
+        if self.state != AudioSessionState::Idle {
             tel_debug!(
                 &*self.deps.telemetry,
-                "app-coach: StartSession ignored (state not Idle)",
+                "app-coach: AudioStartSession ignored (state not Idle)",
                 state = format!("{:?}", self.state),
             );
             return;
         }
 
         // → Starting
-        self.transition(SessionState::Starting);
+        self.transition(AudioSessionState::Starting);
 
         // Pick the stream for the requested device id.
         let stream_info = match self.resolve_stream(cfg.device_id.as_ref()) {
             Some(s) => s,
             None => {
                 self.fail(
-                    SessionErrorKind::DeviceUnavailable,
+                    AudioSessionErrorKind::DeviceUnavailable,
                     "no matching device".to_string(),
                 );
                 return;
@@ -258,7 +258,7 @@ impl ControlPlane {
         ) {
             Ok(t) => t,
             Err(e) => {
-                self.fail(SessionErrorKind::Other, e.to_string());
+                self.fail(AudioSessionErrorKind::Other, e.to_string());
                 return;
             }
         };
@@ -295,7 +295,7 @@ impl ControlPlane {
                     device_id: cfg.device_id.clone(),
                     buffer_frames: negotiated_cfg.buffer_frames,
                 })));
-                self.transition(SessionState::Running);
+                self.transition(AudioSessionState::Running);
             }
             Err(e) => {
                 // Capture refused. The data plane is still spinning
@@ -311,7 +311,7 @@ impl ControlPlane {
 
     fn do_stop_session(&mut self) {
         match self.state {
-            SessionState::Running | SessionState::Starting => {
+            AudioSessionState::Running | AudioSessionState::Starting => {
                 // Both "stop a running capture" and "cancel an
                 // in-flight Starting" land here. In v1 Start is
                 // synchronous on the control thread, so we never
@@ -322,19 +322,19 @@ impl ControlPlane {
                 // Clear audio_info *before* the transition so a head
                 // reacting to Stopping observes `None`, not stale info.
                 self.audio_info_publisher.store(Arc::new(None));
-                self.transition(SessionState::Stopping);
+                self.transition(AudioSessionState::Stopping);
                 self.teardown_data_path();
-                self.transition(SessionState::Idle);
+                self.transition(AudioSessionState::Idle);
             }
-            SessionState::Error => {
+            AudioSessionState::Error => {
                 // Idempotent cleanup.
                 self.teardown_data_path();
-                self.transition(SessionState::Idle);
+                self.transition(AudioSessionState::Idle);
             }
-            SessionState::Idle | SessionState::Stopping => {
+            AudioSessionState::Idle | AudioSessionState::Stopping => {
                 tel_debug!(
                     &*self.deps.telemetry,
-                    "app-coach: StopSession ignored (state already terminal)",
+                    "app-coach: AudioStopSession ignored (state already terminal)",
                     state = format!("{:?}", self.state),
                 );
             }
@@ -342,7 +342,7 @@ impl ControlPlane {
     }
 
     /// Set the musical frame of reference: hold the [`Scale`] the head
-    /// configured. Valid in any state; no [`SessionState`] change — the
+    /// configured. Valid in any state; no [`AudioSessionState`] change — the
     /// musical lifecycle is decoupled from the audio one.
     ///
     /// The `Scale` arrives already placed (the head resolved both motions
@@ -368,10 +368,10 @@ impl ControlPlane {
         );
         self.session_model = Some(scale);
         // Publish the snapshot *before* the event so a head reacting to
-        // `SessionConfigured` reads a coherent `music_info()`.
+        // `MusicSessionConfigured` reads a coherent `music_info()`.
         self.music_info_publisher
             .store(Arc::new(Some(MusicInfo { scale })));
-        self.push_event(CoachEvent::SessionConfigured { scale });
+        self.push_event(CoachEvent::MusicSessionConfigured { scale });
     }
 
     /// Drop the capture (stops RT callback, drops the ring producer),
@@ -394,14 +394,14 @@ impl ControlPlane {
         self.inspect.clear();
     }
 
-    fn fail(&mut self, kind: SessionErrorKind, reason: String) {
+    fn fail(&mut self, kind: AudioSessionErrorKind, reason: String) {
         // Always reachable from Starting (most common); also from
         // Running if a sync path ever invokes this.
         // Clear audio_info before the transition so a head reacting
         // to Error observes `None`. No-op when called from Starting.
         self.audio_info_publisher.store(Arc::new(None));
-        self.transition(SessionState::Error);
-        self.push_event(CoachEvent::SessionError {
+        self.transition(AudioSessionState::Error);
+        self.push_event(CoachEvent::AudioSessionError {
             kind,
             reason: reason.clone(),
         });
@@ -413,12 +413,12 @@ impl ControlPlane {
         );
     }
 
-    fn transition(&mut self, new_state: SessionState) {
+    fn transition(&mut self, new_state: AudioSessionState) {
         if self.state == new_state {
             return;
         }
         self.state = new_state;
-        self.push_event(CoachEvent::SessionStateChanged { new_state });
+        self.push_event(CoachEvent::AudioSessionStateChanged { new_state });
     }
 
     fn push_event(&self, ev: CoachEvent) {
@@ -491,7 +491,7 @@ impl ControlPlane {
 /// `n = None` — no configured tuning yet, so the coach can't know which
 /// octave division is active. Returns an empty `Vec` rather than guessing
 /// 12: honest absence is preferable to silently assuming a 12-slot world
-/// when the head has not yet sent `ConfigureSession`.
+/// when the head has not yet sent `MusicConfigureSession`.
 pub(crate) fn scales_for(n: Option<usize>) -> Vec<ScaleIntervals> {
     let Some(slot_count) = n else {
         return Vec::new();

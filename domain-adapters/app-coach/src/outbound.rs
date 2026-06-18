@@ -56,7 +56,7 @@ mod tests {
     use super::*;
 
     fn list_devices() -> CoachEvent {
-        CoachEvent::DevicesListed { devices: vec![] }
+        CoachEvent::AudioDevicesListed { devices: vec![] }
     }
 
     #[test]

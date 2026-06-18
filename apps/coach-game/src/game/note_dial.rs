@@ -127,7 +127,7 @@ pub fn handle_hub_capture(
         tonality.0 = new_scale;
         coach
             .0
-            .send_command(Command::ConfigureSession { scale: new_scale });
+            .send_command(Command::MusicConfigureSession { scale: new_scale });
         return;
     }
 }
