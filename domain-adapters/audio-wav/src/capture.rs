@@ -32,6 +32,52 @@ struct WavAudioCapture {
 }
 
 impl AudioCapture for WavAudioCapture {
+    /// Validate `requested` against the WAV header's single supported config.
+    ///
+    /// WAV has exactly one concrete format (the header's sample_rate and
+    /// channels). If the request matches, return that config with
+    /// `buffer_frames: None` (the feeder takes chunk geometry from `open`,
+    /// not a pre-known hardware buffer). If the request mismatches, or the
+    /// header is corrupt (zero rate/channels), return an error so the
+    /// control plane learns about the problem before any frames flow.
+    fn negotiate(
+        &self,
+        handle: &StreamHandle,
+        requested: &CaptureConfig,
+    ) -> Result<CaptureConfig, CaptureError> {
+        let wav_handle = handle
+            .0
+            .downcast_ref::<WavStreamHandle>()
+            .ok_or(CaptureError::InvalidHandle)?;
+
+        let spec = wav_handle.spec;
+
+        // A zero sample_rate or channel count means the WAV header is corrupt.
+        // open()'s feeder divides by sample_rate, so let this through is UB.
+        if spec.sample_rate == 0 || spec.channels == 0 {
+            return Err(CaptureError::Other(
+                "WAV header has zero sample_rate/channels".into(),
+            ));
+        }
+
+        let header_config = CaptureConfig {
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            buffer_frames: None,
+        };
+
+        if requested.sample_rate == header_config.sample_rate
+            && requested.channels == header_config.channels
+        {
+            Ok(header_config)
+        } else {
+            Err(CaptureError::UnsupportedConfig {
+                wanted: requested.clone(),
+                actual: Some(header_config),
+            })
+        }
+    }
+
     fn open(
         &self,
         handle: StreamHandle,
@@ -44,61 +90,26 @@ impl AudioCapture for WavAudioCapture {
             .downcast_ref::<WavStreamHandle>()
             .ok_or(CaptureError::InvalidHandle)?;
 
-        // Step 2: validate cfg itself for obviously-bad values.
-        if cfg.sample_rate == 0 {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: "sample_rate must not be zero".into(),
-            });
-        }
-        if cfg.channels == 0 {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: "channels must not be zero".into(),
-            });
-        }
-        if cfg.buffer_frames == Some(0) {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: "buffer_frames must not be zero".into(),
-            });
-        }
-
-        // Step 2 (cont.): validate cfg against the WAV header.
+        // open() trusts the negotiated config (negotiate() already vetted
+        // it against the WAV header). The only check left is about the WAV
+        // *file*, not the config: the sample count must divide evenly by the
+        // channel count, else interleaving is undefined.
         let spec = wav_handle.spec;
-        if cfg.sample_rate != spec.sample_rate {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: format!(
-                    "CaptureConfig sample_rate {} does not match WAV sample_rate {}",
-                    cfg.sample_rate, spec.sample_rate
-                ),
-            });
-        }
-        if cfg.channels != spec.channels {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: format!(
-                    "CaptureConfig channels {} does not match WAV channels {}",
-                    cfg.channels, spec.channels
-                ),
-            });
-        }
-
-        // Step 3: read ALL samples from the WAV up front.
         let samples = read_wav_samples(&wav_handle.path, spec)?;
 
-        // Reject sample counts not divisible by the channel count.
         let channels = cfg.channels as usize;
-        if !samples.len().is_multiple_of(channels) {
-            return Err(CaptureError::UnsupportedConfig {
-                reason: format!(
-                    "WAV sample count {} is not divisible by channel count {}",
-                    samples.len(),
-                    channels
-                ),
-            });
+        if channels == 0 || !samples.len().is_multiple_of(channels) {
+            return Err(CaptureError::Other(format!(
+                "WAV sample count {} is not divisible by channel count {channels}",
+                samples.len(),
+            )));
         }
 
         // Step 4: compute chunk geometry from cfg (not the WAV header).
-        // The `None` default is a 10ms chunk; clamp to ≥1 frame so an absurdly
-        // low sample_rate (<100) can't yield a 0-frame chunk and panic in
-        // `chunks(0)`. `buffer_frames == Some(0)` was already rejected above.
+        // The `None` default is a 10ms chunk; the `.max(1)` clamp guards two
+        // cases: an absurdly low sample_rate (<100) yielding a 0-frame default
+        // chunk, and a caller-supplied `buffer_frames` of 0 — either way one
+        // frame minimum keeps `chunks(0)` from panicking.
         let chunk_frames = cfg
             .buffer_frames
             .map(|f| f as usize)
@@ -222,12 +233,10 @@ fn read_wav_samples(
             // value >32 can't be represented. hound would eventually error on
             // an out-of-range read, but validating here gives a clear message.
             if !(1..=32).contains(&spec.bits_per_sample) {
-                return Err(CaptureError::UnsupportedConfig {
-                    reason: format!(
-                        "unsupported integer bit depth {}; expected 1..=32",
-                        spec.bits_per_sample
-                    ),
-                });
+                return Err(CaptureError::Other(format!(
+                    "unsupported integer bit depth {}; expected 1..=32",
+                    spec.bits_per_sample
+                )));
             }
             let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
             reader
@@ -358,22 +367,54 @@ mod tests {
         let clock = Arc::new(TestClock::default());
         let devs = devices::new(path);
         let stream = devs.default_input().unwrap();
+        // Keep handle live for the borrow; negotiate takes &StreamHandle.
         let handle = stream.handle.clone();
 
         let capture = new(clock as Arc<dyn Clock>);
 
-        // Wrong sample rate
-        let cfg = domain_ports::audio_capture::CaptureConfig {
+        // Mismatched sample rate: negotiate() owns format-mismatch detection.
+        // It must return Err(UnsupportedConfig) with the header as `actual`.
+        let mismatched_cfg = domain_ports::audio_capture::CaptureConfig {
             sample_rate: 44100, // WAV is 48000
             channels: 1,
             buffer_frames: Some(441),
         };
+        let result = capture.negotiate(&handle, &mismatched_cfg);
+        match result {
+            Err(CaptureError::UnsupportedConfig { wanted, actual }) => {
+                assert_eq!(
+                    wanted.sample_rate, 44100,
+                    "wanted must be the requested rate"
+                );
+                let actual =
+                    actual.expect("WAV has a concrete single config — actual must be Some");
+                assert_eq!(
+                    actual.sample_rate, 48000,
+                    "actual must be the WAV header rate"
+                );
+                assert_eq!(actual.channels, 1, "actual must be the WAV header channels");
+            }
+            other => panic!("expected UnsupportedConfig, got {other:?}"),
+        }
 
-        let result = capture.open(handle, cfg, Box::new(|_| {}));
-        assert!(matches!(
-            result,
-            Err(CaptureError::UnsupportedConfig { .. })
-        ));
+        // Matching request: negotiate() must succeed and return the header config.
+        let matching_cfg = domain_ports::audio_capture::CaptureConfig {
+            sample_rate: 48000,
+            channels: 1,
+            buffer_frames: Some(480),
+        };
+        let negotiated = capture
+            .negotiate(&handle, &matching_cfg)
+            .expect("matching request must succeed");
+        assert_eq!(
+            negotiated.sample_rate, 48000,
+            "negotiated rate must match header"
+        );
+        assert_eq!(
+            negotiated.channels, 1,
+            "negotiated channels must match header"
+        );
+        assert_eq!(negotiated.buffer_frames, None, "WAV has no hardware buffer");
     }
 
     /// Write a 16-bit integer-PCM mono WAV with the given raw sample values.

@@ -35,6 +35,76 @@ struct CpalAudioCapture {
 }
 
 impl AudioCapture for CpalAudioCapture {
+    fn negotiate(
+        &self,
+        handle: &StreamHandle,
+        requested: &CaptureConfig,
+    ) -> Result<CaptureConfig, CaptureError> {
+        let cpal_handle = handle
+            .0
+            .downcast_ref::<CpalStreamHandle>()
+            .ok_or(CaptureError::InvalidHandle)?;
+
+        // Re-query the device's supported input configs. Match against the
+        // requested channel count and check whether the requested sample rate
+        // falls in any supported range.
+        let configs = cpal_handle.device.supported_input_configs().map_err(|e| {
+            CaptureError::DeviceUnavailable {
+                reason: format!("supported_input_configs: {e}"),
+            }
+        })?;
+
+        // Walk ALL configs matching the requested channel count. For each one
+        // whose sample-rate range covers the request, check whether the buffer
+        // range (when known) also covers the requested buffer. A config with
+        // SupportedBufferSize::Unknown defers buffer validation to open() and
+        // still counts as a match.
+        //
+        // Do NOT stop on the first rate match whose buffer is out-of-range — a
+        // later config entry (same channels, same rate range) might have Unknown
+        // or a wider buffer range. Only after exhausting all channel-matching
+        // configs without any full match is UnsupportedConfig returned.
+        //
+        // The device exposes ranges, not single configs, so a mismatch has no
+        // single `actual` CaptureConfig to report — `actual: None` is the
+        // honest answer here.
+        for cfg in configs {
+            if cfg.channels() != requested.channels {
+                continue;
+            }
+            let lo = cfg.min_sample_rate();
+            let hi = cfg.max_sample_rate();
+            if !(lo..=hi).contains(&requested.sample_rate) {
+                continue;
+            }
+            // Rate range matches. Check the buffer constraint.
+            if let Some(n) = requested.buffer_frames {
+                if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
+                    if n < *min || n > *max {
+                        // This config's buffer range excludes the request; keep
+                        // scanning — another config may accept it.
+                        continue;
+                    }
+                }
+                // SupportedBufferSize::Unknown: defer validation to open().
+            }
+            return Ok(CaptureConfig {
+                sample_rate: requested.sample_rate,
+                channels: requested.channels,
+                buffer_frames: requested.buffer_frames,
+            });
+        }
+
+        // No supported config matched the requested channels + rate + buffer.
+        // This also covers the generic-ProbeOnly case: an empty supported-config
+        // list produces no iterations and falls through to this rejection
+        // (real ProbeOnly/iOS handling is step 1.6.1b).
+        Err(CaptureError::UnsupportedConfig {
+            wanted: requested.clone(),
+            actual: None,
+        })
+    }
+
     fn open(
         &self,
         handle: StreamHandle,
@@ -78,8 +148,19 @@ impl AudioCapture for CpalAudioCapture {
                 },
                 None,
             )
-            .map_err(|e| CaptureError::UnsupportedConfig {
-                reason: format!("build_input_stream: {e}"),
+            .map_err(|e| match e {
+                // The format itself is unsupported — this is the SupportedBufferSize::
+                // Unknown fallback negotiate() deferred to us. Report it as a format
+                // mismatch, not a device error.
+                cpal::BuildStreamError::StreamConfigNotSupported => {
+                    CaptureError::UnsupportedConfig {
+                        wanted: cfg.clone(),
+                        actual: None,
+                    }
+                }
+                _ => CaptureError::DeviceUnavailable {
+                    reason: format!("build_input_stream: {e}"),
+                },
             })?;
 
         stream.play().map_err(|e| CaptureError::DeviceUnavailable {

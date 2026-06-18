@@ -149,8 +149,11 @@ pub struct AudioInfo {
     /// The device the session is reading from. `None` when the session
     /// opened the OS default and no persistent id is available.
     pub device_id: Option<DeviceId>,
-    /// Negotiated capture buffer size, in frames.
-    pub buffer_frames: u32,
+    /// Negotiated capture buffer size, in frames. `None` when the
+    /// adapter cannot know the actual buffer size before frames
+    /// arrive (e.g. cpal with `BufferSize::Default`). Heads that
+    /// need a concrete value must wait for the first callback.
+    pub buffer_frames: Option<u32>,
 }
 
 /// What the host wants to capture from — the *audio* parameters of a

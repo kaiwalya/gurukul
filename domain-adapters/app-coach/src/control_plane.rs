@@ -219,18 +219,35 @@ impl ControlPlane {
         let channels = stream_info.channels;
         let buffer_frames = cfg.buffer_frames.or(Some(sample_rate / 100));
 
-        let capture_cfg = CaptureConfig {
+        let requested_cfg = CaptureConfig {
             sample_rate,
             channels,
             buffer_frames,
         };
 
+        // Negotiate the exact format before building the engine. A mismatch
+        // surfaces here as UnsupportedConfig — before any data plane is
+        // started, so there is nothing to clean up.
+        let negotiated_cfg = match self
+            .deps
+            .audio_capture
+            .negotiate(&stream_info.handle, &requested_cfg)
+        {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let (kind, reason) = classify_open_error(e);
+                self.fail(kind, reason);
+                return;
+            }
+        };
+
         // Spawn the data plane first so its ring producer is in hand
         // before cpal can fire the callback. If engine build / thread
         // spawn fails we surface as Other and skip opening the device.
+        // Build for the NEGOTIATED sample rate, not the requested guess.
         let startup = match DataPlane::start(
             DataPlaneDeps {
-                sample_rate,
+                sample_rate: negotiated_cfg.sample_rate,
                 feature_publisher: Arc::clone(&self.feature_publisher),
                 clock: Arc::clone(&self.deps.clock),
                 telemetry: Arc::clone(&self.deps.telemetry),
@@ -251,13 +268,13 @@ impl ControlPlane {
             samples_dropped: dropped_for_cb,
         } = startup;
 
-        let callback = self.build_frame_callback(channels, producer, dropped_for_cb);
+        let callback = self.build_frame_callback(negotiated_cfg.channels, producer, dropped_for_cb);
 
-        match self
-            .deps
-            .audio_capture
-            .open(stream_info.handle.clone(), capture_cfg, callback)
-        {
+        match self.deps.audio_capture.open(
+            stream_info.handle.clone(),
+            negotiated_cfg.clone(),
+            callback,
+        ) {
             Ok(session) => {
                 self.capture = Some(session);
                 self.data_plane = Some(data_plane);
@@ -265,18 +282,18 @@ impl ControlPlane {
                     &*self.deps.telemetry,
                     "app-coach: capture started",
                     device = stream_info.name.clone(),
-                    sample_rate = sample_rate,
-                    channels = channels as u32,
-                    buffer_frames = buffer_frames.unwrap_or(0),
+                    sample_rate = negotiated_cfg.sample_rate,
+                    channels = negotiated_cfg.channels as u32,
+                    buffer_frames = format!("{:?}", negotiated_cfg.buffer_frames),
                 );
                 // Publish negotiated session info *before* emitting the
                 // Running transition so any head reacting to the event
                 // sees Some(info) (not None or stale).
                 self.audio_info_publisher.store(Arc::new(Some(AudioInfo {
-                    sample_rate,
-                    channels,
+                    sample_rate: negotiated_cfg.sample_rate,
+                    channels: negotiated_cfg.channels,
                     device_id: cfg.device_id.clone(),
-                    buffer_frames: buffer_frames.unwrap_or(0),
+                    buffer_frames: negotiated_cfg.buffer_frames,
                 })));
                 self.transition(SessionState::Running);
             }

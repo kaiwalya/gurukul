@@ -337,6 +337,13 @@ mod tests {
     struct FakeCapture {
         opens: Arc<AtomicU32>,
         outcome: FakeOutcome,
+        /// What `negotiate()` returns. `PassThrough` means return the requested
+        /// config verbatim (normal path); `Return(cfg)` returns that config
+        /// (simulating a device that negotiates a different rate); `Fail` makes
+        /// negotiate fail.
+        negotiate_result: NegotiateResult,
+        /// Config passed to each `open()` call, in order.
+        opened_configs: Arc<Mutex<Vec<CaptureConfig>>>,
     }
 
     #[derive(Clone)]
@@ -346,13 +353,59 @@ mod tests {
         FailOnceThenOk,
     }
 
+    /// Injection point for `negotiate()` in tests.
+    #[derive(Clone)]
+    enum NegotiateResult {
+        /// Return the requested config verbatim (normal happy path).
+        PassThrough,
+        /// Return this specific config (simulates a device that negotiates
+        /// a different rate from what was requested).
+        Return(CaptureConfig),
+        /// Return this error (simulates a device that rejects the config).
+        Fail(u32, u16), // sample_rate and channels to use in the error
+    }
+
     impl AudioCapture for FakeCapture {
+        fn negotiate(
+            &self,
+            _handle: &StreamHandle,
+            requested: &CaptureConfig,
+        ) -> Result<CaptureConfig, CaptureError> {
+            match &self.negotiate_result {
+                NegotiateResult::PassThrough => Ok(CaptureConfig {
+                    sample_rate: requested.sample_rate,
+                    channels: requested.channels,
+                    buffer_frames: requested.buffer_frames,
+                }),
+                NegotiateResult::Return(cfg) => Ok(CaptureConfig {
+                    sample_rate: cfg.sample_rate,
+                    channels: cfg.channels,
+                    buffer_frames: cfg.buffer_frames,
+                }),
+                NegotiateResult::Fail(wanted_rate, wanted_channels) => {
+                    Err(CaptureError::UnsupportedConfig {
+                        wanted: CaptureConfig {
+                            sample_rate: *wanted_rate,
+                            channels: *wanted_channels,
+                            buffer_frames: None,
+                        },
+                        actual: None,
+                    })
+                }
+            }
+        }
+
         fn open(
             &self,
             _handle: StreamHandle,
-            _cfg: CaptureConfig,
+            cfg: CaptureConfig,
             _on_frame: CaptureCallback,
         ) -> Result<CaptureSession, CaptureError> {
+            self.opened_configs.lock().unwrap().push(CaptureConfig {
+                sample_rate: cfg.sample_rate,
+                channels: cfg.channels,
+                buffer_frames: cfg.buffer_frames,
+            });
             let open_index = self.opens.fetch_add(1, Ordering::SeqCst);
             match (&self.outcome, open_index) {
                 (FakeOutcome::Ok, _) | (FakeOutcome::FailOnceThenOk, 1..) => {
@@ -360,7 +413,8 @@ mod tests {
                 }
                 (FakeOutcome::FailUnsupported | FakeOutcome::FailOnceThenOk, _) => {
                     Err(CaptureError::UnsupportedConfig {
-                        reason: "test".into(),
+                        wanted: cfg,
+                        actual: None,
                     })
                 }
             }
@@ -373,6 +427,19 @@ mod tests {
         outcome: FakeOutcome,
         opens: Arc<AtomicU32>,
     ) -> (AppCoachDeps, Arc<TestTelemetry>) {
+        let (deps, tel, _) = deps_with_negotiate(outcome, opens, NegotiateResult::PassThrough);
+        (deps, tel)
+    }
+
+    fn deps_with_negotiate(
+        outcome: FakeOutcome,
+        opens: Arc<AtomicU32>,
+        negotiate_result: NegotiateResult,
+    ) -> (
+        AppCoachDeps,
+        Arc<TestTelemetry>,
+        Arc<Mutex<Vec<CaptureConfig>>>,
+    ) {
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
         let telemetry = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
 
@@ -392,7 +459,13 @@ mod tests {
             devices: vec![device],
             default: Some(stream),
         });
-        let capture_port: Arc<dyn AudioCapture> = Arc::new(FakeCapture { opens, outcome });
+        let opened_configs: Arc<Mutex<Vec<CaptureConfig>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture_port: Arc<dyn AudioCapture> = Arc::new(FakeCapture {
+            opens,
+            outcome,
+            negotiate_result,
+            opened_configs: Arc::clone(&opened_configs),
+        });
         (
             AppCoachDeps {
                 clock,
@@ -402,6 +475,7 @@ mod tests {
                 host_version: "test",
             },
             telemetry,
+            opened_configs,
         )
     }
 
@@ -1126,6 +1200,155 @@ mod tests {
             opens.load(Ordering::SeqCst),
             2,
             "capture must be reopened on the second Start"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// Test A: negotiate() returns a sample_rate DIFFERENT from what was
+    /// requested. The engine and AudioInfo must be built for the NEGOTIATED
+    /// rate, not the requested guess.
+    #[test]
+    fn negotiate_different_rate_engine_built_for_negotiated_rate() {
+        let opens = Arc::new(AtomicU32::new(0));
+        // The fake device says it will deliver 44100 instead of 48000.
+        let negotiated_cfg = CaptureConfig {
+            sample_rate: 44_100,
+            channels: 1,
+            buffer_frames: Some(441),
+        };
+        let (deps, _tel, opened_configs) = deps_with_negotiate(
+            FakeOutcome::Ok,
+            Arc::clone(&opens),
+            NegotiateResult::Return(negotiated_cfg),
+        );
+        let coach = new(deps);
+
+        coach.send_command(Command::StartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None, // would default to 48000 via preferred_sample_rate
+            buffer_frames: None,
+            session_label: None,
+        }));
+
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::SessionStateChanged {
+                        new_state: SessionState::Running
+                    }
+                )
+            })
+        });
+
+        // AudioInfo must reflect the NEGOTIATED rate and buffer, not the requested defaults.
+        let info = coach.audio_info().expect("Running should have AudioInfo");
+        assert_eq!(
+            info.sample_rate, 44_100,
+            "AudioInfo.sample_rate must be the negotiated rate"
+        );
+        assert_eq!(
+            info.buffer_frames,
+            Some(441),
+            "AudioInfo.buffer_frames must be the negotiated buffer_frames"
+        );
+
+        // open() must have been called with the NEGOTIATED config, not the requested defaults.
+        let configs = opened_configs.lock().unwrap();
+        assert_eq!(
+            configs.len(),
+            1,
+            "open() must have been called exactly once"
+        );
+        assert_eq!(
+            configs[0].sample_rate, 44_100,
+            "open() must receive the negotiated sample_rate"
+        );
+        assert_eq!(
+            configs[0].buffer_frames,
+            Some(441),
+            "open() must receive the negotiated buffer_frames"
+        );
+        assert_eq!(
+            configs[0].channels, 1,
+            "open() must receive the negotiated channels"
+        );
+        drop(configs);
+
+        // capture was opened exactly once.
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// Test B: negotiate() returns Err(UnsupportedConfig). The session must
+    /// land in Error with SessionErrorKind::UnsupportedConfig and open() must
+    /// NEVER be called.
+    #[test]
+    fn negotiate_failure_lands_in_error_before_open() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel, _opened_configs) = deps_with_negotiate(
+            FakeOutcome::Ok, // open() would succeed — but must never be called
+            Arc::clone(&opens),
+            NegotiateResult::Fail(48_000, 1),
+        );
+        let coach = new(deps);
+
+        coach.send_command(Command::StartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::SessionError { .. }))
+        });
+
+        // Must have errored with UnsupportedConfig.
+        let kind = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::SessionError { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("SessionError must be emitted");
+        assert_eq!(
+            kind,
+            SessionErrorKind::UnsupportedConfig,
+            "negotiate failure must map to UnsupportedConfig"
+        );
+
+        // State must be Error.
+        let saw_error = events.iter().any(|e| {
+            matches!(
+                e,
+                CoachEvent::SessionStateChanged {
+                    new_state: SessionState::Error
+                }
+            )
+        });
+        assert!(saw_error, "state must reach Error on negotiate failure");
+
+        // open() must never have been called — the error came before DataPlane::start.
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            0,
+            "open() must not be called when negotiate() fails"
+        );
+
+        // AudioInfo must be None (no session was opened).
+        assert!(
+            coach.audio_info().is_none(),
+            "audio_info must be None when negotiate() failed"
         );
 
         assert_eq!(

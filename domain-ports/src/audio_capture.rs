@@ -29,6 +29,15 @@
 //!
 //! # Lifecycle
 //!
+//! The normal flow is `negotiate() → open(verbatim)`:
+//!
+//! 1. Call [`AudioCapture::negotiate`] with the desired config to learn
+//!    the exact format the device will deliver. This must happen before
+//!    building the engine (so the engine is built for the right rate).
+//! 2. Pass the returned [`CaptureConfig`] verbatim to
+//!    [`AudioCapture::open`]. `open()` trusts the config it is given and
+//!    fails only on genuine runtime errors (device unplugged, busy).
+//!
 //! [`AudioCapture::open`] returns a [`CaptureSession`] guard. The
 //! stream stops when the session is dropped — there is no explicit
 //! `stop()`. This is intentional: forgetting to stop is a real bug
@@ -43,6 +52,7 @@ use crate::audio_devices::StreamHandle;
 /// callers should pick a value that's actually supported. If the
 /// stream is `ProbeOnly`, "validate" means "try the open and see
 /// what happens."
+#[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub sample_rate: u32,
     pub channels: u16,
@@ -80,7 +90,7 @@ pub struct CaptureFrame<'a> {
 /// buffer cursors) without interior mutability.
 pub type CaptureCallback = Box<dyn FnMut(CaptureFrame<'_>) + Send + 'static>;
 
-/// Failure modes for [`AudioCapture::open`].
+/// Failure modes for [`AudioCapture::open`] and [`AudioCapture::negotiate`].
 ///
 /// Closed set so callers can match exhaustively. `Other` is the
 /// escape valve for adapter-specific failures that don't deserve a
@@ -91,11 +101,13 @@ pub enum CaptureError {
     /// instance, or has been invalidated. Re-enumerate via
     /// [`AudioDevices::list_devices`](crate::audio_devices::AudioDevices::list_devices).
     InvalidHandle,
-    /// The stream cannot satisfy the requested
-    /// [`CaptureConfig`] (rate, channels). The reason is
-    /// adapter-defined but should be specific enough for a log line.
+    /// The stream cannot satisfy the requested [`CaptureConfig`].
+    /// `wanted` is the config that was requested; `actual` is the
+    /// config the device supports, or `None` when the device cannot
+    /// report what it supports (generic `ProbeOnly` stream).
     UnsupportedConfig {
-        reason: String,
+        wanted: CaptureConfig,
+        actual: Option<CaptureConfig>,
     },
     /// The device exists in enumeration but cannot be opened right
     /// now (busy, permission denied, just unplugged).
@@ -109,7 +121,21 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidHandle => write!(f, "invalid stream handle"),
-            Self::UnsupportedConfig { reason } => write!(f, "unsupported config: {reason}"),
+            Self::UnsupportedConfig { wanted, actual } => {
+                write!(
+                    f,
+                    "unsupported config: wanted sample_rate={} channels={} buffer_frames={:?}",
+                    wanted.sample_rate, wanted.channels, wanted.buffer_frames,
+                )?;
+                if let Some(a) = actual {
+                    write!(
+                        f,
+                        "; device supports sample_rate={} channels={} buffer_frames={:?}",
+                        a.sample_rate, a.channels, a.buffer_frames,
+                    )?;
+                }
+                Ok(())
+            }
             Self::DeviceUnavailable { reason } => write!(f, "device unavailable: {reason}"),
             Self::Other(s) => write!(f, "{s}"),
         }
@@ -152,9 +178,34 @@ impl Drop for CaptureSession {
 }
 
 pub trait AudioCapture: Send + Sync {
+    /// Preflight that learns the exact format the device will deliver,
+    /// **before** the engine is built.
+    ///
+    /// The control plane calls `negotiate` with the desired config,
+    /// receives the exact [`CaptureConfig`] the device will honour, builds
+    /// its engine for that rate, then passes the returned config verbatim
+    /// to `open`. This ensures the engine is sized correctly the first time
+    /// and that a format mismatch is detected before any frames flow.
+    ///
+    /// On a stream the adapter cannot characterise without actually opening
+    /// it (generic `ProbeOnly`), returns
+    /// `Err(UnsupportedConfig { wanted: requested.clone(), actual: None })`.
+    ///
+    /// On success the returned config represents the exact format `open`
+    /// will deliver; pass it verbatim.
+    fn negotiate(
+        &self,
+        handle: &StreamHandle,
+        requested: &CaptureConfig,
+    ) -> Result<CaptureConfig, CaptureError>;
+
     /// Open the stream identified by `handle` with the given
     /// `cfg`, delivering frames to `on_frame` until the returned
     /// [`CaptureSession`] is dropped.
+    ///
+    /// The control plane passes the config returned by [`negotiate`]
+    /// verbatim. `open` trusts it and fails only on genuine runtime errors
+    /// (device unplugged, busy) — format validation is `negotiate`'s job.
     fn open(
         &self,
         handle: StreamHandle,
