@@ -191,7 +191,10 @@ pub fn sync_confirm_modal(
     if !showing.0 {
         return;
     }
-    let root = commands
+    // `spawn_overlay_modal` is generic over a single marker type, so we
+    // can't mix ConfirmYesButton and ConfirmCancelButton in one call.
+    // Build the backdrop manually and spawn the two buttons as children.
+    let backdrop = commands
         .spawn((
             Name::new("quit_confirm"),
             ConfirmModalRoot,
@@ -209,7 +212,7 @@ pub fn sync_confirm_modal(
             BackgroundColor(COLOR_OVERLAY),
         ))
         .id();
-    commands.entity(root).with_children(|parent| {
+    commands.entity(backdrop).with_children(|parent| {
         parent.spawn((
             Text::new("Quit? Your session will end."),
             TextFont {
@@ -218,7 +221,7 @@ pub fn sync_confirm_modal(
             },
             TextColor(COLOR_TEXT),
             Node {
-                margin: UiRect::bottom(px(24)),
+                margin: UiRect::bottom(px(8)),
                 ..default()
             },
         ));

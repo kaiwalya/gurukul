@@ -174,3 +174,106 @@ pub fn on_scroll(
         scroll.propagate(false);
     }
 }
+
+/// Parameters for one button in an overlay modal.
+pub struct ModalButton<M: Component> {
+    pub label: &'static str,
+    pub marker: M,
+    pub disabled: bool,
+}
+
+/// Spawn a full-screen absolute overlay with a centred body column and a
+/// button row. Returns the Entity of the backdrop node so callers can
+/// parent it and attach their own markers.
+pub fn spawn_overlay_modal<M: Component>(
+    commands: &mut Commands,
+    headline: &str,
+    body_text: Option<&str>,
+    buttons: Vec<ModalButton<M>>,
+) -> Entity {
+    let backdrop = commands
+        .spawn((
+            Name::new("modal_backdrop"),
+            Node {
+                width: percent(100),
+                height: percent(100),
+                position_type: PositionType::Absolute,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: px(24),
+                ..default()
+            },
+            BackgroundColor(COLOR_OVERLAY),
+        ))
+        .id();
+
+    commands.entity(backdrop).with_children(|parent| {
+        parent.spawn((
+            Text::new(headline.to_string()),
+            TextFont {
+                font_size: FONT_HEADER,
+                ..default()
+            },
+            TextColor(COLOR_TEXT),
+            Node {
+                margin: UiRect::bottom(px(8)),
+                ..default()
+            },
+        ));
+        if let Some(body) = body_text {
+            parent.spawn((
+                Text::new(body.to_string()),
+                TextFont {
+                    font_size: FONT_BODY,
+                    ..default()
+                },
+                TextColor(COLOR_TEXT_DIM),
+                Node {
+                    margin: UiRect::bottom(px(16)),
+                    ..default()
+                },
+            ));
+        }
+        parent
+            .spawn((Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: px(16),
+                ..default()
+            },))
+            .with_children(|row| {
+                for btn_spec in buttons {
+                    let (bg, text_color) = if btn_spec.disabled {
+                        (COLOR_BUTTON_DISABLED, COLOR_TEXT_DIM)
+                    } else {
+                        (COLOR_BUTTON, COLOR_TEXT)
+                    };
+                    let mut btn = row.spawn((
+                        Button,
+                        btn_spec.marker,
+                        Node {
+                            width: px(200),
+                            height: px(56),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(bg),
+                    ));
+                    if btn_spec.disabled {
+                        btn.insert(ButtonDisabled);
+                    }
+                    btn.with_child((
+                        Text::new(btn_spec.label),
+                        TextFont {
+                            font_size: FONT_BUTTON,
+                            ..default()
+                        },
+                        TextColor(text_color),
+                    ));
+                }
+            });
+    });
+
+    backdrop
+}

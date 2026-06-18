@@ -42,6 +42,7 @@ pub mod widgets;
 
 use bevy::prelude::*;
 use bevy::ui::UiSystems;
+use menu::permission::{MicStatus, PermissionPrompt};
 use state::{
     AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, ResumeLocked,
     SelectedDevice, SongTonality,
@@ -60,6 +61,8 @@ pub fn build_app(app: &mut App) {
         .init_resource::<KnownScales>()
         .init_resource::<HasPausedSession>()
         .init_resource::<ResumeLocked>()
+        .init_resource::<PermissionPrompt>()
+        .init_resource::<MicStatus>()
         .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
@@ -77,12 +80,16 @@ pub fn build_app(app: &mut App) {
         .init_resource::<widgets::time_graph::scene::TimeGraphGridSceneRes>()
         .init_resource::<widgets::time_graph::scene::TimeGraphLiveSceneRes>()
         .init_resource::<widgets::hud::scene::HudSceneRes>()
+        // Register AppLifecycle so `query_on_foreground` works in headless tests
+        // (MinimalPlugins skips WindowPlugin which normally adds it).
+        .add_message::<bevy::window::AppLifecycle>()
         // Always-on
         .add_observer(ui::on_scroll)
         .add_systems(
             Update,
             (
                 coach::drain_events,
+                coach::query_on_foreground,
                 ui::update_button_colors,
                 ui::send_scroll_events,
                 // Order: rebuild_slots spawns slot children; apply_state
@@ -101,13 +108,24 @@ pub fn build_app(app: &mut App) {
         // the same frame the runner is about to exit on.
         .add_systems(Last, coach::shutdown_on_exit)
         // MainMenu
-        .add_systems(OnEnter(AppState::MainMenu), menu::main_menu::spawn)
+        .add_systems(
+            OnEnter(AppState::MainMenu),
+            (menu::main_menu::spawn, send_boot_permission_query),
+        )
         .add_systems(
             Update,
             (
                 menu::main_menu::handle_new_game,
                 menu::main_menu::handle_settings,
                 menu::main_menu::handle_quit,
+                (
+                    menu::main_menu::advance_checking_hardware,
+                    menu::permission::sync_permission_modal,
+                    menu::permission::handle_allow_mic,
+                    menu::permission::handle_open_settings,
+                    menu::permission::handle_permission_cancel,
+                )
+                    .after(coach::drain_events),
             )
                 .run_if(in_state(AppState::MainMenu)),
         )
@@ -209,4 +227,10 @@ pub fn build_app(app: &mut App) {
             )
                 .run_if(in_state(AppState::Paused)),
         );
+}
+
+fn send_boot_permission_query(coach: NonSend<coach::Coach>) {
+    coach
+        .0
+        .send_command(domain_ports::app_coach::Command::AudioPermissionQuery);
 }

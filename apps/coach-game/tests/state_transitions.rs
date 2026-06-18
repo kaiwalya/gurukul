@@ -55,9 +55,14 @@ fn new_game_transitions_to_in_game_and_starts_session() {
 
     assert_eq!(current_state(&app), AppState::InGame);
     let cmds = drain_commands(&fake);
+    // AudioListDevices is now sent by handle_new_game before transitioning; skip it.
+    let session_cmds: Vec<_> = cmds
+        .iter()
+        .filter(|c| !matches!(c, Command::AudioListDevices | Command::AudioPermissionQuery))
+        .collect();
     assert!(
         matches!(
-            cmds.as_slice(),
+            session_cmds.as_slice(),
             [
                 Command::MusicConfigureSession { .. },
                 Command::AudioStartSession(_)
@@ -81,7 +86,12 @@ fn start_session_uses_selected_device_id() {
     pump(&mut app);
 
     let cmds = drain_commands(&fake);
-    match cmds.as_slice() {
+    // AudioListDevices is now sent by handle_new_game before transitioning; skip it.
+    let session_cmds: Vec<_> = cmds
+        .iter()
+        .filter(|c| !matches!(c, Command::AudioListDevices | Command::AudioPermissionQuery))
+        .collect();
+    match session_cmds.as_slice() {
         [Command::MusicConfigureSession { .. }, Command::AudioStartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(id));
         }
@@ -190,8 +200,13 @@ fn exiting_in_game_stops_session() {
     pump(&mut app);
 
     let cmds = drain_commands(&fake);
+    // OnEnter(MainMenu) fires send_boot_permission_query — filter it out.
+    let stop_cmds: Vec<_> = cmds
+        .iter()
+        .filter(|c| !matches!(c, Command::AudioPermissionQuery))
+        .collect();
     assert!(
-        matches!(cmds.as_slice(), [Command::AudioStopSession]),
+        matches!(stop_cmds.as_slice(), [Command::AudioStopSession]),
         "expected exactly one StopSession after exiting InGame, got {} commands",
         cmds.len()
     );
@@ -527,7 +542,12 @@ fn full_device_selection_flow_carries_to_start_session() {
     assert_eq!(current_state(&app), AppState::InGame);
 
     let cmds = drain_commands(&fake);
-    match cmds.as_slice() {
+    // AudioListDevices is now sent by handle_new_game before transitioning; skip it.
+    let session_cmds: Vec<_> = cmds
+        .iter()
+        .filter(|c| !matches!(c, Command::AudioListDevices | Command::AudioPermissionQuery))
+        .collect();
+    match session_cmds.as_slice() {
         [Command::MusicConfigureSession { .. }, Command::AudioStartSession(cfg)] => {
             assert_eq!(cfg.device_id, Some(airpods_id));
         }

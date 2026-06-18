@@ -31,9 +31,11 @@ use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window, WindowResolution};
 use coach_game::coach::Coach;
 use coach_game::menu::main_menu::NewGameButton;
+use coach_game::menu::permission::MicStatus;
 use coach_game::state::AppState;
 use coach_game::trace::replay::{self, load};
 use common::FakeCoach;
+use domain_ports::audio_driver::AudioInitStatus;
 
 /// The scale factor this harness runs at. Physical = logical × `SCALE`. The
 /// window override, camera `RenderTargetInfo`, and the button-centre conversion
@@ -164,6 +166,8 @@ fn replayed_click_fires_picking_and_transitions_to_ingame() {
         .world_mut()
         .insert_non_send_resource(Coach(Box::new(FakeCoach::default())));
     coach_game::build_app(&mut probe);
+    // Pre-grant mic so the button press reaches InGame without a permission modal.
+    probe.world_mut().resource_mut::<MicStatus>().0 = AudioInitStatus::Granted;
     pump_settled(&mut probe);
     assert_eq!(
         *probe.world().resource::<State<AppState>>().get(),
@@ -179,6 +183,8 @@ fn replayed_click_fires_picking_and_transitions_to_ingame() {
     let trace = click_trace(/* frames */ 10, /* click_frame */ 6, center);
     replay::install(&mut app, trace, /* hold */ true);
     coach_game::build_app(&mut app);
+    // Pre-grant mic so the button press reaches InGame without a permission modal.
+    app.world_mut().resource_mut::<MicStatus>().0 = AudioInitStatus::Granted;
 
     // Settle a few frames so the menu (and so the button) is spawned before we
     // attach the observer. The driver serves one recorded frame per update, so

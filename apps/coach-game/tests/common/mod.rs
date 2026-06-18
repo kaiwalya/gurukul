@@ -18,9 +18,14 @@ use bevy::math::UVec2;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use coach_game::coach::Coach;
+use coach_game::menu::permission::MicStatus;
 use domain_ports::app_coach::{
     AppCoach, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo, ShutdownResult,
 };
+use domain_ports::audio_devices::{
+    InputDevice, InputStream, SampleRateSupport, StreamHandle, Transport,
+};
+use domain_ports::audio_driver::AudioInitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,9 +47,32 @@ pub struct FakeCoach {
     pub inner: Arc<Mutex<FakeCoachState>>,
 }
 
+/// Construct a minimal `InputDevice` for test purposes.
+fn fake_input_device() -> InputDevice {
+    InputDevice {
+        persistent_id: None,
+        name: "Fake Mic".into(),
+        transport: Transport::BuiltIn,
+        streams: vec![InputStream {
+            handle: StreamHandle(std::sync::Arc::new(())),
+            name: "Fake Mic".into(),
+            channels: 1,
+            sample_rates: SampleRateSupport::ProbeOnly,
+        }],
+    }
+}
+
 impl AppCoach for FakeCoach {
     fn send_command(&self, cmd: Command) {
-        self.inner.lock().unwrap().commands.push(cmd);
+        let mut g = self.inner.lock().unwrap();
+        // Auto-respond to AudioListDevices with one fake mic so
+        // `advance_checking_hardware` can transition to InGame in headless tests.
+        if matches!(cmd, Command::AudioListDevices) {
+            g.pending_events.push(CoachEvent::AudioDevicesListed {
+                devices: vec![fake_input_device()],
+            });
+        }
+        g.commands.push(cmd);
     }
 
     fn poll_events(&self, out: &mut Vec<CoachEvent>) {
@@ -95,6 +123,10 @@ pub fn build_test_app() -> (App, FakeCoach) {
     app.insert_non_send_resource(Coach(Box::new(fake.clone())));
 
     coach_game::build_app(&mut app);
+    // Headless tests have no real AudioDriver, so permission is always
+    // Undetermined. Pre-set Granted so button-press tests reach InGame
+    // without triggering the permission modal.
+    app.world_mut().resource_mut::<MicStatus>().0 = AudioInitStatus::Granted;
     (app, fake)
 }
 
@@ -171,6 +203,8 @@ pub fn build_layout_test_app() -> (App, FakeCoach) {
     app.insert_non_send_resource(Coach(Box::new(fake.clone())));
 
     coach_game::build_app(&mut app);
+    // Pre-set Granted so button-press tests reach InGame without the permission modal.
+    app.world_mut().resource_mut::<MicStatus>().0 = AudioInitStatus::Granted;
     (app, fake)
 }
 

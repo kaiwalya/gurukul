@@ -19,6 +19,9 @@ use std::time::Duration;
 use domain_ports::app_coach::{
     AppCoach, AudioInfo, CoachEvent, Command, FeatureSnapshot, MusicInfo, ShutdownResult,
 };
+use domain_ports::audio_devices::{
+    InputDevice, InputStream, SampleRateSupport, StreamHandle, Transport,
+};
 
 use super::load::CoachRead;
 
@@ -82,9 +85,29 @@ impl ReplayCoach {
 }
 
 impl AppCoach for ReplayCoach {
-    /// Commands are already in the recorded `cmd` channel and drive nothing on
-    /// replay (the coach is canned). Drop them.
-    fn send_command(&self, _cmd: Command) {}
+    /// Commands are already in the recorded `cmd` channel. Most are dropped on
+    /// replay, but `AudioListDevices` gets a synthetic response so the permission
+    /// flow can complete (otherwise `advance_checking_hardware` never fires).
+    fn send_command(&self, cmd: Command) {
+        if matches!(cmd, Command::AudioListDevices) {
+            self.pending
+                .borrow_mut()
+                .events
+                .push(CoachEvent::AudioDevicesListed {
+                    devices: vec![InputDevice {
+                        persistent_id: None,
+                        name: "Replay Mic".into(),
+                        transport: Transport::BuiltIn,
+                        streams: vec![InputStream {
+                            handle: StreamHandle(std::sync::Arc::new(())),
+                            name: "Replay Mic".into(),
+                            channels: 1,
+                            sample_rates: SampleRateSupport::ProbeOnly,
+                        }],
+                    }],
+                });
+        }
+    }
 
     fn poll_events(&self, out: &mut Vec<CoachEvent>) {
         out.append(&mut self.pending.borrow_mut().events);

@@ -8,6 +8,7 @@
 
 use crate::feature_history::FeatureHistory;
 pub use crate::feature_types::Features;
+use crate::menu::permission::{MicStatus, PermissionPrompt};
 use crate::state::{AppState, HasPausedSession, KnownDevices, KnownScales, ResumeLocked};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -70,6 +71,8 @@ pub struct DrainReadModels<'w> {
     history: ResMut<'w, FeatureHistoryRes>,
     feature_scratch: ResMut<'w, FeatureDrainScratch>,
     drain_count: ResMut<'w, FeatureDrainCount>,
+    mic_status: ResMut<'w, MicStatus>,
+    prompt: ResMut<'w, PermissionPrompt>,
 }
 
 /// Construct the real adapter-backed coach, optionally substituting the WAV
@@ -160,6 +163,8 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
         mut history,
         mut feature_scratch,
         mut drain_count,
+        mut mic_status,
+        mut prompt,
     } = models;
     let mut events = Vec::new();
     coach.0.poll_events(&mut events);
@@ -219,6 +224,29 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
             CoachEvent::AudioDefaultInputChanged { .. } => {}
             CoachEvent::AudioPermissionStatus { status } => {
                 info!("audio permission status: {status:?}");
+                if mic_status.0 != status {
+                    mic_status.0 = status;
+                }
+                match (&*prompt, status) {
+                    (
+                        PermissionPrompt::RequestPending,
+                        domain_ports::audio_driver::AudioInitStatus::Denied,
+                    ) => {
+                        *prompt = PermissionPrompt::NeedsPermission(
+                            domain_ports::audio_driver::AudioInitStatus::Denied,
+                        );
+                    }
+                    (
+                        PermissionPrompt::RequestPending,
+                        domain_ports::audio_driver::AudioInitStatus::Granted,
+                    ) => {
+                        coach
+                            .0
+                            .send_command(domain_ports::app_coach::Command::AudioListDevices);
+                        *prompt = PermissionPrompt::CheckingHardware;
+                    }
+                    _ => {}
+                }
             }
             // The musical frame was (re)configured. Pull the fresh
             // snapshot and republish it for the UI to read.
@@ -251,5 +279,19 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
         history
             .0
             .extend(feature_scratch.0.drain(..).map(Features::from));
+    }
+}
+
+/// Re-query mic permission when the app returns to the foreground.
+pub fn query_on_foreground(
+    mut reader: MessageReader<bevy::window::AppLifecycle>,
+    coach: NonSend<Coach>,
+) {
+    for ev in reader.read() {
+        if *ev == bevy::window::AppLifecycle::WillResume {
+            coach
+                .0
+                .send_command(domain_ports::app_coach::Command::AudioPermissionQuery);
+        }
     }
 }

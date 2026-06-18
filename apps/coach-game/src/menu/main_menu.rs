@@ -1,13 +1,11 @@
 //! Main menu screen: title + three buttons (Free Practice / Settings / Quit).
-//!
-//! When `HasPausedSession` is set, the start button reads "Continue"
-//! instead of "Free Practice" — the marker (`NewGameButton`) stays the
-//! same, since both labels lead to InGame and the OnEnter handler clears
-//! the flag either way.
 
-use crate::state::{AppState, HasPausedSession};
+use crate::menu::permission::{MicStatus, PermissionPrompt};
+use crate::state::{AppState, HasPausedSession, KnownDevices};
 use crate::ui::*;
 use bevy::prelude::*;
+use domain_ports::app_coach::Command;
+use domain_ports::audio_driver::AudioInitStatus;
 
 #[derive(Component)]
 pub struct NewGameButton;
@@ -48,9 +46,6 @@ pub fn spawn(mut commands: Commands, has_paused: Res<HasPausedSession>) {
                     ..default()
                 },
             ),
-            // Trace paths key off the stable `Name`, not the dynamic label
-            // ("Continue" vs "Free Practice"), so an agent reads the same path
-            // regardless of session state.
             menu_button("new_game", start_label, NewGameButton),
             menu_button("settings", "Settings", SettingsButton),
             menu_button("quit", "Quit", QuitButton),
@@ -82,14 +77,49 @@ fn menu_button<M: Component>(name: &'static str, label: &str, marker: M) -> impl
     )
 }
 
+/// Start/Continue button pressed. Fork on current mic status.
 pub fn handle_new_game(
     q: Query<&Interaction, (Changed<Interaction>, With<NewGameButton>)>,
-    mut next: ResMut<NextState<AppState>>,
+    mic: Res<MicStatus>,
+    coach: NonSend<crate::coach::Coach>,
+    mut prompt: ResMut<PermissionPrompt>,
 ) {
     for i in q.iter() {
-        if *i == Interaction::Pressed {
-            next.set(AppState::InGame);
+        if *i != Interaction::Pressed {
+            continue;
         }
+        match mic.0 {
+            AudioInitStatus::Granted => {
+                coach.0.send_command(Command::AudioListDevices);
+                *prompt = PermissionPrompt::CheckingHardware;
+            }
+            AudioInitStatus::Undetermined => {
+                *prompt = PermissionPrompt::NeedsPermission(AudioInitStatus::Undetermined);
+            }
+            AudioInitStatus::Denied => {
+                *prompt = PermissionPrompt::NeedsPermission(AudioInitStatus::Denied);
+            }
+        }
+    }
+}
+
+/// Advance from `CheckingHardware` when a fresh `AudioDevicesListed` reply arrives.
+pub fn advance_checking_hardware(
+    known: Res<KnownDevices>,
+    mut prompt: ResMut<PermissionPrompt>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    if !known.is_changed() {
+        return;
+    }
+    if *prompt != PermissionPrompt::CheckingHardware {
+        return;
+    }
+    if known.0.is_empty() {
+        *prompt = PermissionPrompt::NoHardware;
+    } else {
+        *prompt = PermissionPrompt::Hidden;
+        next.set(AppState::InGame);
     }
 }
 
@@ -105,16 +135,7 @@ pub fn handle_settings(
 }
 
 /// Quit by despawning the primary window rather than writing
-/// `AppExit::Success` directly. Bevy 0.18.1 has a known macOS deadlock
-/// when AppExit is sent programmatically from a system
-/// (bevyengine/bevy#23313): the winit event loop hangs and the window
-/// stays open. Despawning `PrimaryWindow` re-enters the native close
-/// path, which fires AppExit cleanly via `exit_on_primary_closed`.
-///
-/// In headless tests there is no PrimaryWindow, so the query is empty
-/// and we fall back to writing AppExit directly. The shutdown-on-exit
-/// assertion in `quit_button_writes_app_exit_and_shuts_down_coach`
-/// covers both paths.
+/// `AppExit::Success` directly.
 pub fn handle_quit(
     q: Query<&Interaction, (Changed<Interaction>, With<QuitButton>)>,
     window: Query<Entity, With<bevy::window::PrimaryWindow>>,
