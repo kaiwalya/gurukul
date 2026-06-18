@@ -5,7 +5,7 @@
 //! can't change input devices mid-run. To re-configure audio, quit to
 //! the main menu first.
 
-use crate::state::AppState;
+use crate::state::{AppState, ResumeLocked};
 use crate::ui::*;
 use bevy::prelude::*;
 
@@ -239,4 +239,38 @@ pub fn sync_confirm_modal(
 /// previous half-cancelled state can't leak into the next pause.
 pub fn reset_confirm_flag(mut showing: ResMut<ShowingQuitConfirm>) {
     showing.0 = false;
+}
+
+/// Reactively enable/disable the Resume button based on [`ResumeLocked`].
+///
+/// Runs whenever `ResumeLocked` changes (Changed<ResumeLocked> gate).
+/// An OS interruption sets it `true` (Resume greyed out, non-interactive);
+/// `InterruptionEnded { should_resume: true }` clears it back to `false`
+/// (Resume active again). The user-Escape path never sets it, so Resume
+/// is enabled by default.
+pub fn sync_resume_locked(
+    resume_locked: Res<ResumeLocked>,
+    mut resume_q: Query<(Entity, &mut BackgroundColor), With<ResumeButton>>,
+    mut text_q: Query<(&mut TextColor, &ChildOf)>,
+    mut commands: Commands,
+) {
+    if !resume_locked.is_changed() {
+        return;
+    }
+    let locked = resume_locked.0;
+    for (entity, mut bg) in resume_q.iter_mut() {
+        if locked {
+            bg.0 = COLOR_BUTTON_DISABLED;
+            commands.entity(entity).insert(ButtonDisabled);
+        } else {
+            bg.0 = COLOR_BUTTON;
+            commands.entity(entity).remove::<ButtonDisabled>();
+        }
+        // Update the child text colour.
+        for (mut tc, child_of) in text_q.iter_mut() {
+            if child_of.parent() == entity {
+                tc.0 = if locked { COLOR_TEXT_DIM } else { COLOR_TEXT };
+            }
+        }
+    }
 }

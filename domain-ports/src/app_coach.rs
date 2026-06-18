@@ -293,6 +293,35 @@ pub enum CoachEvent {
     /// live value read from the OS at the time of emission — never a
     /// stale verdict carried in the request.
     AudioPermissionStatus { status: AudioInitStatus },
+
+    /// An OS-level interruption (phone call, Siri, etc.) began or ended.
+    ///
+    /// This event rides **alongside** [`AudioSessionStateChanged`]: the state
+    /// change drives the stop/idle transition; this event tells the head *why*
+    /// so it can lock (and later unlock) the Pause screen's Resume action.
+    ///
+    /// `phase = Began` → mic is gone; head should disable Resume.
+    /// `phase = Ended { should_resume: true }` → OS says mic is back; head may
+    /// enable Resume so the player can tap it.
+    /// `phase = Ended { should_resume: false }` → OS says don't resume (call
+    /// still active or ended abnormally); Resume stays disabled.
+    ///
+    /// If the interruption times out without an `Ended` arriving, no `Ended`
+    /// event is emitted — the `Began` is the last signal, and Resume stays
+    /// disabled until the player quits to menu.
+    AudioInterruption { phase: InterruptionPhase },
+}
+
+/// Phase of an [`CoachEvent::AudioInterruption`] signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum InterruptionPhase {
+    /// The interruption just started (phone call picked up, Siri invoked, etc.).
+    Began,
+    /// The interruption ended. `should_resume` mirrors the OS hint: `true`
+    /// means the mic is available again; `false` means it isn't (the call ended
+    /// abnormally or the OS chose not to resume).
+    Ended { should_resume: bool },
 }
 
 /// Where the session is in its lifecycle. Heads render UI off this.

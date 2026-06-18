@@ -43,8 +43,8 @@ pub mod widgets;
 use bevy::prelude::*;
 use bevy::ui::UiSystems;
 use state::{
-    AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, SelectedDevice,
-    SongTonality,
+    AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, ResumeLocked,
+    SelectedDevice, SongTonality,
 };
 
 /// Register the game's state, resources, and systems. Split out of
@@ -59,6 +59,7 @@ pub fn build_app(app: &mut App) {
         .init_resource::<KnownDevices>()
         .init_resource::<KnownScales>()
         .init_resource::<HasPausedSession>()
+        .init_resource::<ResumeLocked>()
         .init_resource::<menu::paused::ShowingQuitConfirm>()
         .init_resource::<menu::settings::SettingsTab>()
         .init_resource::<menu::settings::MusicSelection>()
@@ -203,6 +204,7 @@ pub fn build_app(app: &mut App) {
                 menu::paused::handle_confirm_yes,
                 menu::paused::handle_confirm_cancel,
                 menu::paused::sync_confirm_modal,
+                menu::paused::sync_resume_locked,
                 game::handle_esc_paused,
             )
                 .run_if(in_state(AppState::Paused)),

@@ -31,6 +31,17 @@ pub enum AppState {
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct HasPausedSession(pub bool);
 
+/// True when the Pause screen's Resume action must be disabled because the
+/// session was interrupted by the OS (phone call, Siri, etc.) and the
+/// interruption has not yet ended with `should_resume: true`.
+///
+/// Set to `true` by `drain_events` on `AudioInterruption { Began }`.
+/// Cleared to `false` on `AudioInterruption { Ended { should_resume: true } }`.
+/// When the user presses Escape to pause (not an OS interruption) this is
+/// `false` — Resume is enabled.
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct ResumeLocked(pub bool);
+
 /// User-chosen input device, persists across menu navigation. `None`
 /// means "use OS default" — what AppCoach's `AudioConfig::device_id`
 /// also treats as default.

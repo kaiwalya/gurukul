@@ -8,10 +8,12 @@
 
 use crate::feature_history::FeatureHistory;
 pub use crate::feature_types::Features;
-use crate::state::{AppState, KnownDevices, KnownScales};
+use crate::state::{AppState, HasPausedSession, KnownDevices, KnownScales, ResumeLocked};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use domain_ports::app_coach::{AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, MusicInfo};
+use domain_ports::app_coach::{
+    AppCoach, AppCoachDeps, CoachEvent, FeatureSnapshot, InterruptionPhase, MusicInfo,
+};
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::Telemetry;
 use domain_ports::tuning::Tuning;
@@ -62,6 +64,9 @@ pub struct DrainReadModels<'w> {
     music: ResMut<'w, MusicInfoRes>,
     features: ResMut<'w, LatestFeatures>,
     state: Res<'w, State<AppState>>,
+    next_state: ResMut<'w, NextState<AppState>>,
+    has_paused: ResMut<'w, HasPausedSession>,
+    resume_locked: ResMut<'w, ResumeLocked>,
     history: ResMut<'w, FeatureHistoryRes>,
     feature_scratch: ResMut<'w, FeatureDrainScratch>,
     drain_count: ResMut<'w, FeatureDrainCount>,
@@ -149,6 +154,9 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
         mut music,
         mut features,
         state,
+        mut next_state,
+        mut has_paused,
+        mut resume_locked,
         mut history,
         mut feature_scratch,
         mut drain_count,
@@ -164,10 +172,46 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
                 scales.0 = shapes;
             }
             CoachEvent::AudioSessionStateChanged { new_state } => {
+                // Log all transitions. Recovery cycles (Running→Stopping→Starting→Running
+                // the head didn't command) are tolerated silently — no screen change.
+                // The interruption case is handled separately via AudioInterruption.
                 info!("session state: {new_state:?}");
             }
             CoachEvent::AudioSessionError { kind, reason } => {
+                // Terminal error: get the player out of InGame so they aren't
+                // stuck with a dead session. Log detail; surface a brief reason.
                 error!("session error: {kind:?} — {reason}");
+                use domain_ports::app_coach::AudioSessionErrorKind;
+                let current = *state.get();
+                if current == AppState::InGame || current == AppState::Paused {
+                    if kind == AudioSessionErrorKind::PermissionDenied {
+                        warn!("Microphone permission denied — enable it in Settings");
+                    } else {
+                        warn!("Audio session failed — returning to main menu");
+                    }
+                    next_state.set(AppState::MainMenu);
+                }
+            }
+            CoachEvent::AudioInterruption { phase } => {
+                info!("audio interruption: {phase:?}");
+                match phase {
+                    InterruptionPhase::Began => {
+                        // OS interrupted the session (phone call, Siri, etc.).
+                        // Enter Pause with Resume locked so the player can't
+                        // try to sing while the mic is gone.
+                        resume_locked.0 = true;
+                        has_paused.0 = true;
+                        next_state.set(AppState::Paused);
+                    }
+                    InterruptionPhase::Ended { should_resume } => {
+                        if should_resume {
+                            // Mic is back; unlock Resume so the player can tap it.
+                            resume_locked.0 = false;
+                        }
+                        // should_resume: false → leave Resume locked; player may
+                        // quit to menu. No state change needed.
+                    }
+                }
             }
             CoachEvent::EventsDropped { count } => {
                 warn!("events dropped: {count}");

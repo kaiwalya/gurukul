@@ -277,7 +277,9 @@ impl Drop for CoachImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_ports::app_coach::{AudioConfig, AudioSessionErrorKind, AudioSessionState};
+    use domain_ports::app_coach::{
+        AudioConfig, AudioSessionErrorKind, AudioSessionState, InterruptionPhase,
+    };
     use domain_ports::audio_capture::{
         AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureSession, LifecycleEvent,
         LifecycleSink,
@@ -2333,6 +2335,142 @@ mod tests {
         // Only the initial start opened the device.
         assert_eq!(opens.load(Ordering::SeqCst), 1);
 
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `Interrupted` emits `AudioInterruption { Began }` so the head can lock
+    /// its Resume action (Decision 4).
+    #[test]
+    fn interrupted_emits_interruption_began_event() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+        // Drain start-up events.
+        let _ = collect_states(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioInterruption {
+                        phase: InterruptionPhase::Began
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoachEvent::AudioInterruption {
+                    phase: InterruptionPhase::Began
+                }
+            )),
+            "Interrupted must emit AudioInterruption {{ Began }}"
+        );
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `InterruptionEnded { should_resume: true }` emits
+    /// `AudioInterruption { Ended { should_resume: true } }`.
+    #[test]
+    fn interruption_ended_emits_ended_event_with_should_resume_true() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        let _ = collect_states(&coach);
+
+        firer.fire(LifecycleEvent::InterruptionEnded {
+            should_resume: true,
+        });
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioInterruption {
+                        phase: InterruptionPhase::Ended { .. }
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoachEvent::AudioInterruption {
+                    phase: InterruptionPhase::Ended { should_resume: true }
+                }
+            )),
+            "InterruptionEnded(true) must emit AudioInterruption {{ Ended {{ should_resume: true }} }}"
+        );
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `InterruptionEnded { should_resume: false }` emits the flag faithfully.
+    #[test]
+    fn interruption_ended_emits_ended_event_with_should_resume_false() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        let _ = collect_states(&coach);
+
+        firer.fire(LifecycleEvent::InterruptionEnded {
+            should_resume: false,
+        });
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioInterruption {
+                        phase: InterruptionPhase::Ended { .. }
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoachEvent::AudioInterruption {
+                    phase: InterruptionPhase::Ended { should_resume: false }
+                }
+            )),
+            "InterruptionEnded(false) must emit AudioInterruption {{ Ended {{ should_resume: false }} }}"
+        );
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),
             ShutdownResult::Clean

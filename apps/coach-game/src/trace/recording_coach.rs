@@ -173,5 +173,6 @@ fn clone_event(ev: &CoachEvent) -> CoachEvent {
         CoachEvent::AudioPermissionStatus { status } => {
             CoachEvent::AudioPermissionStatus { status: *status }
         }
+        CoachEvent::AudioInterruption { phase } => CoachEvent::AudioInterruption { phase: *phase },
     }
 }

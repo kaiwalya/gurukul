@@ -9,7 +9,7 @@ pub mod time_graph;
 
 use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
 use crate::semantic_graph::{GraphProjector, SemanticGraph};
-use crate::state::{AppState, HasPausedSession, SelectedDevice, SongTonality};
+use crate::state::{AppState, HasPausedSession, ResumeLocked, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
 use std::path::PathBuf;
@@ -207,13 +207,17 @@ pub fn refresh_semantic_graph(
 
 /// Esc in InGame → Paused (stops session via OnEnter(Paused)). Marks
 /// `HasPausedSession` so the main menu can offer Continue.
+/// `ResumeLocked` is cleared so the Pause screen's Resume action is enabled
+/// (this is a deliberate user pause, not an OS interruption).
 pub fn handle_esc_in_game(
     keys: Res<ButtonInput<KeyCode>>,
     mut next: ResMut<NextState<AppState>>,
     mut has_paused: ResMut<HasPausedSession>,
+    mut resume_locked: ResMut<ResumeLocked>,
 ) {
     if keys.just_pressed(KeyCode::Escape) {
         has_paused.0 = true;
+        resume_locked.0 = false;
         next.set(AppState::Paused);
     }
 }

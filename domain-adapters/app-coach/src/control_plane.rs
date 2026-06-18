@@ -14,7 +14,7 @@ use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
 use domain_ports::app_coach::{
     AppCoachDeps, AudioConfig, AudioInfo, AudioSessionErrorKind, AudioSessionState, CoachEvent,
-    Command, FeatureSnapshot, MusicInfo,
+    Command, FeatureSnapshot, InterruptionPhase, MusicInfo,
 };
 use domain_ports::audio_capture::{
     CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession, LifecycleEvent, LifecycleSink,
@@ -416,6 +416,13 @@ impl ControlPlane {
         self.deadlines.route_debounce = None;
         self.deadlines.interruption_timeout =
             Some(self.deps.clock.now_ms() + INTERRUPTION_TIMEOUT_MS);
+        // Emit the interruption signal so the head can lock its Resume
+        // action. This rides alongside the AudioSessionStateChanged events
+        // already emitted above — the state changes drive the stop; this
+        // event tells the head *why*.
+        self.push_event(CoachEvent::AudioInterruption {
+            phase: InterruptionPhase::Began,
+        });
     }
 
     /// An interruption ended. Clear the interruption timeout. We never
@@ -429,6 +436,11 @@ impl ControlPlane {
             "app-coach: interruption ended",
             should_resume = should_resume,
         );
+        // Emit the Ended signal so the head can unlock (or keep locked)
+        // its Resume action per Decision 4.
+        self.push_event(CoachEvent::AudioInterruption {
+            phase: InterruptionPhase::Ended { should_resume },
+        });
     }
 
     /// Set/extend the route-change debounce deadline. Coalesces a burst of
