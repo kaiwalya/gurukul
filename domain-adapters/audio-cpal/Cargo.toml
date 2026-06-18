@@ -10,8 +10,17 @@ cpal = { workspace = true }
 # iOS-only: AVAudioSession permission + activation.
 # These are cfg'd out on all other platforms so Mac/Linux/Windows builds
 # don't pay for them. On-device validation: Phase 1.6.2.
+# objc2-avf-audio is feature-gated per Apple framework class; nothing is
+# compiled unless its feature is on. We need: AVAudioApplication (modern,
+# non-deprecated mic-permission API), AVAudioSession + AVAudioSessionTypes
+# (category + setActive activation), and block2 (the completion-handler block).
 [target.'cfg(target_os = "ios")'.dependencies]
-objc2-avf-audio = "0.3"
+objc2-avf-audio = { version = "0.3", features = [
+    "AVAudioApplication",
+    "AVAudioSession",
+    "AVAudioSessionTypes",
+    "block2",
+] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"

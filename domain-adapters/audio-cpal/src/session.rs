@@ -68,16 +68,17 @@ struct IosSessionProvider;
 #[cfg(target_os = "ios")]
 impl AudioSessionProvider for IosSessionProvider {
     fn init_status(&self) -> AudioInitStatus {
-        use objc2_avf_audio::{AVAudioSession, AVAudioSessionRecordPermission};
-        // SAFETY: `sharedInstance` returns a reference to the process-wide
-        // singleton; it is safe to call on any thread.
-        let session = unsafe { AVAudioSession::sharedInstance() };
-        // TODO(1.6.2): verify AVAudioSessionRecordPermission variant names
-        // against the 0.3.2 binding on-device.
-        match unsafe { session.recordPermission() } {
-            AVAudioSessionRecordPermission::Granted => AudioInitStatus::Granted,
-            AVAudioSessionRecordPermission::Denied => AudioInitStatus::Denied,
-            AVAudioSessionRecordPermission::Undetermined => AudioInitStatus::Undetermined,
+        use objc2_avf_audio::{AVAudioApplication, AVAudioApplicationRecordPermission};
+        // Modern (iOS 17+) permission read on the process-wide singleton.
+        // `AVAudioApplicationRecordPermission` is a struct-of-consts, not a
+        // closed enum — the wildcard arm is required by the binding.
+        // SAFETY: `sharedInstance` returns the process-wide singleton; the
+        // read is thread-safe.
+        let app = unsafe { AVAudioApplication::sharedInstance() };
+        match unsafe { app.recordPermission() } {
+            AVAudioApplicationRecordPermission::Granted => AudioInitStatus::Granted,
+            AVAudioApplicationRecordPermission::Denied => AudioInitStatus::Denied,
+            AVAudioApplicationRecordPermission::Undetermined => AudioInitStatus::Undetermined,
             _ => AudioInitStatus::Undetermined,
         }
     }
@@ -85,51 +86,57 @@ impl AudioSessionProvider for IosSessionProvider {
     fn request(&self, sink: AudioPermissionSink) {
         use block2::RcBlock;
         use objc2::runtime::Bool;
-        use objc2_avf_audio::{AVAudioSession, AVAudioSessionCategory};
+        use objc2_avf_audio::{AVAudioApplication, AVAudioSession, AVAudioSessionCategoryRecord};
 
+        // Configure the session for input *before* prompting, so a granted
+        // session is immediately usable. `setCategory_error` returns a Result
+        // (objc2 0.6 wraps the NSError** out-param); the record category is an
+        // extern `Option<&NSString>` static, deref'd here.
         let session = unsafe { AVAudioSession::sharedInstance() };
+        if let Some(category) = unsafe { AVAudioSessionCategoryRecord } {
+            let _ = unsafe { session.setCategory_error(category) };
+        }
 
-        // Set category to record before requesting — required so the session
-        // is configured for input when the permission dialog fires.
-        // TODO(1.6.2): verify setCategory error handling on-device.
-        let _ = unsafe {
-            session.setCategory_error(AVAudioSessionCategory::Record, std::ptr::null_mut())
-        };
-
-        // The block captures ONLY the `Send` sink — never the `!Send` session.
-        // It ignores the Bool (we re-read init_status() on resolution).
+        // The completion block captures ONLY the `Send` sink — never the
+        // `!Send` session/app. It ignores the granted Bool; the control plane
+        // re-reads init_status() on resolution (live truth, not a stale verdict).
+        //
+        // `RcBlock` requires `Fn`, but `sink.signal()` consumes the sink
+        // (one-shot). The OS fires this completion block exactly once, so a
+        // `Cell<Option<_>>` taken on first call bridges the two: `Fn`-callable,
+        // but signals at most once. `Cell` is fine — the block is not `Sync`
+        // and the OS serializes the single callback.
+        let sink = std::cell::Cell::new(Some(sink));
         let block = RcBlock::new(move |_granted: Bool| {
-            sink.signal();
+            if let Some(sink) = sink.take() {
+                sink.signal();
+            }
         });
 
-        // TODO(1.6.2): verify requestRecordPermission method name in 0.3.2 binding.
-        unsafe { session.requestRecordPermission(&*block) };
+        // Class method (no &self): fires the OS dialog, or invokes the block
+        // immediately if already decided. May call back on any thread.
+        unsafe { AVAudioApplication::requestRecordPermissionWithCompletionHandler(&block) };
     }
 
     fn new_devices(&self) -> Result<Box<dyn AudioDevices>, AudioInitError> {
         use objc2_avf_audio::AVAudioSession;
 
-        // Guard: only call setActive after permission is confirmed. Re-read live
-        // status (not a stale snapshot) so Denied is reported accurately even if
-        // permission was revoked between init_status() and new_devices().
+        // Guard: only activate after permission is confirmed. Re-read live
+        // status (not a stale snapshot) so revocation between init_status()
+        // and here is reported accurately.
         match self.init_status() {
             AudioInitStatus::Granted => {}
             AudioInitStatus::Denied => return Err(AudioInitError::Denied),
             AudioInitStatus::Undetermined => return Err(AudioInitError::Undetermined),
         }
 
+        // `setActive_error(true)` returns Result<(), Retained<NSError>>; map the
+        // NSError to our ActivationFailed message.
         let session = unsafe { AVAudioSession::sharedInstance() };
-
-        // TODO(1.6.2): verify setActive error mapping on-device.
-        let mut err: *mut objc2_foundation::NSError = std::ptr::null_mut();
-        let ok = unsafe { session.setActive_error(true, &mut err) };
-        if !ok {
-            let msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                unsafe { (*err).localizedDescription().to_string() }
-            };
-            return Err(AudioInitError::ActivationFailed(msg));
+        if let Err(err) = unsafe { session.setActive_error(true) } {
+            return Err(AudioInitError::ActivationFailed(
+                err.localizedDescription().to_string(),
+            ));
         }
 
         Ok(Box::new(devices::new()))
