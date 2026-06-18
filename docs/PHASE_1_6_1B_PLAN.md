@@ -183,8 +183,29 @@ A `FakeAudioSessionProvider` driving the state machine deterministically:
   with a stale generation is dropped (no unwanted start).
 - `new_devices()` returning `ActivationFailed` → `Error`.
 
-iOS simulator: best-effort manual (session activates, mic opens, negotiate
-reads the live config). Real privacy prompt + on-device routes = 1.6.2.
+### iOS simulator — what it CAN test (corrected)
+
+The simulator is **not** the limited target the first draft implied. It runs
+a live `tccd` and routes the Mac's mic, so the **real privacy prompt and
+grant/deny are fully exercisable on the sim** — no device needed. Verified
+in 1.6.1b: the app cross-compiles for `aarch64-apple-ios-sim`, packages
+(`cargo ios`), installs, launches, and renders.
+
+The reason the prompt does **not** appear from a simulator run today is
+**our design, not a sim limitation**: `AudioStartSession` errors on
+`Undetermined` and never prompts; only `AudioPermissionRequest` pops the
+dialog, and no head UI sends that command yet. That trigger UI is **1.6.1c**
+("we need the mic" pre-session screen). Once it exists, the full
+prompt → grant/deny → status flow is testable on the sim through the real
+product path.
+
+One observability caveat for when we do test it: `telemetry-std` writes to
+**stderr**, which `simctl` does not fold into the unified log — capture
+stderr (or query coach state) to watch the state machine on the sim.
+
+Genuinely device-only (Phase 1.6.2): signing/provisioning, and real
+hardware audio *routing* quirks (Bluetooth, route changes) — not the
+permission prompt itself.
 
 ## Explicitly NOT in 1.6.1b (→ 1.6.1c)
 
