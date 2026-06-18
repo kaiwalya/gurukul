@@ -179,6 +179,7 @@ pub struct AudioInfo {
 /// configuration of a session (the [`Scale`]), which is carried by
 /// [`Command::MusicConfigureSession`] and is decoupled from the audio
 /// lifecycle.
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioConfig {
     /// Identifies the device to open. `None` requests the system's

@@ -13,6 +13,7 @@
 use crate::WavStreamHandle;
 use domain_ports::audio_capture::{
     AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureFrame, CaptureSession,
+    LifecycleSink,
 };
 use domain_ports::audio_devices::StreamHandle;
 use domain_ports::clock::Clock;
@@ -83,6 +84,10 @@ impl AudioCapture for WavAudioCapture {
         handle: StreamHandle,
         cfg: CaptureConfig,
         on_frame: CaptureCallback,
+        // A WAV file is a never-ending mic: nothing can interrupt it, change
+        // its route, or revoke its permission. The sink is accepted to honour
+        // the port contract and ignored — no lifecycle event will ever fire.
+        _on_event: LifecycleSink,
     ) -> Result<CaptureSession, CaptureError> {
         // Step 1: downcast the handle to our private WavStreamHandle type.
         let wav_handle = handle
@@ -329,6 +334,7 @@ mod tests {
                 Box::new(move |frame| {
                     counter_clone.fetch_add(frame.frames, Ordering::SeqCst);
                 }),
+                Box::new(|_| {}),
             )
             .unwrap();
 
@@ -355,7 +361,7 @@ mod tests {
             buffer_frames: Some(480),
         };
 
-        let result = capture.open(foreign_handle, cfg, Box::new(|_| {}));
+        let result = capture.open(foreign_handle, cfg, Box::new(|_| {}), Box::new(|_| {}));
         assert!(matches!(result, Err(CaptureError::InvalidHandle)));
     }
 
@@ -482,6 +488,7 @@ mod tests {
                 Box::new(move |frame| {
                     counter_clone.fetch_add(frame.frames, Ordering::SeqCst);
                 }),
+                Box::new(|_| {}),
             )
             .unwrap();
         std::thread::sleep(Duration::from_millis(400));

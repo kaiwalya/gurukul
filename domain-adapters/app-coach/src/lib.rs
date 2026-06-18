@@ -279,7 +279,8 @@ mod tests {
     use super::*;
     use domain_ports::app_coach::{AudioConfig, AudioSessionErrorKind, AudioSessionState};
     use domain_ports::audio_capture::{
-        AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureSession,
+        AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureSession, LifecycleEvent,
+        LifecycleSink,
     };
     use domain_ports::audio_devices::{
         AudioDevices, DeviceId, InputDevice, InputStream, SampleRateSupport, StreamHandle,
@@ -372,6 +373,45 @@ mod tests {
         negotiate_result: NegotiateResult,
         /// Config passed to each `open()` call, in order.
         opened_configs: Arc<Mutex<Vec<CaptureConfig>>>,
+        /// The lifecycle sink the control plane handed to the *most recent*
+        /// successful `open()`. The 1.6.1c event-injection hook: a test pulls
+        /// this and fires a `LifecycleEvent` through it (simulating an OS
+        /// interruption / route change / backend error). `None` until the
+        /// first successful open. A shared handle is held by `LifecycleFirer`.
+        last_sink: Arc<Mutex<Option<LifecycleSink>>>,
+    }
+
+    /// Test handle that fires lifecycle events through the sink stored by the
+    /// most recent successful `FakeCapture::open`. Cloneable + `Send` so a
+    /// test can keep it while the coach owns the capture port.
+    #[derive(Clone)]
+    struct LifecycleFirer {
+        sink: Arc<Mutex<Option<LifecycleSink>>>,
+    }
+
+    impl LifecycleFirer {
+        /// Fire one lifecycle event through the *current* stored sink. Panics
+        /// if no session has opened yet (a test bug — fire only after Running).
+        fn fire(&self, event: LifecycleEvent) {
+            let guard = self.sink.lock().unwrap();
+            let sink = guard
+                .as_ref()
+                .expect("no lifecycle sink stored — fire only after a session reached Running");
+            sink(event);
+        }
+
+        /// Take the *current* stored sink out, so a test can hold it across a
+        /// later reopen (recovery) and fire it as a now-stale old-stream sink.
+        /// `LifecycleSink` is `Box<dyn Fn>` (not cloneable), so taking is the
+        /// only way to retain a specific generation's sink; the next
+        /// successful `open()` installs a fresh sink in the vacated slot.
+        fn take_sink(&self) -> LifecycleSink {
+            self.sink
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no lifecycle sink stored — take only after a session reached Running")
+        }
     }
 
     #[derive(Clone)]
@@ -379,6 +419,10 @@ mod tests {
         Ok,
         FailUnsupported,
         FailOnceThenOk,
+        /// The first open succeeds (session reaches Running); every reopen
+        /// after that fails. Drives the recovery retry-budget test: a
+        /// reconcile keeps failing until the budget trips to Error.
+        OkThenFail,
     }
 
     /// Injection point for `negotiate()` in tests.
@@ -428,6 +472,7 @@ mod tests {
             _handle: StreamHandle,
             cfg: CaptureConfig,
             _on_frame: CaptureCallback,
+            on_event: LifecycleSink,
         ) -> Result<CaptureSession, CaptureError> {
             self.opened_configs.lock().unwrap().push(CaptureConfig {
                 sample_rate: cfg.sample_rate,
@@ -436,10 +481,24 @@ mod tests {
             });
             let open_index = self.opens.fetch_add(1, Ordering::SeqCst);
             match (&self.outcome, open_index) {
-                (FakeOutcome::Ok, _) | (FakeOutcome::FailOnceThenOk, 1..) => {
+                (FakeOutcome::Ok, _)
+                | (FakeOutcome::FailOnceThenOk, 1..)
+                | (FakeOutcome::OkThenFail, 0) => {
+                    // Store the sink so a test can fire lifecycle events at the
+                    // now-Running session. Replaces any prior sink — a reopen
+                    // (recovery) supersedes the dead session's sink.
+                    *self.last_sink.lock().unwrap() = Some(on_event);
                     Ok(CaptureSession::new(|| {}))
                 }
-                (FakeOutcome::FailUnsupported | FakeOutcome::FailOnceThenOk, _) => {
+                (
+                    FakeOutcome::FailUnsupported
+                    | FakeOutcome::FailOnceThenOk
+                    | FakeOutcome::OkThenFail,
+                    _,
+                ) => {
+                    // Failed open: the sink dies here (the control plane drops
+                    // it on its side too), so do not store it.
+                    drop(on_event);
                     Err(CaptureError::UnsupportedConfig {
                         wanted: cfg,
                         actual: None,
@@ -496,6 +555,7 @@ mod tests {
             outcome,
             negotiate_result,
             opened_configs: Arc::clone(&opened_configs),
+            last_sink: Arc::new(Mutex::new(None)),
         });
         (
             AppCoachDeps {
@@ -508,6 +568,78 @@ mod tests {
             telemetry,
             opened_configs,
         )
+    }
+
+    /// Deps for the lifecycle-seam tests. Returns the coach deps plus a
+    /// [`LifecycleFirer`] (to inject events) and the [`TestClock`] (to drive
+    /// the deadline-aware loop's timers deterministically).
+    fn deps_for_lifecycle(
+        outcome: FakeOutcome,
+        opens: Arc<AtomicU32>,
+    ) -> (AppCoachDeps, LifecycleFirer, Arc<TestClock>) {
+        let clock = Arc::new(TestClock::new(0));
+        let clock_dyn: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let telemetry = Arc::new(TestTelemetry::new(Arc::clone(&clock_dyn)));
+
+        let stream = InputStream {
+            handle: StreamHandle(Arc::new(())),
+            name: "fake mic".into(),
+            channels: 1,
+            sample_rates: SampleRateSupport::Ranges(vec![(48_000, 48_000)]),
+        };
+        let device = InputDevice {
+            persistent_id: Some(DeviceId("fake-id".into())),
+            name: "fake mic".into(),
+            transport: Transport::BuiltIn,
+            streams: vec![clone_input_stream(&stream)],
+        };
+        let session_port: Arc<dyn domain_ports::audio_driver::AudioDriver> =
+            Arc::new(GrantedAudioDriver {
+                devices: FakeDevices {
+                    devices: vec![device],
+                    default: Some(stream),
+                },
+            });
+        let last_sink: Arc<Mutex<Option<LifecycleSink>>> = Arc::new(Mutex::new(None));
+        let capture_port: Arc<dyn AudioCapture> = Arc::new(FakeCapture {
+            opens,
+            outcome,
+            negotiate_result: NegotiateResult::PassThrough,
+            opened_configs: Arc::new(Mutex::new(Vec::new())),
+            last_sink: Arc::clone(&last_sink),
+        });
+        let firer = LifecycleFirer { sink: last_sink };
+        (
+            AppCoachDeps {
+                clock: clock_dyn,
+                telemetry,
+                audio_driver: session_port,
+                audio_capture: capture_port,
+                host_version: "test",
+            },
+            firer,
+            clock,
+        )
+    }
+
+    /// Start a session and block until it reaches `Running`.
+    fn start_to_running(coach: &impl AppCoach) {
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let _ = poll_until(coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
+                    }
+                )
+            })
+        });
     }
 
     fn poll_until<F: Fn(&[CoachEvent]) -> bool>(coach: &impl AppCoach, pred: F) -> Vec<CoachEvent> {
@@ -1479,6 +1611,7 @@ mod tests {
                 outcome: FakeOutcome::Ok,
                 negotiate_result: NegotiateResult::PassThrough,
                 opened_configs: Arc::new(Mutex::new(Vec::new())),
+                last_sink: Arc::new(Mutex::new(None)),
             });
 
         let deps = AppCoachDeps {
@@ -1754,6 +1887,640 @@ mod tests {
             .expect("AudioSessionError");
         // ActivationFailed maps to Other (it's a generic start failure, not a permission error).
         assert_eq!(kind, AudioSessionErrorKind::Other);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    // ---- lifecycle seam tests (Phase 1.6.1c) ----
+    //
+    // These inject `LifecycleEvent`s through the sink the control plane handed
+    // to the fake capture's `open()`, and assert the resulting state machine
+    // transitions per Decision 3's taxonomy.
+
+    /// Collect the state-change sequence observed so far (best-effort drain).
+    fn collect_states(coach: &impl AppCoach) -> Vec<AudioSessionState> {
+        let mut buf = Vec::new();
+        coach.poll_events(&mut buf);
+        buf.iter()
+            .filter_map(|e| match e {
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each terminal `LifecycleEvent` drives the session to `Error` with the
+    /// classified kind, and clears `AudioInfo`.
+    #[test]
+    fn terminal_lifecycle_events_drive_error_with_classified_kind() {
+        for (event, expected) in [
+            (
+                LifecycleEvent::BackendError {
+                    reason: "boom".into(),
+                },
+                AudioSessionErrorKind::MidStreamFailure,
+            ),
+            (
+                LifecycleEvent::MediaServicesReset,
+                AudioSessionErrorKind::MidStreamFailure,
+            ),
+            (
+                LifecycleEvent::PermissionDenied,
+                AudioSessionErrorKind::PermissionDenied,
+            ),
+        ] {
+            let opens = Arc::new(AtomicU32::new(0));
+            let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+            let coach = new(deps);
+            start_to_running(&coach);
+
+            firer.fire(event.clone());
+
+            let events = poll_until(&coach, |evs| {
+                evs.iter()
+                    .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+            });
+            let kind = events
+                .iter()
+                .find_map(|e| match e {
+                    CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("AudioSessionError expected for {event:?}"));
+            assert_eq!(kind, expected, "wrong kind for {event:?}");
+            assert!(
+                coach.audio_info().is_none(),
+                "AudioInfo must clear on terminal {event:?}"
+            );
+
+            assert_eq!(
+                coach.shutdown(Duration::from_secs(1)),
+                ShutdownResult::Clean
+            );
+        }
+    }
+
+    /// `Interrupted` stops capture and clears `AudioInfo`, transitioning
+    /// Running → Stopping → Idle (same shape as a user stop; the coach state
+    /// does not encode *why*).
+    #[test]
+    fn interrupted_stops_and_clears_audio_info() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+        // Drain the start events so we only see what the interruption produces.
+        let _ = collect_states(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        let states: Vec<AudioSessionState> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![AudioSessionState::Stopping, AudioSessionState::Idle],
+            "Interrupted must drive Running → Stopping → Idle"
+        );
+        assert!(
+            coach.audio_info().is_none(),
+            "AudioInfo must be cleared on interruption"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// A lifecycle event whose generation is stale (the session was stopped
+    /// and restarted, bumping the generation) is dropped — no transition.
+    #[test]
+    fn stale_generation_lifecycle_event_is_dropped() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Reach Running (generation now N), capture the sink for that session.
+        start_to_running(&coach);
+        // Stop (bumps generation) then start again (bumps again) — the sink
+        // captured above now carries a stale generation.
+        coach.send_command(Command::AudioStopSession);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        // NOTE: a fresh start would overwrite last_sink, so hold the OLD sink
+        // by firing through `firer` *before* the next start. Instead, we keep
+        // the stale-sink semantics by firing now (post-stop): generation has
+        // bumped, the session is Idle, and the event must be ignored.
+        let _ = collect_states(&coach);
+        firer.fire(LifecycleEvent::BackendError {
+            reason: "late".into(),
+        });
+
+        thread::sleep(Duration::from_millis(60));
+        let mut buf = Vec::new();
+        coach.poll_events(&mut buf);
+        assert!(
+            !buf.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. })),
+            "stale-generation lifecycle event must be dropped (no Error)"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// Duplicate/coalesced terminal events are idempotent: firing the same
+    /// event twice lands in the same end state (the second is stale once the
+    /// first tore the session down).
+    #[test]
+    fn duplicate_terminal_event_is_idempotent() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        firer.fire(LifecycleEvent::BackendError {
+            reason: "first".into(),
+        });
+        // Fire the same event again — the session is already terminal; the
+        // second is harmless.
+        firer.fire(LifecycleEvent::BackendError {
+            reason: "second".into(),
+        });
+
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+        let error_count = events
+            .iter()
+            .filter(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+            .count();
+        assert_eq!(
+            error_count, 1,
+            "duplicate terminal event must produce exactly one Error transition"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// Retry budget: `DeviceUnavailable` with a default-input intent triggers
+    /// reconcile, whose reopen keeps failing; after RETRY_BUDGET consecutive
+    /// failures the session goes terminal `Error`.
+    #[test]
+    fn retry_budget_trips_to_error_after_failed_reopens() {
+        let opens = Arc::new(AtomicU32::new(0));
+        // First open succeeds (reaches Running); every reopen fails.
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::OkThenFail, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        // Default intent → DeviceUnavailable triggers reconcile → reopen fails
+        // → retry → ... → Error once the budget is spent.
+        firer.fire(LifecycleEvent::DeviceUnavailable);
+
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. })),
+            "exhausted retry budget must land in Error"
+        );
+        // First open + RETRY_BUDGET failed reopens.
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1 + 3,
+            "one successful open plus RETRY_BUDGET (3) failed reopens"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// The interruption timeout fires when `InterruptionEnded` never arrives,
+    /// resolving the paused state without wedging (stays Idle, not auto-resumed).
+    #[test]
+    fn interruption_timeout_fires_and_does_not_wedge() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+        // Session should reach Idle (capture stopped).
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+
+        // Advance the fake clock past INTERRUPTION_TIMEOUT_MS; the deadline
+        // loop's timeout branch should fire it. The session stays Idle (no
+        // auto-resume) and remains responsive (a subsequent stop is clean).
+        clock.advance_ns(10_000 * 1_000_000); // 10s > 8s timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // No spurious transition out of Idle (no auto-resume to Running).
+        let states = collect_states(&coach);
+        assert!(
+            !states.contains(&AudioSessionState::Running),
+            "interruption timeout must NOT auto-resume to Running"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `DeviceUnavailable` with a *specific* device intent is terminal (the
+    /// named device is gone; there is nothing to re-select).
+    #[test]
+    fn device_unavailable_specific_intent_is_terminal() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        // Start with a SPECIFIC device id (the fake device's id).
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: Some(DeviceId("fake-id".into())),
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
+                    }
+                )
+            })
+        });
+
+        firer.fire(LifecycleEvent::DeviceUnavailable);
+
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+        let kind = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("AudioSessionError expected for specific-device loss");
+        assert_eq!(kind, AudioSessionErrorKind::MidStreamFailure);
+        // Exactly one open: the start. No reconcile reopen for a specific device.
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "no reopen for specific device"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `DeviceUnavailable` with a default-input intent re-selects (reconcile):
+    /// the reopen succeeds and the session returns to Running.
+    #[test]
+    fn device_unavailable_default_intent_reselects_and_recovers() {
+        let opens = Arc::new(AtomicU32::new(0));
+        // Every open succeeds, so the reconcile reopen recovers cleanly.
+        let (deps, firer, _clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+        let _ = collect_states(&coach);
+
+        firer.fire(LifecycleEvent::DeviceUnavailable);
+
+        // Recovery cycle: Stopping → Starting → Running.
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        CoachEvent::AudioSessionStateChanged {
+                            new_state: AudioSessionState::Running
+                        }
+                    )
+                })
+                .count()
+                >= 1
+        });
+        let states: Vec<AudioSessionState> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                AudioSessionState::Stopping,
+                AudioSessionState::Starting,
+                AudioSessionState::Running,
+            ],
+            "default-intent device loss must reconcile back to Running"
+        );
+        assert!(
+            coach.audio_info().is_some(),
+            "AudioInfo republished after recovery"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "start + one reopen");
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `InterruptionEnded` clears the interruption timeout but does NOT
+    /// auto-resume — the coach stays Idle (the head's Pause screen owns the
+    /// resume decision).
+    #[test]
+    fn interruption_ended_does_not_auto_resume() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        firer.fire(LifecycleEvent::Interrupted);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        let _ = collect_states(&coach);
+
+        // `InterruptionEnded` arrives through the SAME sink as `Interrupted`
+        // (same generation — interruption does not bump). It must be processed
+        // (not gated as stale): it clears the interruption timeout but does
+        // NOT auto-resume.
+        firer.fire(LifecycleEvent::InterruptionEnded {
+            should_resume: true,
+        });
+        thread::sleep(Duration::from_millis(60));
+
+        let states = collect_states(&coach);
+        assert!(
+            !states.contains(&AudioSessionState::Running),
+            "InterruptionEnded must NOT auto-resume to Running"
+        );
+        assert!(coach.audio_info().is_none(), "still stopped after ended");
+
+        // The timeout was cleared by InterruptionEnded — advancing past it
+        // must do nothing (no state churn, no wedge).
+        clock.advance_ns(20_000 * 1_000_000); // 20s ≫ 8s timeout
+        thread::sleep(Duration::from_millis(60));
+        let late = collect_states(&coach);
+        assert!(
+            late.is_empty(),
+            "cleared interruption timeout must not fire after InterruptionEnded"
+        );
+        // Only the initial start opened the device.
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// `RouteChanged` is debounced: the reconcile fires only after the
+    /// debounce window elapses (driven by advancing the fake clock), and the
+    /// reopen returns the session to Running.
+    #[test]
+    fn route_changed_debounces_then_reconciles_to_running() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+        let _ = collect_states(&coach);
+
+        // A burst of route changes — all coalesced into one reconcile.
+        firer.fire(LifecycleEvent::RouteChanged);
+        firer.fire(LifecycleEvent::RouteChanged);
+
+        // Before the debounce elapses, no reopen has happened.
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "route change must not reconcile before the debounce window"
+        );
+
+        // Advance past the debounce window; the loop's timeout branch fires
+        // the deadline → one reconcile → back to Running.
+        clock.advance_ns(1_000 * 1_000_000); // 1s ≫ 150ms debounce
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        CoachEvent::AudioSessionStateChanged {
+                            new_state: AudioSessionState::Running
+                        }
+                    )
+                })
+                .count()
+                >= 1
+        });
+        let states: Vec<AudioSessionState> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoachEvent::AudioSessionStateChanged { new_state } => Some(*new_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                AudioSessionState::Stopping,
+                AudioSessionState::Starting,
+                AudioSessionState::Running,
+            ],
+            "debounced route change must reconcile Stopping → Starting → Running"
+        );
+        // start + exactly one reopen (the burst coalesced).
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "coalesced route-change burst must reopen exactly once"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// A route-debounce armed before an interruption must not survive to fire
+    /// a reconcile against a later user-started session.
+    #[test]
+    fn route_debounce_does_not_survive_interruption_into_next_session() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+        let _ = collect_states(&coach);
+
+        // Arm a route debounce, then immediately interrupt (before it fires).
+        firer.fire(LifecycleEvent::RouteChanged);
+        firer.fire(LifecycleEvent::Interrupted);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Idle
+                    }
+                )
+            })
+        });
+        let _ = collect_states(&coach);
+
+        // User starts a fresh session.
+        start_to_running(&coach);
+        let _ = collect_states(&coach);
+        let opens_after_restart = opens.load(Ordering::SeqCst);
+
+        // Advance the clock well past any debounce/timeout; the stale
+        // pre-interruption debounce must NOT fire a reconcile on this session.
+        clock.advance_ns(60_000 * 1_000_000); // 60s
+        thread::sleep(Duration::from_millis(80));
+
+        let churn = collect_states(&coach);
+        assert!(
+            churn.is_empty(),
+            "stale route debounce must not reconcile the fresh session: {churn:?}"
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            opens_after_restart,
+            "no spurious reopen from a stale debounce"
+        );
+        assert!(coach.audio_info().is_some(), "fresh session stays Running");
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    /// A late event fired through the *old* stream's sink after a recovery
+    /// reopen is dropped (recovery bumps the generation), so it cannot disturb
+    /// the new, healthy session.
+    #[test]
+    fn old_stream_sink_is_stale_after_recovery_reopen() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, firer, clock) = deps_for_lifecycle(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+        start_to_running(&coach);
+
+        // Drain the initial start events so the Running we wait for below is
+        // the *recovery* one, not the start's.
+        let _ = collect_states(&coach);
+
+        // Hold the FIRST session's sink (generation N).
+        let old_sink = firer.take_sink();
+
+        // Trigger a recovery via a debounced route change → reconcile reopens
+        // (generation bumps) and installs a fresh sink. Fire through the held
+        // old sink (still the current generation at this point). Let the
+        // control thread arm the debounce (against fake-clock 0) *before*
+        // advancing the clock past the window — otherwise the deadline would
+        // be armed relative to the advanced time and never fire.
+        old_sink(LifecycleEvent::RouteChanged);
+        thread::sleep(Duration::from_millis(40));
+        clock.advance_ns(1_000 * 1_000_000);
+        let _ = poll_until(&coach, |evs| {
+            evs.iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        CoachEvent::AudioSessionStateChanged {
+                            new_state: AudioSessionState::Running
+                        }
+                    )
+                })
+                .count()
+                >= 1
+        });
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "reconcile reopened once");
+        let _ = collect_states(&coach);
+
+        // Now fire a TERMINAL event through the OLD (generation-N) sink. It is
+        // stale — the reconcile bumped the generation — so it must be dropped.
+        old_sink(LifecycleEvent::BackendError {
+            reason: "late from dead stream".into(),
+        });
+
+        thread::sleep(Duration::from_millis(60));
+        let mut buf = Vec::new();
+        coach.poll_events(&mut buf);
+        assert!(
+            !buf.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. })),
+            "old-stream sink after recovery must be stale and dropped (no Error)"
+        );
+        // Session is still healthy.
+        assert!(
+            coach.audio_info().is_some(),
+            "session must remain Running — the stale event did not tear it down"
+        );
 
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),

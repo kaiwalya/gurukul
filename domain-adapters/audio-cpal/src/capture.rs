@@ -18,6 +18,7 @@ use crate::CpalStreamHandle;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use domain_ports::audio_capture::{
     AudioCapture, CaptureCallback, CaptureConfig, CaptureError, CaptureFrame, CaptureSession,
+    LifecycleEvent, LifecycleSink,
 };
 use domain_ports::audio_devices::StreamHandle;
 use domain_ports::clock::Clock;
@@ -110,11 +111,18 @@ impl AudioCapture for CpalAudioCapture {
         handle: StreamHandle,
         cfg: CaptureConfig,
         mut on_frame: CaptureCallback,
+        on_event: LifecycleSink,
     ) -> Result<CaptureSession, CaptureError> {
         let cpal_handle = handle
             .0
             .downcast_ref::<CpalStreamHandle>()
             .ok_or(CaptureError::InvalidHandle)?;
+
+        // TODO(1.6.2): on iOS, arm the AVAudioSession observers here
+        // (interruption / route-change / mediaServicesReset notifications)
+        // and route them through `on_event`. cpal does not own the session,
+        // so the observer wiring lives alongside the stream. Out of scope for
+        // 1.6.1c — the seam is proven on Mac with the fake event source.
 
         let stream_config = cpal::StreamConfig {
             channels: cfg.channels,
@@ -140,11 +148,16 @@ impl AudioCapture for CpalAudioCapture {
                         t_ms: clock.now_ms(),
                     });
                 },
-                |err| {
-                    // cpal delivers errors on its own thread. There's
-                    // no caller-supplied error sink at this layer —
-                    // future work could route this through telemetry.
-                    eprintln!("[adapter-audio-cpal] stream error: {err}");
+                move |err| {
+                    // cpal delivers errors on its own thread. Route them
+                    // through the lifecycle sink as a `BackendError` — the
+                    // control plane marshals it onto its own thread and
+                    // classifies it (today's mid-stream-death dead-end).
+                    // `on_event` only enqueues, so calling it from cpal's
+                    // error thread is safe.
+                    on_event(LifecycleEvent::BackendError {
+                        reason: err.to_string(),
+                    });
                 },
                 None,
             )

@@ -3,8 +3,56 @@
 //! default sample-rate picker.
 
 use domain_ports::app_coach::AudioSessionErrorKind;
-use domain_ports::audio_capture::CaptureError;
+use domain_ports::audio_capture::{CaptureError, LifecycleEvent};
 use domain_ports::audio_devices::SampleRateSupport;
+
+/// Map a *terminal* mid-stream [`LifecycleEvent`] to the
+/// [`AudioSessionErrorKind`] (and reason string) the head sees.
+///
+/// Returns `None` for the **recoverable** events — `Interrupted`,
+/// `InterruptionEnded`, and `RouteChanged` — which the control plane's
+/// state logic handles (pause / reconcile), not this classifier.
+///
+/// The taxonomy (per the 1.6.1 spec):
+///
+/// - `BackendError` / `DeviceUnavailable` → [`MidStreamFailure`]: the
+///   stream died after a clean start, distinct from a start-time failure.
+/// - `PermissionDenied` → [`PermissionDenied`]: route the user to Settings.
+/// - `MediaServicesReset` → [`MidStreamFailure`]: terminal in Phase 1
+///   (recoverable rebuild is deferred to 1.6.2, on-device only).
+///
+/// `DeviceUnavailable`'s "default intent → re-select rather than terminal"
+/// exception lives in the control plane, which knows the stored start
+/// intent; this classifier only sees the event.
+///
+/// [`MidStreamFailure`]: AudioSessionErrorKind::MidStreamFailure
+/// [`PermissionDenied`]: AudioSessionErrorKind::PermissionDenied
+pub(crate) fn classify_lifecycle_event(
+    ev: &LifecycleEvent,
+) -> Option<(AudioSessionErrorKind, String)> {
+    match ev {
+        LifecycleEvent::BackendError { reason } => Some((
+            AudioSessionErrorKind::MidStreamFailure,
+            format!("backend stream error: {reason}"),
+        )),
+        LifecycleEvent::DeviceUnavailable => Some((
+            AudioSessionErrorKind::MidStreamFailure,
+            "capture device became unavailable mid-session".to_string(),
+        )),
+        LifecycleEvent::PermissionDenied => Some((
+            AudioSessionErrorKind::PermissionDenied,
+            "microphone permission revoked mid-session".to_string(),
+        )),
+        LifecycleEvent::MediaServicesReset => Some((
+            AudioSessionErrorKind::MidStreamFailure,
+            "media services reset (terminal in Phase 1)".to_string(),
+        )),
+        // Recoverable — the control plane's state logic decides, not us.
+        LifecycleEvent::Interrupted
+        | LifecycleEvent::InterruptionEnded { .. }
+        | LifecycleEvent::RouteChanged => None,
+    }
+}
 
 pub(crate) fn classify_open_error(e: CaptureError) -> (AudioSessionErrorKind, String) {
     match e {

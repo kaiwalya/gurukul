@@ -8,7 +8,7 @@
 //! audio callback.
 
 use crate::data_plane::{push_samples, DataPlane, DataPlaneDeps};
-use crate::helpers::{classify_open_error, preferred_sample_rate};
+use crate::helpers::{classify_lifecycle_event, classify_open_error, preferred_sample_rate};
 use crate::inspect::InspectShared;
 use crate::outbound::OutboundQueue;
 use arc_swap::ArcSwap;
@@ -16,7 +16,9 @@ use domain_ports::app_coach::{
     AppCoachDeps, AudioConfig, AudioInfo, AudioSessionErrorKind, AudioSessionState, CoachEvent,
     Command, FeatureSnapshot, MusicInfo,
 };
-use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
+use domain_ports::audio_capture::{
+    CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession, LifecycleEvent, LifecycleSink,
+};
 use domain_ports::audio_devices::{AudioDevices, DeviceId, InputStream};
 use domain_ports::audio_driver::{AudioInitError, AudioInitStatus, AudioPermissionSink};
 use domain_ports::scale::{Scale, ScaleIntervals};
@@ -25,6 +27,56 @@ use domain_ports::{tel_debug, tel_info, tel_warn};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// After this many *consecutive* failed reopens during recovery, give up
+/// and go terminal (`Error(MidStreamFailure)`). Reset to zero on a clean
+/// Running. Guards the reopen→fail→reopen spin both reviewers flagged.
+const RETRY_BUDGET: usize = 3;
+
+/// Route changes arrive in bursts while the OS settles a new route. Coalesce
+/// every route change seen within this window into a single reconcile.
+const ROUTE_DEBOUNCE_MS: u64 = 150;
+
+/// Bounded wait for `InterruptionEnded` to arrive (Apple drops it in some
+/// backgrounding cases). iOS says interruptions last 5–30s; 8s gives buffer
+/// without wedging forever. On timeout we leave the session stopped — never
+/// auto-resume.
+const INTERRUPTION_TIMEOUT_MS: u64 = 8_000;
+
+/// Upper bound on a single `recv_timeout` wait. With no pending deadline the
+/// loop still wakes this often (hygiene, matching the prior fixed 500ms); with
+/// a nearer deadline the wait shrinks to it.
+const MAX_WAIT_MS: u64 = 500;
+
+/// What the head asked for at start, retained for recovery. Recovery
+/// re-runs the start sequence reading *live* device truth plus this stored
+/// intent, so it knows whether a lost device should be re-selected (the
+/// "default input" policy) or is terminal (a specific device).
+#[derive(Clone)]
+struct StartIntent {
+    /// The original [`AudioConfig`] from the head (rate/buffer prefs, label).
+    cfg: AudioConfig,
+    /// The device policy distilled from `cfg.device_id`.
+    device: DevicePolicy,
+}
+
+/// Whether the session targets the system default input or one specific
+/// device. Drives the `DeviceUnavailable` verdict: a default can be
+/// re-selected; a specific device that vanishes is terminal.
+#[derive(Clone, PartialEq)]
+enum DevicePolicy {
+    Default,
+    Specific(DeviceId),
+}
+
+/// The bring-up sequence failed. Carries the classified error so the caller
+/// (start / reconcile) decides what to do next — `bring_up_capture` itself
+/// does **not** transition to `Error`, because a recovery retry must stay in
+/// `Starting` and only the *final* exhausted attempt becomes terminal.
+struct BringUpError {
+    kind: AudioSessionErrorKind,
+    reason: String,
+}
 
 /// Everything the control plane processes. v1 sources:
 ///
@@ -36,10 +88,11 @@ use std::time::Duration;
 ///   Carries the generation that was current when the request was issued;
 ///   stale generations are dropped.
 ///
-/// Phase 2 will add a `CaptureFailedMidStream` variant once the
-/// audio-capture port grows an error-reporting channel out of the RT
-/// callback. Today the cpal adapter has no way to surface mid-stream
-/// errors, so the variant would be dead.
+/// - [`Input::Lifecycle`]: a mid-stream [`LifecycleEvent`] marshalled onto
+///   this thread by the `LifecycleSink` the control plane handed to `open()`.
+///   Carries the generation that was current at `open()` time; a stale
+///   generation (a late notification from an already-dropped session) is
+///   dropped.
 pub(crate) enum Input {
     FromHead(Command),
     /// OS permission callback arrived. `generation` must match the control
@@ -47,7 +100,45 @@ pub(crate) enum Input {
     AudioPermissionResolved {
         generation: u64,
     },
+    /// A mid-stream lifecycle signal from the capture adapter. `generation`
+    /// is the value frozen into the sink closure at `open()` time; it must
+    /// match the control plane's current generation or the event is dropped
+    /// (it came from a session we have since torn down).
+    Lifecycle {
+        event: LifecycleEvent,
+        generation: u64,
+    },
     Quit,
+}
+
+/// A pending time-based action the deadline-aware loop must service. Each
+/// holds an absolute fire time in `clock.now_ms()` units. The loop computes
+/// its per-iteration wait as the gap to the nearest of these, and fires any
+/// that have come due in the timeout branch.
+struct Deadlines {
+    /// Set when an interruption begins; fires if `InterruptionEnded` never
+    /// arrives. Firing leaves the session stopped (no auto-resume).
+    interruption_timeout: Option<u64>,
+    /// Set/extended on each `RouteChanged`; firing triggers one reconcile
+    /// for the whole coalesced burst.
+    route_debounce: Option<u64>,
+}
+
+impl Deadlines {
+    fn new() -> Self {
+        Self {
+            interruption_timeout: None,
+            route_debounce: None,
+        }
+    }
+
+    /// The nearest pending fire time, if any.
+    fn nearest(&self) -> Option<u64> {
+        [self.interruption_timeout, self.route_debounce]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 pub(crate) struct FeaturePublishers {
@@ -111,6 +202,17 @@ pub(crate) struct ControlPlane {
     /// `AudioDriver::new_devices()` at session start and dropped
     /// at session stop/shutdown. `None` when no session is active.
     live_devices: Option<Box<dyn AudioDevices>>,
+    /// What the head asked for at the last successful start. Retained so
+    /// recovery (reconcile) can re-run the start sequence reading live
+    /// device truth plus this intent. `None` when no session is/has been
+    /// running, cleared on a clean user stop.
+    start_intent: Option<StartIntent>,
+    /// Pending time-based actions (interruption timeout, route debounce).
+    /// The `run()` loop computes its wait from the nearest of these.
+    deadlines: Deadlines,
+    /// Consecutive failed reopens during recovery. Reset to 0 on a clean
+    /// Running; trips to `Error` at [`RETRY_BUDGET`].
+    retry_count: usize,
 }
 
 impl ControlPlane {
@@ -141,6 +243,9 @@ impl ControlPlane {
             data_plane: None,
             feature_producer: Some(feature_publishers.history),
             live_devices: None,
+            start_intent: None,
+            deadlines: Deadlines::new(),
+            retry_count: 0,
         }
     }
 
@@ -153,13 +258,24 @@ impl ControlPlane {
         );
 
         loop {
-            // Bounded wait so a slow stream of RT errors doesn't
-            // starve out the chance to inspect state from a future
-            // watchdog. Today the timeout is just hygiene.
-            match self.rx.recv_timeout(Duration::from_millis(500)) {
+            // Deadline-aware wait: block only until the nearest pending
+            // deadline (interruption timeout / route debounce), capped at
+            // MAX_WAIT_MS as hygiene. Deadlines are tracked in
+            // `clock.now_ms()` units so tests with a fake clock drive them
+            // deterministically; the wall-clock `recv_timeout` only bounds
+            // *when* we re-check, never *whether* a deadline is due (the
+            // timeout branch re-reads the clock and fires what has come due).
+            let wait = self.next_wait_ms();
+            match self.rx.recv_timeout(Duration::from_millis(wait)) {
                 Ok(Input::Quit) => break,
-                Ok(input) => self.apply(input),
-                Err(RecvTimeoutError::Timeout) => continue,
+                Ok(input) => {
+                    self.apply(input);
+                    // Service deadlines after every input too, not only on a
+                    // bare timeout: a steady stream of inputs must not starve
+                    // a due interruption-timeout / route-debounce.
+                    self.service_deadlines();
+                }
+                Err(RecvTimeoutError::Timeout) => self.service_deadlines(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -176,6 +292,8 @@ impl ControlPlane {
         }
         // Drop the live devices handle (deactivates the OS audio session).
         self.live_devices = None;
+        self.start_intent = None;
+        self.deadlines = Deadlines::new();
         // Clear any stale reading so a head polling after shutdown
         // sees `None` instead of the last-known f0 / session info.
         self.feature_publisher.store(Arc::new(None));
@@ -225,7 +343,133 @@ impl ControlPlane {
                 }
                 // Stale generation — drop silently.
             }
+            Input::Lifecycle { event, generation } => self.do_lifecycle(event, generation),
         }
+    }
+
+    /// Handle a mid-stream [`LifecycleEvent`]. The generation gate runs first:
+    /// a late notification from an already-dropped session (carrying a stale
+    /// generation) is dropped — it cannot drive a transition on a session the
+    /// user has since stopped or that we have already torn down for recovery.
+    fn do_lifecycle(&mut self, event: LifecycleEvent, generation: u64) {
+        if generation != self.generation {
+            tel_debug!(
+                &*self.deps.telemetry,
+                "app-coach: stale lifecycle event dropped",
+                event = format!("{event:?}"),
+                event_generation = generation,
+                current_generation = self.generation,
+            );
+            return;
+        }
+
+        tel_debug!(
+            &*self.deps.telemetry,
+            "app-coach: lifecycle event",
+            event = format!("{event:?}"),
+            state = format!("{:?}", self.state),
+        );
+
+        match event {
+            LifecycleEvent::Interrupted => self.on_interrupted(),
+            LifecycleEvent::InterruptionEnded { should_resume } => {
+                self.on_interruption_ended(should_resume)
+            }
+            LifecycleEvent::RouteChanged => self.arm_route_debounce(),
+            LifecycleEvent::DeviceUnavailable => {
+                // Context-sensitive: a lost *default* device re-selects (the
+                // new default may already be live); a lost *specific* device
+                // is terminal.
+                match self.start_intent.as_ref().map(|i| i.device.clone()) {
+                    Some(DevicePolicy::Default) => self.reconcile(),
+                    _ => self.fail_lifecycle(&LifecycleEvent::DeviceUnavailable),
+                }
+            }
+            // The rest are terminal in Phase 1.
+            terminal => self.fail_lifecycle(&terminal),
+        }
+    }
+
+    /// An interruption began: stop capture + clear `AudioInfo`
+    /// (`Running → Stopping → Idle`, the same transition as a user stop —
+    /// the coach state does not encode *why*; the head's Pause screen does),
+    /// and arm the interruption timeout so a missing `InterruptionEnded`
+    /// can't wedge us.
+    fn on_interrupted(&mut self) {
+        if self.state != AudioSessionState::Running {
+            return;
+        }
+        // NOTE: we deliberately do NOT bump the generation here. `Interrupted`
+        // and its paired `InterruptionEnded` arrive through the *same* sink
+        // (same OS session, same generation); bumping would gate the paired
+        // `InterruptionEnded` out as stale and the resume hint would be lost.
+        // Stale-event safety still holds: this leaves the session Idle, and a
+        // late *terminal* event is dropped by `fail_lifecycle`'s Idle guard.
+        self.audio_info_publisher.store(Arc::new(None));
+        self.transition(AudioSessionState::Stopping);
+        self.teardown_data_path();
+        self.transition(AudioSessionState::Idle);
+        // Interruption ends the running capture context: drop any pending
+        // route-debounce (it belonged to the now-dead session; otherwise it
+        // could fire a reconcile on a later session). Then arm the
+        // interruption timeout.
+        self.deadlines.route_debounce = None;
+        self.deadlines.interruption_timeout =
+            Some(self.deps.clock.now_ms() + INTERRUPTION_TIMEOUT_MS);
+    }
+
+    /// An interruption ended. Clear the interruption timeout. We never
+    /// auto-resume — `should_resume` is the OS hint the head uses to unlock
+    /// its Resume action (Decision 4), surfaced as an event for the head to
+    /// observe. The coach itself stays Idle.
+    fn on_interruption_ended(&mut self, should_resume: bool) {
+        self.deadlines.interruption_timeout = None;
+        tel_debug!(
+            &*self.deps.telemetry,
+            "app-coach: interruption ended",
+            should_resume = should_resume,
+        );
+    }
+
+    /// Set/extend the route-change debounce deadline. Coalesces a burst of
+    /// route changes into one reconcile after the window settles.
+    ///
+    /// Only meaningful while `Running`: a route change during an interruption
+    /// (Idle) or after a terminal error must not trigger a reconcile, which
+    /// would auto-resume a session the user/OS has paused. Such an event is
+    /// dropped — when the session resumes it reads live truth anyway.
+    fn arm_route_debounce(&mut self) {
+        if self.state != AudioSessionState::Running {
+            return;
+        }
+        self.deadlines.route_debounce = Some(self.deps.clock.now_ms() + ROUTE_DEBOUNCE_MS);
+    }
+
+    /// Terminal verdict from a lifecycle event: classify, clear `AudioInfo`,
+    /// tear down the data path, and go to `Error(kind)`.
+    ///
+    /// Idempotent against a duplicate / coalesced burst: if the session is
+    /// already terminal (`Error`) or idle, a second terminal event is dropped
+    /// — the first already tore everything down, so re-emitting the error
+    /// would be noise.
+    fn fail_lifecycle(&mut self, event: &LifecycleEvent) {
+        if matches!(
+            self.state,
+            AudioSessionState::Error | AudioSessionState::Idle
+        ) {
+            return;
+        }
+        let Some((kind, reason)) = classify_lifecycle_event(event) else {
+            // Recoverable events never reach here.
+            return;
+        };
+        // Bump generation so the dropped session's late notifications are
+        // invalidated, then tear down and go terminal.
+        self.generation = self.generation.wrapping_add(1);
+        self.teardown_data_path();
+        self.start_intent = None;
+        self.deadlines = Deadlines::new();
+        self.fail(kind, reason);
     }
 
     fn do_list_devices(&mut self) {
@@ -261,6 +505,11 @@ impl ControlPlane {
         // Bump generation on every accepted start (whether it succeeds or fails)
         // to invalidate any in-flight permission sinks from before this command.
         self.generation = self.generation.wrapping_add(1);
+        // Clear any session-scoped deadlines / retry budget left over from a
+        // prior session (e.g. an interruption-paused session the user never
+        // explicitly stopped) so they can't fire against this fresh start.
+        self.deadlines = Deadlines::new();
+        self.retry_count = 0;
 
         // Check permission. Do NOT auto-prompt — the head owns prompting via
         // `AudioPermissionRequest`.
@@ -290,55 +539,91 @@ impl ControlPlane {
             }
         }
 
-        // Bring up the OS audio session and get a live devices handle.
-        let devices = match self.deps.audio_driver.new_devices() {
-            Ok(d) => d,
-            Err(AudioInitError::ActivationFailed(msg)) => {
-                self.transition(AudioSessionState::Starting);
-                self.fail(
-                    AudioSessionErrorKind::Other,
-                    format!("session activation failed: {msg}"),
-                );
-                return;
-            }
-            Err(AudioInitError::Denied) => {
-                self.transition(AudioSessionState::Starting);
-                self.fail(
-                    AudioSessionErrorKind::PermissionDenied,
-                    "microphone permission denied".to_string(),
-                );
-                return;
-            }
-            Err(AudioInitError::Undetermined) => {
-                self.transition(AudioSessionState::Starting);
-                self.fail(
-                    AudioSessionErrorKind::PermissionDenied,
-                    "microphone permission not yet determined".to_string(),
-                );
-                return;
-            }
+        // Distill the head's request into a retained start intent — recovery
+        // reads it later (device policy decides terminal vs re-select).
+        let intent = StartIntent {
+            cfg: cfg.clone(),
+            device: match cfg.device_id.clone() {
+                None => DevicePolicy::Default,
+                Some(id) => DevicePolicy::Specific(id),
+            },
         };
 
         // → Starting
         self.transition(AudioSessionState::Starting);
 
-        // Pick the stream for the requested device id.
-        let stream_info = match Self::resolve_stream_from(&*devices, cfg.device_id.as_ref()) {
-            Some(s) => s,
-            None => {
-                self.fail(
-                    AudioSessionErrorKind::DeviceUnavailable,
-                    "no matching device".to_string(),
-                );
-                return;
+        // Run the bring-up sequence. On success retain the intent + reset the
+        // retry budget; on failure go terminal (a start failure is terminal —
+        // recovery only applies once a session has been Running).
+        match self.bring_up_capture(&intent) {
+            Ok(()) => {
+                self.start_intent = Some(intent);
+                self.retry_count = 0;
+            }
+            Err(BringUpError { kind, reason }) => self.fail(kind, reason),
+        }
+    }
+
+    /// The shared start sequence: activate session → enumerate → resolve the
+    /// stream for the intent's device policy → negotiate → build the data
+    /// plane → open the stream (handing it a generation-stamped lifecycle
+    /// sink) → publish `AudioInfo` → `Running`.
+    ///
+    /// Used by both the head's start and recovery's reconcile. It reads
+    /// **live** device truth every time, so on reconcile a "default" intent
+    /// re-selects the current default. On any failure it transitions to
+    /// `Error` (via [`fail`]) and returns `Err(BringUpError)`; the caller
+    /// decides what to do next (start gives up; reconcile counts a retry).
+    ///
+    /// Precondition: state is `Starting` and the data path is already torn
+    /// down (no live capture / data plane). On failure it returns the
+    /// classified error **without** transitioning to `Error` — the caller
+    /// owns that decision.
+    fn bring_up_capture(&mut self, intent: &StartIntent) -> Result<(), BringUpError> {
+        // Bring up the OS audio session and get a live devices handle.
+        let devices = match self.deps.audio_driver.new_devices() {
+            Ok(d) => d,
+            Err(AudioInitError::ActivationFailed(msg)) => {
+                return Err(BringUpError {
+                    kind: AudioSessionErrorKind::Other,
+                    reason: format!("session activation failed: {msg}"),
+                });
+            }
+            Err(AudioInitError::Denied) => {
+                return Err(BringUpError {
+                    kind: AudioSessionErrorKind::PermissionDenied,
+                    reason: "microphone permission denied".to_string(),
+                });
+            }
+            Err(AudioInitError::Undetermined) => {
+                return Err(BringUpError {
+                    kind: AudioSessionErrorKind::PermissionDenied,
+                    reason: "microphone permission not yet determined".to_string(),
+                });
             }
         };
 
-        let sample_rate = cfg
+        // Pick the stream for the intent's device policy.
+        let want = match &intent.device {
+            DevicePolicy::Default => None,
+            DevicePolicy::Specific(id) => Some(id),
+        };
+        let stream_info = match Self::resolve_stream_from(&*devices, want) {
+            Some(s) => s,
+            None => {
+                return Err(BringUpError {
+                    kind: AudioSessionErrorKind::DeviceUnavailable,
+                    reason: "no matching device".to_string(),
+                });
+            }
+        };
+
+        let sample_rate = intent
+            .cfg
             .sample_rate
             .unwrap_or_else(|| preferred_sample_rate(&stream_info.sample_rates));
         let channels = stream_info.channels;
-        let buffer_frames = cfg.buffer_frames.or(Some(sample_rate / 100));
+        let buffer_frames = intent.cfg.buffer_frames.or(Some(sample_rate / 100));
 
         let requested_cfg = CaptureConfig {
             sample_rate,
@@ -357,8 +642,7 @@ impl ControlPlane {
             Ok(cfg) => cfg,
             Err(e) => {
                 let (kind, reason) = classify_open_error(e);
-                self.fail(kind, reason);
-                return;
+                return Err(BringUpError { kind, reason });
             }
         };
 
@@ -373,14 +657,16 @@ impl ControlPlane {
                 clock: Arc::clone(&self.deps.clock),
                 telemetry: Arc::clone(&self.deps.telemetry),
                 inspect: Arc::clone(&self.inspect),
-                session_prefix: cfg.session_label.clone(),
+                session_prefix: intent.cfg.session_label.clone(),
             },
             &mut self.feature_producer,
         ) {
             Ok(t) => t,
             Err(e) => {
-                self.fail(AudioSessionErrorKind::Other, e.to_string());
-                return;
+                return Err(BringUpError {
+                    kind: AudioSessionErrorKind::Other,
+                    reason: e.to_string(),
+                });
             }
         };
         let crate::data_plane::DataPlaneStartup {
@@ -390,11 +676,13 @@ impl ControlPlane {
         } = startup;
 
         let callback = self.build_frame_callback(negotiated_cfg.channels, producer, dropped_for_cb);
+        let on_event = self.build_lifecycle_sink();
 
         match self.deps.audio_capture.open(
             stream_info.handle.clone(),
             negotiated_cfg.clone(),
             callback,
+            on_event,
         ) {
             Ok(session) => {
                 self.capture = Some(session);
@@ -416,10 +704,11 @@ impl ControlPlane {
                 self.audio_info_publisher.store(Arc::new(Some(AudioInfo {
                     sample_rate: negotiated_cfg.sample_rate,
                     channels: negotiated_cfg.channels,
-                    device_id: cfg.device_id.clone(),
+                    device_id: intent.cfg.device_id.clone(),
                     buffer_frames: negotiated_cfg.buffer_frames,
                 })));
                 self.transition(AudioSessionState::Running);
+                Ok(())
             }
             Err(e) => {
                 // Capture refused. The data plane is still spinning
@@ -430,7 +719,130 @@ impl ControlPlane {
                 // Drop devices (deactivate session) before failing.
                 drop(devices);
                 let (kind, reason) = classify_open_error(e);
-                self.fail(kind, reason);
+                Err(BringUpError { kind, reason })
+            }
+        }
+    }
+
+    /// Build the [`LifecycleSink`] handed to `open()`. Mirrors the permission
+    /// sink: clone `tx`, freeze the **current** generation into the closure,
+    /// and enqueue `Input::Lifecycle` carrying that fixed generation. The sink
+    /// only enqueues — never mutates state or touches the `!Send` session — so
+    /// it is safe to fire from any OS-notification thread. A late event from a
+    /// dropped session carries the stale generation and is dropped on receipt.
+    fn build_lifecycle_sink(&self) -> LifecycleSink {
+        let tx = self.tx.clone();
+        let generation = self.generation;
+        Box::new(move |event| {
+            let _ = tx.send(Input::Lifecycle { event, generation });
+        })
+    }
+
+    /// Recovery: re-run the start sequence reading live device truth + the
+    /// stored intent. Drives `Running → Stopping → Starting → Running` (the
+    /// head observes a recovery cycle it did not command).
+    ///
+    /// **Generation.** Each reopen bumps the generation before building the
+    /// new sink (the same "stop also bumps" rule the spec applies to user
+    /// stops): the dropped stream's late notifications carry the old
+    /// generation and are dropped, so they cannot disturb the new stream.
+    ///
+    /// **Retries stay in `Starting`.** An intermediate failed reopen does
+    /// **not** emit a public `Error` — only the final attempt, once the retry
+    /// budget is spent, transitions to terminal `Error`. This keeps the
+    /// closed-enum contract ("`Error` is terminal until `AudioStopSession`")
+    /// intact: we never bounce out of `Error` on our own.
+    fn reconcile(&mut self) {
+        // Only reconcile a *live* session. From Idle (interruption pause) or
+        // Error (terminal) a reconcile would auto-resume a session the user or
+        // OS has paused — never do that. A retry loop below re-enters from
+        // Starting, which is also fine.
+        if !matches!(
+            self.state,
+            AudioSessionState::Running | AudioSessionState::Starting
+        ) {
+            return;
+        }
+        let Some(intent) = self.start_intent.clone() else {
+            // Nothing to reconcile against — no session was ever running.
+            return;
+        };
+
+        // Tear down the current (possibly half-dead) data path, then walk
+        // Stopping → Starting. Bump the generation so the old session's sink
+        // is invalidated.
+        self.audio_info_publisher.store(Arc::new(None));
+        self.transition(AudioSessionState::Stopping);
+        self.teardown_data_path();
+        self.generation = self.generation.wrapping_add(1);
+        self.transition(AudioSessionState::Starting);
+
+        // Retry in-place: each attempt reads live truth and bumps the
+        // generation, so a transient failure may clear on the next try. Stay
+        // in `Starting` between attempts — no public `Error` until exhaustion.
+        loop {
+            match self.bring_up_capture(&intent) {
+                Ok(()) => {
+                    self.retry_count = 0;
+                    return;
+                }
+                Err(BringUpError { kind, reason }) => {
+                    self.retry_count += 1;
+                    if self.retry_count >= RETRY_BUDGET {
+                        tel_warn!(
+                            &*self.deps.telemetry,
+                            "app-coach: recovery exhausted retry budget",
+                            retry_count = self.retry_count as u64,
+                        );
+                        self.start_intent = None;
+                        self.deadlines = Deadlines::new();
+                        self.fail(kind, reason);
+                        return;
+                    }
+                    // Bump the generation for the next reopen's sink, then
+                    // retry. Stay in `Starting`.
+                    self.generation = self.generation.wrapping_add(1);
+                }
+            }
+        }
+    }
+
+    /// Per-iteration `recv_timeout` duration: the gap to the nearest pending
+    /// deadline (clamped to ≥1ms so a just-passed deadline still wakes us),
+    /// capped at [`MAX_WAIT_MS`]. With no deadline pending, the cap is used.
+    fn next_wait_ms(&self) -> u64 {
+        match self.deadlines.nearest() {
+            None => MAX_WAIT_MS,
+            Some(deadline) => {
+                let now = self.deps.clock.now_ms();
+                deadline.saturating_sub(now).clamp(1, MAX_WAIT_MS)
+            }
+        }
+    }
+
+    /// Fire whichever deadlines have come due (reading the clock fresh).
+    /// Called from the loop's timeout branch.
+    fn service_deadlines(&mut self) {
+        let now = self.deps.clock.now_ms();
+
+        if let Some(deadline) = self.deadlines.interruption_timeout {
+            if now >= deadline {
+                // InterruptionEnded never arrived. Leave the session stopped
+                // (already Idle from on_interrupted) — never auto-resume.
+                self.deadlines.interruption_timeout = None;
+                tel_warn!(
+                    &*self.deps.telemetry,
+                    "app-coach: interruption timeout fired (no InterruptionEnded)",
+                );
+            }
+        }
+
+        if let Some(deadline) = self.deadlines.route_debounce {
+            if now >= deadline {
+                self.deadlines.route_debounce = None;
+                // Reconcile only if a session is (or was) live; reconcile()
+                // no-ops without a stored intent.
+                self.reconcile();
             }
         }
     }
@@ -445,9 +857,15 @@ impl ControlPlane {
                 // but the spec says Stop-during-Start cancels, so
                 // we model it: if capture was opened, drop it.
                 //
-                // Bump generation to invalidate any in-flight permission
-                // sinks that referenced this session.
+                // Bump generation to invalidate any in-flight permission /
+                // lifecycle sinks that referenced this session.
                 self.generation = self.generation.wrapping_add(1);
+                // A user stop ends the session intentionally — drop the
+                // recovery intent, pending deadlines, and retry budget so no
+                // reconcile fires after the user walked away.
+                self.start_intent = None;
+                self.deadlines = Deadlines::new();
+                self.retry_count = 0;
                 // Clear audio_info *before* the transition so a head
                 // reacting to Stopping observes `None`, not stale info.
                 self.audio_info_publisher.store(Arc::new(None));
@@ -457,6 +875,9 @@ impl ControlPlane {
             }
             AudioSessionState::Error => {
                 // Idempotent cleanup.
+                self.start_intent = None;
+                self.deadlines = Deadlines::new();
+                self.retry_count = 0;
                 self.teardown_data_path();
                 self.transition(AudioSessionState::Idle);
             }

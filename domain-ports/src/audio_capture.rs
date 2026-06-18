@@ -90,6 +90,89 @@ pub struct CaptureFrame<'a> {
 /// buffer cursors) without interior mutability.
 pub type CaptureCallback = Box<dyn FnMut(CaptureFrame<'_>) + Send + 'static>;
 
+/// A mid-stream lifecycle signal the adapter raises *after* [`open`]
+/// succeeds — the seam for the OS taking the mic away.
+///
+/// These are the platform-neutral distillation of the events Apple's
+/// `AVAudioSession`, Android's Camera2, and a Mac CoreAudio device
+/// listener all surface in their own vocabularies. Apple's explicit
+/// warning is honoured in the shape: "interruption ended" (a
+/// *conditional* resume hint) is **not** collapsed with "route
+/// changed" (an *unconditional* re-read) — different variants, different
+/// recovery paths.
+///
+/// An event is a **trigger**, not a recovery instruction: the control
+/// plane re-evaluates current truth (re-enumerate / renegotiate /
+/// reopen) when it receives one, so a missed, duplicated, or coalesced
+/// event is safe.
+///
+/// [`open`]: AudioCapture::open
+#[derive(Debug, Clone)]
+pub enum LifecycleEvent {
+    /// An interruption began (incoming call, Siri, another app grabbed
+    /// the session). The stream is gone; do **not** reopen yet.
+    Interrupted,
+    /// An interruption ended. `should_resume` carries the OS hint
+    /// (Apple's `.shouldResume` option): resume only if set. The
+    /// control plane never auto-resumes — this merely unlocks resume.
+    InterruptionEnded { should_resume: bool },
+    /// The audio route changed (headphones plugged/unplugged, a device
+    /// became the new default). Re-read config and keep running if the
+    /// stored intent is still satisfiable.
+    RouteChanged,
+    /// The OS media services were reset — every audio object is now
+    /// invalid. Phase-1 treats this as terminal (the recoverable
+    /// rebuild lands in 1.6.2 on-device, where it is actually
+    /// exercisable).
+    MediaServicesReset,
+    /// The capture device was lost / disconnected.
+    DeviceUnavailable,
+    /// Mic permission was revoked mid-session. Terminal; route the user
+    /// to OS Settings.
+    PermissionDenied,
+    /// The backend's stream errored (cpal's error closure, formerly an
+    /// `eprintln!` dead-end). Carries the backend's message.
+    BackendError { reason: String },
+}
+
+/// The adapter→control-plane sink for [`LifecycleEvent`]s.
+///
+/// It is a plain `Send` enqueuer: every invocation merely pushes one
+/// event onto the control plane's mailbox. It is `Fn` (not `FnMut` /
+/// `FnOnce`) because it fires repeatedly over the life of a stream and
+/// only enqueues — it owns no mutable state.
+///
+/// **Lifecycle.** It is born in [`open`](AudioCapture::open) and lives
+/// as long as the adapter's notification source can fire. It must
+/// capture **only `Send` things** (a cloned channel sender, a frozen
+/// generation token) and **never the `!Send` [`CaptureSession`]** —
+/// observer notifications fire on arbitrary OS threads, so the sink
+/// must be safe to *move to* the notification thread.
+///
+/// On most adapters the sink dies with the [`CaptureSession`] (cpal's
+/// error closure is owned by the stream). On a platform whose
+/// interruption model spans the stream's life — iOS, where
+/// `Interrupted` tears down the audio unit but the paired
+/// `InterruptionEnded` must still be deliverable (1.6.2) — the observer
+/// feed that owns the sink must outlive a single stream open/close, so
+/// the adapter parks the sink on a longer-lived object than the cpal
+/// stream. Either way the sink must not keep the control-plane channel
+/// alive past coach shutdown.
+///
+/// `Send` (not `Sync`) is deliberate and sufficient for the adapters in
+/// this commit: the sink is *moved into* a single notification closure
+/// (cpal's stream-error callback), not shared across threads. If a
+/// future platform (iOS, 1.6.2) needs to fan one sink out to several
+/// observer threads concurrently, wrap it in an `Arc` adapter-side or
+/// promote this alias to `Arc<dyn Fn(..) + Send + Sync>` then.
+///
+/// Note the sink takes only a [`LifecycleEvent`] — no generation. The
+/// generation lives in the *control plane's* closure that constructs
+/// this sink, exactly like the permission sink: the closure wraps each
+/// event with the generation that was current at `open()` time before
+/// enqueueing. The port type stays generation-free.
+pub type LifecycleSink = Box<dyn Fn(LifecycleEvent) + Send + 'static>;
+
 /// Failure modes for [`AudioCapture::open`] and [`AudioCapture::negotiate`].
 ///
 /// Closed set so callers can match exhaustively. `Other` is the
@@ -206,10 +289,17 @@ pub trait AudioCapture: Send + Sync {
     /// The control plane passes the config returned by [`negotiate`]
     /// verbatim. `open` trusts it and fails only on genuine runtime errors
     /// (device unplugged, busy) — format validation is `negotiate`'s job.
+    ///
+    /// `on_event` is the [`LifecycleSink`]: the adapter calls it once per
+    /// mid-stream lifecycle signal (interruption, route change, backend
+    /// error, …). The sink only enqueues onto the control plane's mailbox,
+    /// so it is safe to call from any OS-notification thread. Adapters that
+    /// cannot be interrupted (a WAV file source) accept it and ignore it.
     fn open(
         &self,
         handle: StreamHandle,
         cfg: CaptureConfig,
         on_frame: CaptureCallback,
+        on_event: LifecycleSink,
     ) -> Result<CaptureSession, CaptureError>;
 }
