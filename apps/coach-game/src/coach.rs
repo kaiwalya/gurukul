@@ -80,16 +80,19 @@ pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
 
-    let (audio_devices, audio_capture): (
-        Arc<dyn domain_ports::audio_devices::AudioDevices>,
+    let (audio_session, audio_capture): (
+        Arc<dyn domain_ports::audio_session::AudioSessionProvider>,
         Arc<dyn domain_ports::audio_capture::AudioCapture>,
     ) = match replay_audio {
         None => (
-            Arc::new(adapter_audio_cpal::new_devices()),
+            Arc::new(adapter_audio_cpal::new_session_provider()),
             Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock))),
         ),
         Some(wav) => (
-            Arc::new(adapter_audio_wav::new_devices(wav)),
+            // WAV replay: the session provider returns WAV-backed AudioDevices
+            // so resolve_stream() gets the WAV stream handle (needed for
+            // AudioCapture::open to downcast back to the WAV path).
+            Arc::new(adapter_audio_wav::new_session_provider(wav)),
             Arc::new(adapter_audio_wav::new_capture(Arc::clone(&clock))),
         ),
     };
@@ -97,7 +100,7 @@ pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach
     Box::new(adapter_app_coach::new(AppCoachDeps {
         clock,
         telemetry,
-        audio_devices,
+        audio_session,
         audio_capture,
         host_version: env!("CARGO_PKG_VERSION"),
     }))
@@ -170,6 +173,9 @@ pub fn drain_events(coach: NonSend<Coach>, models: DrainReadModels) {
                 warn!("events dropped: {count}");
             }
             CoachEvent::AudioDefaultInputChanged { .. } => {}
+            CoachEvent::AudioPermissionStatus { status } => {
+                info!("audio permission status: {status:?}");
+            }
             // The musical frame was (re)configured. Pull the fresh
             // snapshot and republish it for the UI to read.
             CoachEvent::MusicSessionConfigured { scale } => {

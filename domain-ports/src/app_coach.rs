@@ -34,7 +34,8 @@
 //! in. This is the load-bearing constraint of the design.
 
 use crate::audio_capture::AudioCapture;
-use crate::audio_devices::{AudioDevices, DeviceId, InputDevice};
+use crate::audio_devices::{DeviceId, InputDevice};
+use crate::audio_session::{AudioInitStatus, AudioSessionProvider};
 use crate::clock::Clock;
 use crate::scale::{Scale, ScaleIntervals};
 use crate::telemetry::Telemetry;
@@ -49,7 +50,12 @@ use std::time::Duration;
 pub struct AppCoachDeps {
     pub clock: Arc<dyn Clock>,
     pub telemetry: Arc<dyn Telemetry>,
-    pub audio_devices: Arc<dyn AudioDevices>,
+    /// Audio session + permission provider. Replaces the earlier
+    /// `audio_devices: Arc<dyn AudioDevices>` — the provider yields a
+    /// ready `AudioDevices` only when the OS session is active and permission
+    /// is granted. The control plane calls `provider.new_devices()` once per
+    /// `AudioStartSession` rather than holding a long-lived devices handle.
+    pub audio_session: Arc<dyn AudioSessionProvider>,
     pub audio_capture: Arc<dyn AudioCapture>,
     /// `CARGO_PKG_VERSION` of the *host* binary. Stamped on lifecycle
     /// telemetry so warehouse data attributes behaviour to the version
@@ -121,6 +127,19 @@ pub enum Command {
     /// A head can read current state via the snapshot or fold the event
     /// stream to reconstruct it; the two never drift.
     MusicConfigureSession { scale: Scale },
+
+    /// Synchronously read the current OS mic permission state. Never
+    /// shows a dialog. The coach replies with
+    /// [`CoachEvent::AudioPermissionStatus`].
+    AudioPermissionQuery,
+
+    /// Fire the async OS permission request. Returns immediately; the
+    /// OS dialog (if any) appears later. The coach replies with
+    /// [`CoachEvent::AudioPermissionStatus`] once the state resolves.
+    ///
+    /// The head owns prompting: it sends this only after showing its
+    /// own "we need the mic for singing coaching" framing.
+    AudioPermissionRequest,
 }
 
 /// Negotiated parameters of the currently-running session.
@@ -268,6 +287,12 @@ pub enum CoachEvent {
     /// Surfaced as a single event per drop-burst (not one per dropped
     /// event). Heads SHOULD drain at ≥10Hz to avoid this.
     EventsDropped { count: u32 },
+
+    /// Reply to [`Command::AudioPermissionQuery`] or the resolved
+    /// outcome of [`Command::AudioPermissionRequest`]. `status` is the
+    /// live value read from the OS at the time of emission — never a
+    /// stale verdict carried in the request.
+    AudioPermissionStatus { status: AudioInitStatus },
 }
 
 /// Where the session is in its lifecycle. Heads render UI off this.
@@ -297,6 +322,9 @@ pub enum AudioSessionErrorKind {
     UnsupportedConfig,
     /// The audio stream failed mid-session (e.g. device unplugged).
     MidStreamFailure,
+    /// Mic permission was explicitly denied by the user. The head should
+    /// direct the user to enable it in OS Settings.
+    PermissionDenied,
     Other,
     // `WorkerPanic` is Phase 2 — there is no worker in v1 to detect.
 }

@@ -17,11 +17,12 @@ use domain_ports::app_coach::{
     Command, FeatureSnapshot, MusicInfo,
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
-use domain_ports::audio_devices::{DeviceId, InputStream};
+use domain_ports::audio_devices::{AudioDevices, DeviceId, InputStream};
+use domain_ports::audio_session::{AudioInitError, AudioInitStatus, AudioPermissionSink};
 use domain_ports::scale::{Scale, ScaleIntervals};
 use domain_ports::tuning::Tuning;
 use domain_ports::{tel_debug, tel_info, tel_warn};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +31,10 @@ use std::time::Duration;
 /// - [`Input::FromHead`]: head commands arrived via `send_command`.
 /// - [`Input::Quit`]: shutdown signal. Synthesised by
 ///   [`AppCoach::shutdown`] / `Drop`.
+/// - [`Input::AudioPermissionResolved`]: fired by the `AudioPermissionSink`
+///   callback on an arbitrary thread when the OS permission state changes.
+///   Carries the generation that was current when the request was issued;
+///   stale generations are dropped.
 ///
 /// Phase 2 will add a `CaptureFailedMidStream` variant once the
 /// audio-capture port grows an error-reporting channel out of the RT
@@ -37,6 +42,11 @@ use std::time::Duration;
 /// errors, so the variant would be dead.
 pub(crate) enum Input {
     FromHead(Command),
+    /// OS permission callback arrived. `generation` must match the control
+    /// plane's current generation or the event is dropped.
+    AudioPermissionResolved {
+        generation: u64,
+    },
     Quit,
 }
 
@@ -49,6 +59,10 @@ pub(crate) struct ControlPlane {
     deps: AppCoachDeps,
     outbound: Arc<Mutex<OutboundQueue>>,
     rx: mpsc::Receiver<Input>,
+    /// Cloned sender for this control plane's own input channel. Used to
+    /// build `AudioPermissionSink` closures that enqueue
+    /// `Input::AudioPermissionResolved` from the OS callback thread.
+    tx: Sender<Input>,
     feature_publisher: Arc<ArcSwap<Option<FeatureSnapshot>>>,
     /// Holds the negotiated `AudioInfo` while a session is `Running`,
     /// `None` otherwise. The control plane writes it *before* emitting
@@ -69,6 +83,11 @@ pub(crate) struct ControlPlane {
     inspect: Arc<InspectShared>,
 
     state: AudioSessionState,
+    /// Monotonically increasing generation counter. Bumped whenever a
+    /// start is accepted and whenever a stop is accepted. Sinks built for
+    /// `AudioPermissionRequest` capture the snapshot; a late
+    /// `AudioPermissionResolved` carrying a mismatched generation is dropped.
+    generation: u64,
     /// The musical frame of reference — the [`Scale`] the singer is in —
     /// set by [`Command::MusicConfigureSession`]. `None` until the head first
     /// configures. Decoupled from the audio lifecycle: it is *not*
@@ -88,12 +107,18 @@ pub(crate) struct ControlPlane {
     /// Persistent producer for the ordered feature queue. Loaned to the
     /// active data-plane worker and returned when that worker joins.
     feature_producer: Option<rtrb::Producer<FeatureSnapshot>>,
+    /// Live `AudioDevices` handle for the current session. Produced by
+    /// `AudioSessionProvider::new_devices()` at session start and dropped
+    /// at session stop/shutdown. `None` when no session is active.
+    live_devices: Option<Box<dyn AudioDevices>>,
 }
 
 impl ControlPlane {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         deps: AppCoachDeps,
         outbound: Arc<Mutex<OutboundQueue>>,
+        tx: Sender<Input>,
         rx: mpsc::Receiver<Input>,
         feature_publishers: FeaturePublishers,
         audio_info_publisher: Arc<ArcSwap<Option<AudioInfo>>>,
@@ -104,15 +129,18 @@ impl ControlPlane {
             deps,
             outbound,
             rx,
+            tx,
             feature_publisher: feature_publishers.latest,
             audio_info_publisher,
             music_info_publisher,
             inspect,
             state: AudioSessionState::Idle,
+            generation: 0,
             session_model: None,
             capture: None,
             data_plane: None,
             feature_producer: Some(feature_publishers.history),
+            live_devices: None,
         }
     }
 
@@ -146,6 +174,8 @@ impl ControlPlane {
         if let Some(dp) = self.data_plane.take() {
             let _ = dp.stop(&*self.deps.telemetry);
         }
+        // Drop the live devices handle (deactivates the OS audio session).
+        self.live_devices = None;
         // Clear any stale reading so a head polling after shutdown
         // sees `None` instead of the last-known f0 / session info.
         self.feature_publisher.store(Arc::new(None));
@@ -174,11 +204,41 @@ impl ControlPlane {
             Input::FromHead(Command::MusicConfigureSession { scale }) => {
                 self.do_configure_session(scale)
             }
+            Input::FromHead(Command::AudioPermissionQuery) => {
+                let status = self.deps.audio_session.init_status();
+                self.push_event(CoachEvent::AudioPermissionStatus { status });
+            }
+            Input::FromHead(Command::AudioPermissionRequest) => {
+                let generation = self.generation;
+                let tx = self.tx.clone();
+                let sink = AudioPermissionSink(Box::new(move || {
+                    // Enqueue on the control thread; if the channel is closed
+                    // (shutdown in flight) the send fails silently.
+                    let _ = tx.send(Input::AudioPermissionResolved { generation });
+                }));
+                self.deps.audio_session.request(sink);
+            }
+            Input::AudioPermissionResolved { generation } => {
+                if generation == self.generation {
+                    let status = self.deps.audio_session.init_status();
+                    self.push_event(CoachEvent::AudioPermissionStatus { status });
+                }
+                // Stale generation — drop silently.
+            }
         }
     }
 
     fn do_list_devices(&mut self) {
-        let devices = self.deps.audio_devices.list_devices();
+        // Never prompt — listing is passive. If permission is not yet granted,
+        // return an empty list rather than blocking or auto-prompting.
+        if self.deps.audio_session.init_status() != AudioInitStatus::Granted {
+            self.push_event(CoachEvent::AudioDevicesListed { devices: vec![] });
+            return;
+        }
+        let devices = match self.deps.audio_session.new_devices() {
+            Ok(d) => d.list_devices(),
+            Err(_) => vec![],
+        };
         self.push_event(CoachEvent::AudioDevicesListed { devices });
     }
 
@@ -198,11 +258,72 @@ impl ControlPlane {
             return;
         }
 
+        // Bump generation on every accepted start (whether it succeeds or fails)
+        // to invalidate any in-flight permission sinks from before this command.
+        self.generation = self.generation.wrapping_add(1);
+
+        // Check permission. Do NOT auto-prompt — the head owns prompting via
+        // `AudioPermissionRequest`.
+        match self.deps.audio_session.init_status() {
+            AudioInitStatus::Granted => {
+                // Fall through to start the session.
+            }
+            AudioInitStatus::Denied => {
+                // Terminal — user must enable in OS Settings.
+                self.transition(AudioSessionState::Starting);
+                self.fail(
+                    AudioSessionErrorKind::PermissionDenied,
+                    "microphone permission denied".to_string(),
+                );
+                return;
+            }
+            AudioInitStatus::Undetermined => {
+                // Not yet decided — the head should call AudioPermissionRequest
+                // first. Do not auto-prompt.
+                self.transition(AudioSessionState::Starting);
+                self.fail(
+                    AudioSessionErrorKind::PermissionDenied,
+                    "microphone permission not yet determined; request permission first"
+                        .to_string(),
+                );
+                return;
+            }
+        }
+
+        // Bring up the OS audio session and get a live devices handle.
+        let devices = match self.deps.audio_session.new_devices() {
+            Ok(d) => d,
+            Err(AudioInitError::ActivationFailed(msg)) => {
+                self.transition(AudioSessionState::Starting);
+                self.fail(
+                    AudioSessionErrorKind::Other,
+                    format!("session activation failed: {msg}"),
+                );
+                return;
+            }
+            Err(AudioInitError::Denied) => {
+                self.transition(AudioSessionState::Starting);
+                self.fail(
+                    AudioSessionErrorKind::PermissionDenied,
+                    "microphone permission denied".to_string(),
+                );
+                return;
+            }
+            Err(AudioInitError::Undetermined) => {
+                self.transition(AudioSessionState::Starting);
+                self.fail(
+                    AudioSessionErrorKind::PermissionDenied,
+                    "microphone permission not yet determined".to_string(),
+                );
+                return;
+            }
+        };
+
         // → Starting
         self.transition(AudioSessionState::Starting);
 
         // Pick the stream for the requested device id.
-        let stream_info = match self.resolve_stream(cfg.device_id.as_ref()) {
+        let stream_info = match Self::resolve_stream_from(&*devices, cfg.device_id.as_ref()) {
             Some(s) => s,
             None => {
                 self.fail(
@@ -278,6 +399,9 @@ impl ControlPlane {
             Ok(session) => {
                 self.capture = Some(session);
                 self.data_plane = Some(data_plane);
+                // Store the live devices handle; dropping it would deactivate
+                // the session while capture is still running.
+                self.live_devices = Some(devices);
                 tel_info!(
                     &*self.deps.telemetry,
                     "app-coach: capture started",
@@ -303,6 +427,8 @@ impl ControlPlane {
                 // the callback which we've now dropped). Stop it so
                 // its worker thread joins before we surface the error.
                 self.feature_producer = data_plane.stop(&*self.deps.telemetry);
+                // Drop devices (deactivate session) before failing.
+                drop(devices);
                 let (kind, reason) = classify_open_error(e);
                 self.fail(kind, reason);
             }
@@ -319,6 +445,9 @@ impl ControlPlane {
                 // but the spec says Stop-during-Start cancels, so
                 // we model it: if capture was opened, drop it.
                 //
+                // Bump generation to invalidate any in-flight permission
+                // sinks that referenced this session.
+                self.generation = self.generation.wrapping_add(1);
                 // Clear audio_info *before* the transition so a head
                 // reacting to Stopping observes `None`, not stale info.
                 self.audio_info_publisher.store(Arc::new(None));
@@ -386,6 +515,8 @@ impl ControlPlane {
         if let Some(dp) = self.data_plane.take() {
             self.feature_producer = dp.stop(&*self.deps.telemetry);
         }
+        // Drop the live devices handle (deactivates the OS audio session).
+        self.live_devices = None;
         self.feature_publisher.store(Arc::new(None));
         // Clear the inspect publishers so the head's debug pane sees
         // an empty node list + no taps until the next session starts.
@@ -425,12 +556,13 @@ impl ControlPlane {
         self.outbound.lock().unwrap().push(ev);
     }
 
-    fn resolve_stream(&self, want: Option<&DeviceId>) -> Option<InputStream> {
+    fn resolve_stream_from(
+        devices: &dyn AudioDevices,
+        want: Option<&DeviceId>,
+    ) -> Option<InputStream> {
         match want {
-            None => self.deps.audio_devices.default_input(),
-            Some(id) => self
-                .deps
-                .audio_devices
+            None => devices.default_input(),
+            Some(id) => devices
                 .list_devices()
                 .into_iter()
                 .find(|d| d.persistent_id.as_ref() == Some(id))

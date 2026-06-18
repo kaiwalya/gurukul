@@ -7,5 +7,14 @@ edition = "2021"
 domain-ports = { path = "../../domain-ports" }
 cpal = { workspace = true }
 
+# iOS-only: AVAudioSession permission + activation.
+# These are cfg'd out on all other platforms so Mac/Linux/Windows builds
+# don't pay for them. On-device validation: Phase 1.6.2.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-avf-audio = "0.3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }

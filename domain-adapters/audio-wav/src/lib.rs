@@ -43,6 +43,38 @@ pub(crate) struct WavStreamHandle {
 pub use capture::new as new_capture;
 pub use devices::new as new_devices;
 
+use domain_ports::audio_devices::AudioDevices;
+use domain_ports::audio_session::{
+    AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider,
+};
+
+/// Build an `AudioSessionProvider` backed by a WAV file.
+///
+/// Permission is always `Granted` (WAV replay doesn't need OS permission);
+/// `new_devices()` returns the WAV-backed `AudioDevices` on every call.
+/// `request()` invokes the sink immediately to exercise the park-and-resume path.
+pub fn new_session_provider(wav_path: std::path::PathBuf) -> impl AudioSessionProvider {
+    WavSessionProvider { wav_path }
+}
+
+struct WavSessionProvider {
+    wav_path: std::path::PathBuf,
+}
+
+impl AudioSessionProvider for WavSessionProvider {
+    fn init_status(&self) -> AudioInitStatus {
+        AudioInitStatus::Granted
+    }
+
+    fn request(&self, sink: AudioPermissionSink) {
+        sink.signal();
+    }
+
+    fn new_devices(&self) -> Result<Box<dyn AudioDevices>, AudioInitError> {
+        Ok(Box::new(devices::new(self.wav_path.clone())))
+    }
+}
+
 /// Cheaply validate that `path` is an openable WAV, returning its header on
 /// success. Hosts call this up front (before the slow renderer boot) so a bad
 /// `--replay-audio` path fails with a clean message instead of panicking deep

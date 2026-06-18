@@ -118,12 +118,14 @@ fn build(deps: AppCoachDeps) -> (CoachImpl, Arc<dyn EngineInspect>) {
     let inspect_shared = InspectShared::new();
     let inspect_for_thread = Arc::clone(&inspect_shared);
 
+    let tx_cmd_for_thread = tx_cmd.clone();
     let control_thread = thread::Builder::new()
         .name("app-coach-control".into())
         .spawn(move || {
             ControlPlane::new(
                 deps,
                 outbound_for_thread,
+                tx_cmd_for_thread,
                 rx_cmd,
                 FeaturePublishers {
                     latest: feature_publisher_for_thread,
@@ -283,6 +285,9 @@ mod tests {
         AudioDevices, DeviceId, InputDevice, InputStream, SampleRateSupport, StreamHandle,
         Transport,
     };
+    use domain_ports::audio_session::{
+        AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider,
+    };
     use domain_ports::clock::{Clock, TestClock};
     use domain_ports::pitch::PitchLog2;
     use domain_ports::scale::{Scale, ScaleIntervals};
@@ -331,6 +336,29 @@ mod tests {
             SampleRateSupport::List(v) => SampleRateSupport::List(v.clone()),
             SampleRateSupport::Ranges(v) => SampleRateSupport::Ranges(v.clone()),
             SampleRateSupport::ProbeOnly => SampleRateSupport::ProbeOnly,
+        }
+    }
+
+    /// A session provider that always reports `Granted` and returns the
+    /// supplied `FakeDevices` from `new_devices()`. Used by the existing
+    /// tests that don't care about the permission flow.
+    struct GrantedSessionProvider {
+        devices: FakeDevices,
+    }
+
+    impl AudioSessionProvider for GrantedSessionProvider {
+        fn init_status(&self) -> AudioInitStatus {
+            AudioInitStatus::Granted
+        }
+        fn request(&self, sink: AudioPermissionSink) {
+            sink.signal();
+        }
+        fn new_devices(&self) -> Result<Box<dyn AudioDevices>, AudioInitError> {
+            // Clone the inner FakeDevices for each call (devices are cloned on list).
+            Ok(Box::new(FakeDevices {
+                devices: self.devices.list_devices(),
+                default: self.devices.default_input(),
+            }))
         }
     }
 
@@ -455,10 +483,13 @@ mod tests {
             transport: Transport::BuiltIn,
             streams: vec![clone_input_stream(&stream)],
         };
-        let devices_port: Arc<dyn AudioDevices> = Arc::new(FakeDevices {
-            devices: vec![device],
-            default: Some(stream),
-        });
+        let session_port: Arc<dyn domain_ports::audio_session::AudioSessionProvider> =
+            Arc::new(GrantedSessionProvider {
+                devices: FakeDevices {
+                    devices: vec![device],
+                    default: Some(stream),
+                },
+            });
         let opened_configs: Arc<Mutex<Vec<CaptureConfig>>> = Arc::new(Mutex::new(Vec::new()));
         let capture_port: Arc<dyn AudioCapture> = Arc::new(FakeCapture {
             opens,
@@ -470,7 +501,7 @@ mod tests {
             AppCoachDeps {
                 clock,
                 telemetry: telemetry.clone(),
-                audio_devices: devices_port,
+                audio_session: session_port,
                 audio_capture: capture_port,
                 host_version: "test",
             },
@@ -1399,6 +1430,335 @@ mod tests {
         assert_eq!(
             coach.shutdown(Duration::from_secs(1)),
             ShutdownResult::AlreadyShutDown
+        );
+    }
+
+    // ---- permission state machine tests (use FakeAudioSessionProvider) ----
+
+    use domain_ports::audio_session::{AudioInitStatus as Status, FakeAudioSessionProvider};
+
+    /// Build `AppCoachDeps` with a `FakeAudioSessionProvider` (for permission tests)
+    /// and a `FakeCapture` whose outcome is `Ok`. Returns the provider handle so
+    /// the test can drive it.
+    fn deps_with_provider(
+        initial_status: Status,
+    ) -> (AppCoachDeps, Arc<FakeAudioSessionProvider>, Arc<AtomicU32>) {
+        let clock: Arc<dyn domain_ports::clock::Clock> = Arc::new(TestClock::new(0));
+        let telemetry = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
+
+        let stream = InputStream {
+            handle: StreamHandle(Arc::new(())),
+            name: "fake mic".into(),
+            channels: 1,
+            sample_rates: SampleRateSupport::Ranges(vec![(48_000, 48_000)]),
+        };
+        let device = InputDevice {
+            persistent_id: Some(DeviceId("fake-id".into())),
+            name: "fake mic".into(),
+            transport: Transport::BuiltIn,
+            streams: vec![clone_input_stream(&stream)],
+        };
+
+        let provider = Arc::new(FakeAudioSessionProvider::new(initial_status));
+        // Pre-load the provider with a FakeDevices result for when new_devices() is called.
+        // We set this up as a granted devices source wrapping our stream/device.
+        // The provider returns EmptyDevices by default, which causes DeviceUnavailable.
+        // For tests that reach new_devices(), we must set devices_result beforehand.
+        // Tests that DON'T reach new_devices() (Denied/Undetermined start) are fine with empty.
+        // Tests that DO reach new_devices() (Granted start) call set_devices_result before.
+        //
+        // For simplicity, we use GrantedSessionProvider for those tests and only use
+        // provider for permission-flow-only tests.
+        let _ = device; // only used by set_devices_result callers
+        let _ = stream;
+
+        let opens = Arc::new(AtomicU32::new(0));
+        let capture_port: Arc<dyn domain_ports::audio_capture::AudioCapture> =
+            Arc::new(FakeCapture {
+                opens: Arc::clone(&opens),
+                outcome: FakeOutcome::Ok,
+                negotiate_result: NegotiateResult::PassThrough,
+                opened_configs: Arc::new(Mutex::new(Vec::new())),
+            });
+
+        let deps = AppCoachDeps {
+            clock,
+            telemetry: telemetry.clone(),
+            audio_session: Arc::clone(&provider)
+                as Arc<dyn domain_ports::audio_session::AudioSessionProvider>,
+            audio_capture: capture_port,
+            host_version: "test",
+        };
+        (deps, provider, opens)
+    }
+
+    #[test]
+    fn permission_query_returns_current_status_undetermined() {
+        let (deps, _provider, _opens) = deps_with_provider(Status::Undetermined);
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioPermissionQuery);
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. }))
+        });
+
+        let status = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::AudioPermissionStatus { status } => Some(*status),
+                _ => None,
+            })
+            .expect("AudioPermissionStatus reply");
+        assert_eq!(status, Status::Undetermined);
+        // No audio state change.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CoachEvent::AudioSessionStateChanged { .. })));
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn permission_request_parks_then_resolves_to_granted() {
+        let (deps, provider, _opens) = deps_with_provider(Status::Undetermined);
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioPermissionRequest);
+
+        // Give the control plane a beat to receive the command and store the sink.
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            provider.has_pending_request(),
+            "control plane must have stored the sink"
+        );
+
+        // Flip status and resolve the sink.
+        provider.set_status(Status::Granted);
+        provider.resolve();
+
+        // Now we should get AudioPermissionStatus { Granted }.
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. }))
+        });
+        let status = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::AudioPermissionStatus { status } => Some(*status),
+                _ => None,
+            })
+            .expect("AudioPermissionStatus reply");
+        assert_eq!(status, Status::Granted);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn start_with_granted_reaches_running_no_permission_event() {
+        // Use the GrantedSessionProvider (wraps FakeDevices) so new_devices() works.
+        let opens = Arc::new(AtomicU32::new(0));
+        let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoachEvent::AudioSessionStateChanged {
+                        new_state: AudioSessionState::Running
+                    }
+                )
+            })
+        });
+
+        // Must NOT have emitted AudioPermissionStatus (no prompting on a start).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. })),
+            "start with Granted must not emit AudioPermissionStatus"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn start_with_denied_errors_with_permission_denied_no_prompt() {
+        let (deps, _provider, opens) = deps_with_provider(Status::Denied);
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+
+        let kind = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("AudioSessionError");
+        assert_eq!(kind, AudioSessionErrorKind::PermissionDenied);
+        // Must NOT have emitted AudioPermissionStatus (no auto-prompt).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. })),
+            "start with Denied must not emit AudioPermissionStatus"
+        );
+        // Must not have opened capture.
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn start_with_undetermined_errors_no_auto_prompt() {
+        let (deps, _provider, opens) = deps_with_provider(Status::Undetermined);
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+
+        // Must have errored (PermissionDenied covers Undetermined too).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. })),
+            "start with Undetermined must produce an error"
+        );
+        // Must NOT have emitted AudioPermissionStatus (no auto-prompt).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. })),
+            "start with Undetermined must not emit AudioPermissionStatus (no auto-prompt)"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn stale_permission_resolved_after_generation_bump_is_dropped() {
+        // Scenario: permission request captures generation N; a subsequent
+        // start+stop bumps the generation to N+2; the old sink fires → dropped.
+        // Scenario: request at gen=0; start bumps gen to 1; old sink fires → dropped.
+        let (dep2, provider2, _) = deps_with_provider(Status::Undetermined);
+        let coach = new(dep2);
+
+        // 1) Issue permission request at generation 0; sink captures gen=0.
+        coach.send_command(Command::AudioPermissionRequest);
+        thread::sleep(Duration::from_millis(30));
+        assert!(provider2.has_pending_request(), "sink must be pending");
+
+        // 2) Flip to Granted; start — this bumps generation to 1.
+        //    EmptyDevices causes DeviceUnavailable, but generation is still bumped.
+        provider2.set_status(Status::Granted);
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let _ = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+        // gen=1. Old sink still holds gen=0.
+
+        // 3) Resolve the stale sink (gen=0 ≠ current gen=1) → dropped.
+        provider2.resolve();
+
+        thread::sleep(Duration::from_millis(30));
+        let mut buf = Vec::new();
+        coach.poll_events(&mut buf);
+        let has_permission_status = buf
+            .iter()
+            .any(|e| matches!(e, CoachEvent::AudioPermissionStatus { .. }));
+        assert!(
+            !has_permission_status,
+            "stale AudioPermissionResolved (gen=0, current gen=1) must be dropped"
+        );
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
+        );
+    }
+
+    #[test]
+    fn activation_failed_produces_error() {
+        use domain_ports::audio_session::fakes::{FakeActivationError, FakeDevicesResult};
+
+        let (deps, provider, _opens) = deps_with_provider(Status::Granted);
+        // Configure new_devices() to fail with ActivationFailed.
+        provider.set_devices_result(FakeDevicesResult::Err(
+            FakeActivationError::ActivationFailed("hw failure".to_string()),
+        ));
+        let coach = new(deps);
+
+        coach.send_command(Command::AudioStartSession(AudioConfig {
+            device_id: None,
+            sample_rate: None,
+            buffer_frames: None,
+            session_label: None,
+        }));
+        let events = poll_until(&coach, |evs| {
+            evs.iter()
+                .any(|e| matches!(e, CoachEvent::AudioSessionError { .. }))
+        });
+
+        let kind = events
+            .iter()
+            .find_map(|e| match e {
+                CoachEvent::AudioSessionError { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("AudioSessionError");
+        // ActivationFailed maps to Other (it's a generic start failure, not a permission error).
+        assert_eq!(kind, AudioSessionErrorKind::Other);
+
+        assert_eq!(
+            coach.shutdown(Duration::from_secs(1)),
+            ShutdownResult::Clean
         );
     }
 }

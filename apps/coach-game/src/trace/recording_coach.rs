@@ -139,6 +139,8 @@ fn clone_command(cmd: &Command) -> Command {
         Command::MusicConfigureSession { scale } => {
             Command::MusicConfigureSession { scale: *scale }
         }
+        Command::AudioPermissionQuery => Command::AudioPermissionQuery,
+        Command::AudioPermissionRequest => Command::AudioPermissionRequest,
     }
 }
 
@@ -168,5 +170,8 @@ fn clone_event(ev: &CoachEvent) -> CoachEvent {
             }
         }
         CoachEvent::EventsDropped { count } => CoachEvent::EventsDropped { count: *count },
+        CoachEvent::AudioPermissionStatus { status } => {
+            CoachEvent::AudioPermissionStatus { status: *status }
+        }
     }
 }
