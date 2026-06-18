@@ -73,7 +73,7 @@ pub enum AudioInitError {
 /// A factory that brings up the OS audio session and yields a ready
 /// AudioDevices. On non-iOS the session is a no-op and status is always
 /// Granted.
-pub trait AudioSessionProvider: Send + Sync {
+pub trait AudioDriver: Send + Sync {
     /// SYNC read of current permission state. No dialog, cheap.
     fn init_status(&self) -> AudioInitStatus;
 
@@ -148,7 +148,7 @@ producer; the head consumes it in 1.6.1c to show "enable in Settings").
 
 - New direct deps, iOS-gated: `objc2-avf-audio = "0.3"`, `objc2 = "0.6"`,
   `block2` (for the completion block), `objc2-foundation = "0.3"`.
-- `AudioSessionProvider` impl:
+- `AudioDriver` impl:
   - `init_status` → `AVAudioSession.recordPermission()` mapped to the enum.
   - `request` → `setCategory(.record)`, then `requestRecordPermission(block)`.
     The block is an `RcBlock<dyn Fn(Bool)>` capturing **only** the `Send`
@@ -170,7 +170,7 @@ thread via `new_devices()`.
 
 ## Testing — Mac/headless
 
-A `FakeAudioSessionProvider` driving the state machine deterministically:
+A `FakeAudioDriver` driving the state machine deterministically:
 
 - `init_status` starts `Undetermined`; `request(sink)` resolves on command.
 - `AudioPermissionQuery` → `AudioPermissionStatus{Undetermined}`.

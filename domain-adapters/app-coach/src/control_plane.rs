@@ -18,7 +18,7 @@ use domain_ports::app_coach::{
 };
 use domain_ports::audio_capture::{CaptureCallback, CaptureConfig, CaptureFrame, CaptureSession};
 use domain_ports::audio_devices::{AudioDevices, DeviceId, InputStream};
-use domain_ports::audio_session::{AudioInitError, AudioInitStatus, AudioPermissionSink};
+use domain_ports::audio_driver::{AudioInitError, AudioInitStatus, AudioPermissionSink};
 use domain_ports::scale::{Scale, ScaleIntervals};
 use domain_ports::tuning::Tuning;
 use domain_ports::{tel_debug, tel_info, tel_warn};
@@ -108,7 +108,7 @@ pub(crate) struct ControlPlane {
     /// active data-plane worker and returned when that worker joins.
     feature_producer: Option<rtrb::Producer<FeatureSnapshot>>,
     /// Live `AudioDevices` handle for the current session. Produced by
-    /// `AudioSessionProvider::new_devices()` at session start and dropped
+    /// `AudioDriver::new_devices()` at session start and dropped
     /// at session stop/shutdown. `None` when no session is active.
     live_devices: Option<Box<dyn AudioDevices>>,
 }
@@ -205,7 +205,7 @@ impl ControlPlane {
                 self.do_configure_session(scale)
             }
             Input::FromHead(Command::AudioPermissionQuery) => {
-                let status = self.deps.audio_session.init_status();
+                let status = self.deps.audio_driver.init_status();
                 self.push_event(CoachEvent::AudioPermissionStatus { status });
             }
             Input::FromHead(Command::AudioPermissionRequest) => {
@@ -216,11 +216,11 @@ impl ControlPlane {
                     // (shutdown in flight) the send fails silently.
                     let _ = tx.send(Input::AudioPermissionResolved { generation });
                 }));
-                self.deps.audio_session.request(sink);
+                self.deps.audio_driver.request(sink);
             }
             Input::AudioPermissionResolved { generation } => {
                 if generation == self.generation {
-                    let status = self.deps.audio_session.init_status();
+                    let status = self.deps.audio_driver.init_status();
                     self.push_event(CoachEvent::AudioPermissionStatus { status });
                 }
                 // Stale generation — drop silently.
@@ -231,11 +231,11 @@ impl ControlPlane {
     fn do_list_devices(&mut self) {
         // Never prompt — listing is passive. If permission is not yet granted,
         // return an empty list rather than blocking or auto-prompting.
-        if self.deps.audio_session.init_status() != AudioInitStatus::Granted {
+        if self.deps.audio_driver.init_status() != AudioInitStatus::Granted {
             self.push_event(CoachEvent::AudioDevicesListed { devices: vec![] });
             return;
         }
-        let devices = match self.deps.audio_session.new_devices() {
+        let devices = match self.deps.audio_driver.new_devices() {
             Ok(d) => d.list_devices(),
             Err(_) => vec![],
         };
@@ -264,7 +264,7 @@ impl ControlPlane {
 
         // Check permission. Do NOT auto-prompt — the head owns prompting via
         // `AudioPermissionRequest`.
-        match self.deps.audio_session.init_status() {
+        match self.deps.audio_driver.init_status() {
             AudioInitStatus::Granted => {
                 // Fall through to start the session.
             }
@@ -291,7 +291,7 @@ impl ControlPlane {
         }
 
         // Bring up the OS audio session and get a live devices handle.
-        let devices = match self.deps.audio_session.new_devices() {
+        let devices = match self.deps.audio_driver.new_devices() {
             Ok(d) => d,
             Err(AudioInitError::ActivationFailed(msg)) => {
                 self.transition(AudioSessionState::Starting);

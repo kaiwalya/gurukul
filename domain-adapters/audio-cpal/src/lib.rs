@@ -43,11 +43,11 @@
 
 mod capture;
 mod devices;
-mod session;
+mod driver;
 
 pub use capture::new as new_capture;
 pub use devices::new as new_devices;
-pub use session::new as new_session_provider;
+pub use driver::new as new_driver;
 
 /// Inner payload of a [`domain_ports::audio_devices::StreamHandle`]
 /// vended by this adapter. The capture impl downcasts through the

@@ -1,4 +1,4 @@
-//! AudioSessionProvider port: async OS audio permission + session activation.
+//! AudioDriver port: async OS audio permission + session activation.
 //!
 //! On iOS (and Android), the app must obtain microphone permission before
 //! audio devices can be used. The OS permission model is inherently async:
@@ -95,7 +95,7 @@ impl AudioPermissionSink {
 ///
 /// The port owns the lifecycle policy: `new_devices()` succeeds ONLY when
 /// `init_status() == Granted` AND the session activates without error.
-pub trait AudioSessionProvider: Send + Sync {
+pub trait AudioDriver: Send + Sync {
     /// Synchronously read the current permission state. Never shows a
     /// dialog. Cheap.
     fn init_status(&self) -> AudioInitStatus;
@@ -123,15 +123,15 @@ pub trait AudioSessionProvider: Send + Sync {
 // ---------------------------------------------------------------------
 
 #[cfg(any(test, feature = "test-util"))]
-pub use fakes::FakeAudioSessionProvider;
+pub use fakes::FakeAudioDriver;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod fakes {
-    use super::{AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider};
+    use super::{AudioDriver, AudioInitError, AudioInitStatus, AudioPermissionSink};
     use crate::audio_devices::{AudioDevices, InputDevice, InputStream};
     use std::sync::{Arc, Mutex};
 
-    /// What `FakeAudioSessionProvider` returns from `new_devices()`.
+    /// What `FakeAudioDriver` returns from `new_devices()`.
     pub enum FakeDevicesResult {
         /// Return the supplied `AudioDevices` impl (boxed).
         Ok(Box<dyn AudioDevices>),
@@ -160,18 +160,18 @@ pub mod fakes {
     /// # Usage
     ///
     /// ```ignore
-    /// let provider = FakeAudioSessionProvider::new(AudioInitStatus::Undetermined);
+    /// let provider = FakeAudioDriver::new(AudioInitStatus::Undetermined);
     /// // ... hand to the control plane via AppCoachDeps ...
     ///
     /// // Later, from the test thread, flip permission and resolve:
     /// provider.set_status(AudioInitStatus::Granted);
     /// provider.resolve();    // invokes the pending sink (if any)
     /// ```
-    pub struct FakeAudioSessionProvider {
+    pub struct FakeAudioDriver {
         inner: Arc<Mutex<Inner>>,
     }
 
-    impl FakeAudioSessionProvider {
+    impl FakeAudioDriver {
         /// Create a new fake with the given initial status.
         pub fn new(initial_status: AudioInitStatus) -> Self {
             Self {
@@ -212,7 +212,7 @@ pub mod fakes {
         }
     }
 
-    impl AudioSessionProvider for FakeAudioSessionProvider {
+    impl AudioDriver for FakeAudioDriver {
         fn init_status(&self) -> AudioInitStatus {
             self.inner.lock().unwrap().status
         }

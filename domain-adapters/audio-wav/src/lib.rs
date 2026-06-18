@@ -44,24 +44,24 @@ pub use capture::new as new_capture;
 pub use devices::new as new_devices;
 
 use domain_ports::audio_devices::AudioDevices;
-use domain_ports::audio_session::{
-    AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider,
+use domain_ports::audio_driver::{
+    AudioDriver, AudioInitError, AudioInitStatus, AudioPermissionSink,
 };
 
-/// Build an `AudioSessionProvider` backed by a WAV file.
+/// Build an `AudioDriver` backed by a WAV file.
 ///
 /// Permission is always `Granted` (WAV replay doesn't need OS permission);
 /// `new_devices()` returns the WAV-backed `AudioDevices` on every call.
 /// `request()` invokes the sink immediately to exercise the park-and-resume path.
-pub fn new_session_provider(wav_path: std::path::PathBuf) -> impl AudioSessionProvider {
-    WavSessionProvider { wav_path }
+pub fn new_driver(wav_path: std::path::PathBuf) -> impl AudioDriver {
+    WavAudioDriver { wav_path }
 }
 
-struct WavSessionProvider {
+struct WavAudioDriver {
     wav_path: std::path::PathBuf,
 }
 
-impl AudioSessionProvider for WavSessionProvider {
+impl AudioDriver for WavAudioDriver {
     fn init_status(&self) -> AudioInitStatus {
         AudioInitStatus::Granted
     }

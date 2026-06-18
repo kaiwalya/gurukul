@@ -80,19 +80,19 @@ pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
 
-    let (audio_session, audio_capture): (
-        Arc<dyn domain_ports::audio_session::AudioSessionProvider>,
+    let (audio_driver, audio_capture): (
+        Arc<dyn domain_ports::audio_driver::AudioDriver>,
         Arc<dyn domain_ports::audio_capture::AudioCapture>,
     ) = match replay_audio {
         None => (
-            Arc::new(adapter_audio_cpal::new_session_provider()),
+            Arc::new(adapter_audio_cpal::new_driver()),
             Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock))),
         ),
         Some(wav) => (
-            // WAV replay: the session provider returns WAV-backed AudioDevices
+            // WAV replay: the driver returns WAV-backed AudioDevices
             // so resolve_stream() gets the WAV stream handle (needed for
             // AudioCapture::open to downcast back to the WAV path).
-            Arc::new(adapter_audio_wav::new_session_provider(wav)),
+            Arc::new(adapter_audio_wav::new_driver(wav)),
             Arc::new(adapter_audio_wav::new_capture(Arc::clone(&clock))),
         ),
     };
@@ -100,7 +100,7 @@ pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach
     Box::new(adapter_app_coach::new(AppCoachDeps {
         clock,
         telemetry,
-        audio_session,
+        audio_driver,
         audio_capture,
         host_version: env!("CARGO_PKG_VERSION"),
     }))

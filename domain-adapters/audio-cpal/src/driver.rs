@@ -1,4 +1,4 @@
-//! AudioSessionProvider implementation backed by cpal / AVAudioSession.
+//! AudioDriver implementation backed by cpal / AVAudioSession.
 //!
 //! # Platform split
 //!
@@ -13,19 +13,19 @@
 
 use crate::devices;
 use domain_ports::audio_devices::AudioDevices;
-use domain_ports::audio_session::{
-    AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider,
+use domain_ports::audio_driver::{
+    AudioDriver, AudioInitError, AudioInitStatus, AudioPermissionSink,
 };
 
-/// Build an `AudioSessionProvider` appropriate for the current platform.
-pub fn new() -> impl AudioSessionProvider {
+/// Build an `AudioDriver` appropriate for the current platform.
+pub fn new() -> impl AudioDriver {
     #[cfg(target_os = "ios")]
     {
-        IosSessionProvider
+        IosAudioDriver
     }
     #[cfg(not(target_os = "ios"))]
     {
-        DefaultSessionProvider
+        DefaultAudioDriver
     }
 }
 
@@ -34,10 +34,10 @@ pub fn new() -> impl AudioSessionProvider {
 // =====================================================================
 
 #[cfg(not(target_os = "ios"))]
-struct DefaultSessionProvider;
+struct DefaultAudioDriver;
 
 #[cfg(not(target_os = "ios"))]
-impl AudioSessionProvider for DefaultSessionProvider {
+impl AudioDriver for DefaultAudioDriver {
     fn init_status(&self) -> AudioInitStatus {
         AudioInitStatus::Granted
     }
@@ -63,10 +63,10 @@ impl AudioSessionProvider for DefaultSessionProvider {
 // method call that needs on-device verification.
 
 #[cfg(target_os = "ios")]
-struct IosSessionProvider;
+struct IosAudioDriver;
 
 #[cfg(target_os = "ios")]
-impl AudioSessionProvider for IosSessionProvider {
+impl AudioDriver for IosAudioDriver {
     fn init_status(&self) -> AudioInitStatus {
         use objc2_avf_audio::{AVAudioApplication, AVAudioApplicationRecordPermission};
         // Modern (iOS 17+) permission read on the process-wide singleton.

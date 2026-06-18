@@ -69,13 +69,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 fn build_coach() -> impl AppCoach {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
     let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
-    let audio_session = Arc::new(adapter_audio_cpal::new_session_provider());
+    let audio_driver = Arc::new(adapter_audio_cpal::new_driver());
     let audio_capture = Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock)));
 
     adapter_app_coach::new(AppCoachDeps {
         clock,
         telemetry,
-        audio_session,
+        audio_driver,
         audio_capture,
         host_version: env!("CARGO_PKG_VERSION"),
     })

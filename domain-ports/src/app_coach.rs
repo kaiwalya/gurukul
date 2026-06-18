@@ -35,7 +35,7 @@
 
 use crate::audio_capture::AudioCapture;
 use crate::audio_devices::{DeviceId, InputDevice};
-use crate::audio_session::{AudioInitStatus, AudioSessionProvider};
+use crate::audio_driver::{AudioDriver, AudioInitStatus};
 use crate::clock::Clock;
 use crate::scale::{Scale, ScaleIntervals};
 use crate::telemetry::Telemetry;
@@ -50,12 +50,11 @@ use std::time::Duration;
 pub struct AppCoachDeps {
     pub clock: Arc<dyn Clock>,
     pub telemetry: Arc<dyn Telemetry>,
-    /// Audio session + permission provider. Replaces the earlier
-    /// `audio_devices: Arc<dyn AudioDevices>` — the provider yields a
-    /// ready `AudioDevices` only when the OS session is active and permission
-    /// is granted. The control plane calls `provider.new_devices()` once per
+    /// Audio driver: OS permission + session activation. Yields a ready
+    /// `AudioDevices` only when the OS session is active and permission
+    /// is granted. The control plane calls `driver.new_devices()` once per
     /// `AudioStartSession` rather than holding a long-lived devices handle.
-    pub audio_session: Arc<dyn AudioSessionProvider>,
+    pub audio_driver: Arc<dyn AudioDriver>,
     pub audio_capture: Arc<dyn AudioCapture>,
     /// `CARGO_PKG_VERSION` of the *host* binary. Stamped on lifecycle
     /// telemetry so warehouse data attributes behaviour to the version

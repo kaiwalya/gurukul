@@ -285,8 +285,8 @@ mod tests {
         AudioDevices, DeviceId, InputDevice, InputStream, SampleRateSupport, StreamHandle,
         Transport,
     };
-    use domain_ports::audio_session::{
-        AudioInitError, AudioInitStatus, AudioPermissionSink, AudioSessionProvider,
+    use domain_ports::audio_driver::{
+        AudioDriver, AudioInitError, AudioInitStatus, AudioPermissionSink,
     };
     use domain_ports::clock::{Clock, TestClock};
     use domain_ports::pitch::PitchLog2;
@@ -339,14 +339,14 @@ mod tests {
         }
     }
 
-    /// A session provider that always reports `Granted` and returns the
+    /// An audio driver that always reports `Granted` and returns the
     /// supplied `FakeDevices` from `new_devices()`. Used by the existing
     /// tests that don't care about the permission flow.
-    struct GrantedSessionProvider {
+    struct GrantedAudioDriver {
         devices: FakeDevices,
     }
 
-    impl AudioSessionProvider for GrantedSessionProvider {
+    impl AudioDriver for GrantedAudioDriver {
         fn init_status(&self) -> AudioInitStatus {
             AudioInitStatus::Granted
         }
@@ -483,8 +483,8 @@ mod tests {
             transport: Transport::BuiltIn,
             streams: vec![clone_input_stream(&stream)],
         };
-        let session_port: Arc<dyn domain_ports::audio_session::AudioSessionProvider> =
-            Arc::new(GrantedSessionProvider {
+        let session_port: Arc<dyn domain_ports::audio_driver::AudioDriver> =
+            Arc::new(GrantedAudioDriver {
                 devices: FakeDevices {
                     devices: vec![device],
                     default: Some(stream),
@@ -501,7 +501,7 @@ mod tests {
             AppCoachDeps {
                 clock,
                 telemetry: telemetry.clone(),
-                audio_session: session_port,
+                audio_driver: session_port,
                 audio_capture: capture_port,
                 host_version: "test",
             },
@@ -1433,16 +1433,16 @@ mod tests {
         );
     }
 
-    // ---- permission state machine tests (use FakeAudioSessionProvider) ----
+    // ---- permission state machine tests (use FakeAudioDriver) ----
 
-    use domain_ports::audio_session::{AudioInitStatus as Status, FakeAudioSessionProvider};
+    use domain_ports::audio_driver::{AudioInitStatus as Status, FakeAudioDriver};
 
-    /// Build `AppCoachDeps` with a `FakeAudioSessionProvider` (for permission tests)
+    /// Build `AppCoachDeps` with a `FakeAudioDriver` (for permission tests)
     /// and a `FakeCapture` whose outcome is `Ok`. Returns the provider handle so
     /// the test can drive it.
     fn deps_with_provider(
         initial_status: Status,
-    ) -> (AppCoachDeps, Arc<FakeAudioSessionProvider>, Arc<AtomicU32>) {
+    ) -> (AppCoachDeps, Arc<FakeAudioDriver>, Arc<AtomicU32>) {
         let clock: Arc<dyn domain_ports::clock::Clock> = Arc::new(TestClock::new(0));
         let telemetry = Arc::new(TestTelemetry::new(Arc::clone(&clock)));
 
@@ -1459,7 +1459,7 @@ mod tests {
             streams: vec![clone_input_stream(&stream)],
         };
 
-        let provider = Arc::new(FakeAudioSessionProvider::new(initial_status));
+        let provider = Arc::new(FakeAudioDriver::new(initial_status));
         // Pre-load the provider with a FakeDevices result for when new_devices() is called.
         // We set this up as a granted devices source wrapping our stream/device.
         // The provider returns EmptyDevices by default, which causes DeviceUnavailable.
@@ -1467,7 +1467,7 @@ mod tests {
         // Tests that DON'T reach new_devices() (Denied/Undetermined start) are fine with empty.
         // Tests that DO reach new_devices() (Granted start) call set_devices_result before.
         //
-        // For simplicity, we use GrantedSessionProvider for those tests and only use
+        // For simplicity, we use GrantedAudioDriver for those tests and only use
         // provider for permission-flow-only tests.
         let _ = device; // only used by set_devices_result callers
         let _ = stream;
@@ -1484,8 +1484,7 @@ mod tests {
         let deps = AppCoachDeps {
             clock,
             telemetry: telemetry.clone(),
-            audio_session: Arc::clone(&provider)
-                as Arc<dyn domain_ports::audio_session::AudioSessionProvider>,
+            audio_driver: Arc::clone(&provider) as Arc<dyn domain_ports::audio_driver::AudioDriver>,
             audio_capture: capture_port,
             host_version: "test",
         };
@@ -1562,7 +1561,7 @@ mod tests {
 
     #[test]
     fn start_with_granted_reaches_running_no_permission_event() {
-        // Use the GrantedSessionProvider (wraps FakeDevices) so new_devices() works.
+        // Use the GrantedAudioDriver (wraps FakeDevices) so new_devices() works.
         let opens = Arc::new(AtomicU32::new(0));
         let (deps, _tel) = deps_with(FakeOutcome::Ok, Arc::clone(&opens));
         let coach = new(deps);
@@ -1726,7 +1725,7 @@ mod tests {
 
     #[test]
     fn activation_failed_produces_error() {
-        use domain_ports::audio_session::fakes::{FakeActivationError, FakeDevicesResult};
+        use domain_ports::audio_driver::fakes::{FakeActivationError, FakeDevicesResult};
 
         let (deps, provider, _opens) = deps_with_provider(Status::Granted);
         // Configure new_devices() to fail with ActivationFailed.
