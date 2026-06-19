@@ -157,6 +157,7 @@ pub fn build_app(app: &mut App) {
                     game::spawn_root,
                     game::note_dial::spawn,
                     game::hud::spawn,
+                    game::spawn_pause_button,
                     game::time_graph::spawn,
                 )
                     .chain(),
@@ -176,6 +177,7 @@ pub fn build_app(app: &mut App) {
                 )
                     .chain(),
                 game::handle_esc_in_game,
+                game::handle_pause_button,
                 game::note_dial::update_from_features,
                 game::note_dial::repaint_slots,
                 game::note_dial::handle_hub_capture,

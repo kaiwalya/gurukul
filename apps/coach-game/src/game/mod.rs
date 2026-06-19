@@ -10,6 +10,7 @@ pub mod time_graph;
 use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
 use crate::semantic_graph::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, ResumeLocked, SelectedDevice, SongTonality};
+use crate::ui::{COLOR_TEXT_DIM, FONT_BODY};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
 
@@ -50,12 +51,31 @@ pub struct GraphSlot;
 #[derive(Component)]
 pub struct DialSlot;
 
+/// Marker for the on-screen pause button in the in-game HUD strip.
+/// Tapping/clicking it triggers the same transition as the Escape key.
+#[derive(Component)]
+pub struct PauseButton;
+
 pub fn spawn_root(mut commands: Commands) {
     use crate::widgets::note_dial::DIAL_BOX_PX;
     const BREATHING: f32 = 80.0;
 
     let hud_slot = commands
-        .spawn((HudSlot, Name::new("hud_slot"), Node { ..default() }))
+        .spawn((
+            HudSlot,
+            Name::new("hud_slot"),
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::FlexStart,
+                padding: UiRect {
+                    right: px(32),
+                    ..default()
+                },
+                ..default()
+            },
+        ))
         .id();
 
     let graph_slot = commands
@@ -204,6 +224,50 @@ pub fn refresh_semantic_graph(
     graph.0 = projector.0.project(&history.0, music.0.as_ref());
 }
 
+/// Spawn the on-screen pause button and parent it into `hud_slot` as the
+/// right child. Must run after [`game::hud::spawn`] so the HUD badge (left
+/// child) is already present — child order drives `SpaceBetween` layout.
+pub fn spawn_pause_button(mut commands: Commands, slot: Single<Entity, With<HudSlot>>) {
+    let parent = *slot;
+    commands
+        .spawn((
+            ChildOf(parent),
+            PauseButton,
+            Name::new("pause_button"),
+            Button,
+            Node {
+                width: px(44),
+                height: px(44),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("⏸"),
+                TextFont {
+                    font_size: FONT_BODY,
+                    ..default()
+                },
+                TextColor(COLOR_TEXT_DIM),
+            ));
+        });
+}
+
+/// Shared pause logic: `AppState → Paused`, `HasPausedSession = true`,
+/// `ResumeLocked = false`. Called by both the Escape handler and the
+/// on-screen pause button so they stay in lockstep.
+pub fn request_pause(
+    next: &mut NextState<AppState>,
+    has_paused: &mut HasPausedSession,
+    resume_locked: &mut ResumeLocked,
+) {
+    has_paused.0 = true;
+    resume_locked.0 = false;
+    next.set(AppState::Paused);
+}
+
 /// Esc in InGame → Paused (stops session via OnEnter(Paused)). Marks
 /// `HasPausedSession` so the main menu can offer Continue.
 /// `ResumeLocked` is cleared so the Pause screen's Resume action is enabled
@@ -215,9 +279,22 @@ pub fn handle_esc_in_game(
     mut resume_locked: ResMut<ResumeLocked>,
 ) {
     if keys.just_pressed(KeyCode::Escape) {
-        has_paused.0 = true;
-        resume_locked.0 = false;
-        next.set(AppState::Paused);
+        request_pause(&mut next, &mut has_paused, &mut resume_locked);
+    }
+}
+
+/// On-screen pause button handler — mirrors `handle_esc_in_game` for
+/// touch devices that have no Escape key.
+pub fn handle_pause_button(
+    q: Query<&Interaction, (Changed<Interaction>, With<PauseButton>)>,
+    mut next: ResMut<NextState<AppState>>,
+    mut has_paused: ResMut<HasPausedSession>,
+    mut resume_locked: ResMut<ResumeLocked>,
+) {
+    for i in q.iter() {
+        if *i == Interaction::Pressed {
+            request_pause(&mut next, &mut has_paused, &mut resume_locked);
+        }
     }
 }
 

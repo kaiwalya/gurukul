@@ -15,6 +15,7 @@
 mod common;
 
 use bevy::prelude::*;
+use coach_game::game::PauseButton;
 use coach_game::menu::main_menu::{NewGameButton, QuitButton, SettingsButton};
 use coach_game::menu::paused::{
     ConfirmCancelButton, ConfirmModalRoot, ConfirmYesButton, PausedSettingsButton,
@@ -267,6 +268,32 @@ fn enter_in_game(app: &mut App, fake: &common::FakeCoach) {
     drain_commands(fake);
 }
 
+/// Pressing the on-screen `PauseButton` must do exactly what Escape does:
+/// `InGame → Paused` with `HasPausedSession = true`.
+#[test]
+fn pause_button_transitions_to_paused_and_marks_has_paused() {
+    let (mut app, fake) = build_test_app();
+    settle(&mut app, &fake);
+    enter_in_game(&mut app, &fake);
+
+    // Spawn a bare PauseButton entity with Interaction::Pressed.
+    // Using world_mut().spawn (not Commands) so it is visible to systems
+    // on the same update — the same technique used for all button tests.
+    app.world_mut()
+        .spawn((Button, PauseButton, Interaction::Pressed));
+    pump(&mut app);
+
+    assert_eq!(
+        current_state(&app),
+        AppState::Paused,
+        "pause button should transition to Paused"
+    );
+    assert!(
+        app.world().resource::<HasPausedSession>().0,
+        "pause button should set HasPausedSession"
+    );
+}
+
 /// Helper: drive InGame → Paused via NextState (bypassing the Esc
 /// key plumbing — that's covered by the keyboard canary below). Mirrors
 /// what `handle_esc_in_game` would do: set `HasPausedSession` and
@@ -484,8 +511,18 @@ fn full_device_selection_flow_carries_to_start_session() {
     let (mut app, fake) = build_test_app();
     settle(&mut app, &fake);
 
-    // Seed the fake's outbound queue. The next `poll_events` call
-    // (triggered by the always-on `drain_events`) hands these back.
+    // Enter Settings first so on_enter's AudioListDevices auto-response
+    // (the fake mic) is consumed by drain_events before we seed our real
+    // device list. Seeding before the transition risks the auto-response
+    // overwriting our list if drain_events runs after us in the same tick.
+    app.world_mut()
+        .spawn((Button, SettingsButton, Interaction::Pressed));
+    pump(&mut app);
+    assert_eq!(current_state(&app), AppState::Settings);
+    drain_commands(&fake);
+
+    // Now seed the real device list. drain_events will pick it up on the
+    // next update and rebuild_device_list will spawn rows for it.
     {
         let mut g = fake.inner.lock().unwrap();
         g.pending_events
@@ -496,15 +533,12 @@ fn full_device_selection_flow_carries_to_start_session() {
                 ],
             });
     }
-
-    // Enter Settings. on_enter sends ListDevices; drain_events pulls
-    // our pre-seeded DevicesListed into KnownDevices on the same
-    // double-pump (drain_events runs every Update).
-    app.world_mut()
-        .spawn((Button, SettingsButton, Interaction::Pressed));
-    pump(&mut app);
-    assert_eq!(current_state(&app), AppState::Settings);
-    drain_commands(&fake);
+    // Two updates: the first lets drain_events consume the seeded events
+    // and mark KnownDevices changed; the second lets rebuild_device_list
+    // see that change and spawn rows. (System ordering within a single
+    // update is not guaranteed, so two updates make this order-independent.)
+    app.update();
+    app.update();
 
     // Sanity: rebuild_device_list spawned a row entity for AirPods
     // with the right persistent_id baked in.
