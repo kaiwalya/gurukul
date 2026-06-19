@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[test]
 fn new_logs_to_stderr_without_panicking() {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
-    let tel = adapter_telemetry_std::new(clock);
+    let tel = adapter_telemetry_std::new(clock, None);
     tel.log(Level::Info, "smoke", &Fields::new());
     tel.log(Level::Info, "smoke-with-fields", &fields! { k = 1u32 });
     let child = tel.child(fields! { scope = "boot" });

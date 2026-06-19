@@ -82,11 +82,20 @@ pub struct DrainReadModels<'w> {
 /// `replay_audio = Some(wav)` → WAV-backed devices + capture in place of the
 /// microphone; everything else (engine, worker, UI) runs unchanged.
 ///
+/// `log_prefix = Some(prefix)` → telemetry tees every line to
+/// `<prefix>-log.jsonl` in addition to stderr, so the run's logs are
+/// retrievable off-disk (needed on iOS where simctl swallows stderr).
+/// `log_prefix = None` → stderr-only, unchanged behavior.
+///
 /// The same `Arc<dyn Clock>` is shared across telemetry, the WAV feeder, and
 /// `AppCoachDeps` so all `t_ms` stamps share one epoch.
-pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach> {
+pub fn build_coach_with_audio(
+    replay_audio: Option<PathBuf>,
+    log_prefix: Option<PathBuf>,
+) -> Box<dyn AppCoach> {
     let clock: Arc<dyn Clock> = Arc::new(adapter_clock_std::new());
-    let telemetry: Arc<dyn Telemetry> = Arc::new(adapter_telemetry_std::new(Arc::clone(&clock)));
+    let telemetry: Arc<dyn Telemetry> =
+        Arc::new(adapter_telemetry_std::new(Arc::clone(&clock), log_prefix));
 
     let (audio_driver, audio_capture): (
         Arc<dyn domain_ports::audio_driver::AudioDriver>,
@@ -117,7 +126,7 @@ pub fn build_coach_with_audio(replay_audio: Option<PathBuf>) -> Box<dyn AppCoach
 /// Construct the real adapter-backed coach with the live microphone.
 /// Thin wrapper around [`build_coach_with_audio`] so existing callers are untouched.
 pub fn build_coach() -> Box<dyn AppCoach> {
-    build_coach_with_audio(None)
+    build_coach_with_audio(None, None)
 }
 
 pub fn spawn_coach(world: &mut World) {

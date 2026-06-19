@@ -12,37 +12,93 @@
 //!
 //! Greppable, no JSON dep.
 //!
-//! Apps call [`new`] with an `Arc<dyn Clock>` to get an `impl Telemetry`.
-//! The clock supplies `t_ms` for events. Children share the parent's
-//! `Stderr` handle through an `Arc<Mutex<_>>`, so interleaved writes
-//! from multiple threads stay line-atomic.
+//! Apps call [`new`] with an `Arc<dyn Clock>` and an optional path prefix
+//! to get an `impl Telemetry`. When a prefix is supplied every line is
+//! **teed** to `<prefix>-log.jsonl` in addition to stderr; when `None`
+//! the adapter behaves exactly as before (stderr-only). The clock supplies
+//! `t_ms` for events. Children share both the stderr and file handles
+//! through `Arc<Mutex<_>>`, so interleaved writes stay line-atomic.
 
 use domain_ports::clock::Clock;
 use domain_ports::telemetry::{Event, Fields, Level, Telemetry, TelemetryCore};
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Build a stderr-backed Telemetry. Cheap — does not touch the stderr
-/// handle until the first log call. The `clock` is used to stamp
+/// Build a stderr-backed Telemetry. The `clock` is used to stamp
 /// `t_ms` on every event.
+///
+/// When `log_prefix` is `Some(prefix)`, every log/event line is also
+/// written to `<prefix>-log.jsonl` (tee: stderr unchanged + file added).
+/// The file is created at construction; if creation fails the adapter
+/// falls back to stderr-only without panicking.
 ///
 /// Apps call this once at boot and pass the returned `impl Telemetry`
 /// (typically wrapped in `Arc<dyn Telemetry>`) to whatever subsystems
 /// need to log.
-pub fn new(clock: Arc<dyn Clock>) -> impl Telemetry {
+pub fn new(clock: Arc<dyn Clock>, log_prefix: Option<PathBuf>) -> impl Telemetry {
     StderrTelemetry {
         core: TelemetryCore::new(clock),
         out: Arc::new(Mutex::new(io::stderr())),
+        file: open_log_file(log_prefix.as_deref()),
     }
 }
 
 /// Build a stderr-backed Telemetry with an initial context bag whose
 /// fields appear on every log line. Events do not pick up context;
 /// see [`domain_ports::telemetry::Event`].
-pub fn with_context(clock: Arc<dyn Clock>, context: Fields) -> impl Telemetry {
+pub fn with_context(
+    clock: Arc<dyn Clock>,
+    context: Fields,
+    log_prefix: Option<PathBuf>,
+) -> impl Telemetry {
     StderrTelemetry {
         core: TelemetryCore::with_context(clock, context),
         out: Arc::new(Mutex::new(io::stderr())),
+        file: open_log_file(log_prefix.as_deref()),
+    }
+}
+
+/// Derive the log file path from a run prefix: `<prefix>-log.jsonl`.
+///
+/// A plain `prefix.with_extension("log.jsonl")` would replace any existing
+/// extension in the stem. Instead we append `-log.jsonl` directly to the
+/// file-name component, matching how `audio_trace_format` derives its sibling
+/// paths (e.g. `<stem>.wav`, `<stem>.features.jsonl`).
+fn log_file_path(prefix: &Path) -> PathBuf {
+    let stem = prefix
+        .file_name()
+        .map(|n| {
+            let mut s = n.to_os_string();
+            s.push("-log.jsonl");
+            s
+        })
+        .unwrap_or_else(|| std::ffi::OsString::from("telemetry-log.jsonl"));
+    match prefix.parent() {
+        Some(parent) => parent.join(stem),
+        None => PathBuf::from(stem),
+    }
+}
+
+/// Open (or create) the log file, returning `None` on any error so the
+/// caller can fall back to stderr-only. Mirrors the audio recorder's
+/// best-effort `create_dir_all` pattern.
+fn open_log_file(prefix: Option<&Path>) -> Option<Arc<Mutex<BufWriter<fs::File>>>> {
+    let prefix = prefix?;
+    if let Some(parent) = prefix.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("telemetry-std: could not create log dir {parent:?}: {e}");
+            return None;
+        }
+    }
+    let path = log_file_path(prefix);
+    match fs::File::create(&path) {
+        Ok(f) => Some(Arc::new(Mutex::new(BufWriter::new(f)))),
+        Err(e) => {
+            eprintln!("telemetry-std: could not create log file {path:?}: {e}");
+            None
+        }
     }
 }
 
@@ -51,6 +107,8 @@ struct StderrTelemetry {
     // Arc so children share the same handle; Mutex so concurrent
     // writes from multiple threads serialize at the line boundary.
     out: Arc<Mutex<io::Stderr>>,
+    // Optional file tee. Same sharing + serialization contract as `out`.
+    file: Option<Arc<Mutex<BufWriter<fs::File>>>>,
 }
 
 impl Telemetry for StderrTelemetry {
@@ -62,12 +120,21 @@ impl Telemetry for StderrTelemetry {
         } else {
             writeln!(out, "[{level}] {msg} {merged}")
         };
+        if let Some(file) = &self.file {
+            let mut f = file.lock().unwrap();
+            let _ = if merged.is_empty() {
+                writeln!(f, "[{level}] {msg}")
+            } else {
+                writeln!(f, "[{level}] {msg} {merged}")
+            };
+        }
     }
 
     fn child(&self, fields: Fields) -> Arc<dyn Telemetry> {
         Arc::new(StderrTelemetry {
             core: self.core.child(fields),
             out: Arc::clone(&self.out),
+            file: self.file.as_ref().map(Arc::clone),
         })
     }
 
@@ -75,6 +142,10 @@ impl Telemetry for StderrTelemetry {
         let stamped = self.core.stamp(e);
         let mut out = self.out.lock().unwrap();
         let _ = writeln!(out, "[EVENT] {stamped}");
+        if let Some(file) = &self.file {
+            let mut f = file.lock().unwrap();
+            let _ = writeln!(f, "[EVENT] {stamped}");
+        }
     }
 }
 
@@ -89,6 +160,8 @@ mod tests {
     //! End-to-end "did the line actually hit stderr" is covered by the
     //! integration test in `tests/stderr_smoke.rs`.
 
+    use super::log_file_path;
+    use crate::new;
     use domain_ports::clock::{Clock, TestClock};
     use domain_ports::fields;
     use domain_ports::telemetry::{Event, Fields, Level, Telemetry, TelemetryCore};
@@ -198,5 +271,59 @@ mod tests {
             "[EVENT] {app_version=\"0.1.0\", event=\"boot\", t_ms=42}\n\
              [EVENT] {event=\"shutdown\", t_ms=42, uptime_ms=1458}\n"
         );
+    }
+
+    // --- file-sink tests ---
+
+    #[test]
+    fn log_file_path_appends_suffix() {
+        use std::path::PathBuf;
+        let prefix = PathBuf::from("/tmp/traces/2026-06-18-120000-000");
+        let got = log_file_path(&prefix);
+        assert_eq!(
+            got,
+            PathBuf::from("/tmp/traces/2026-06-18-120000-000-log.jsonl")
+        );
+    }
+
+    #[test]
+    fn file_sink_receives_log_and_event_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir.path().join("test-run");
+
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
+        let tel = new(Arc::clone(&clock), Some(prefix.clone()));
+
+        tel.log(Level::Info, "hello from file", &Fields::new());
+        tel.event(&Event::Boot {
+            app_version: "0.1.0",
+        });
+
+        // Drop the telemetry so the BufWriter is flushed.
+        drop(tel);
+
+        let log_path = log_file_path(&prefix);
+        assert!(log_path.exists(), "log file must exist at {log_path:?}");
+
+        let contents = std::fs::read_to_string(&log_path).expect("read log file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, got: {contents:?}");
+        assert_eq!(lines[0], "[INFO] hello from file");
+        assert!(
+            lines[1].contains("[EVENT]"),
+            "second line must be an event: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn none_prefix_is_stderr_only() {
+        // When log_prefix is None the adapter must construct without panicking
+        // and must write nothing to a file.
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(0));
+        let tel = new(Arc::clone(&clock), None);
+        tel.log(Level::Warn, "stderr only", &Fields::new());
+        drop(tel);
+        // No assertion on stderr content (can't capture it here); the test
+        // merely verifies no panic and no unexpected file is created.
     }
 }

@@ -10,3 +10,4 @@ domain-ports = { path = "../../domain-ports" }
 # Unit tests use TestClock from the port; smoke test uses the real clock.
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
 adapter-clock-std = { path = "../clock-std" }
+tempfile = "3"

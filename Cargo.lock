@@ -129,6 +129,7 @@ version = "0.1.0"
 dependencies = [
  "adapter-clock-std",
  "domain-ports",
+ "tempfile",
 ]
 
 [[package]]
@@ -2044,6 +2045,7 @@ dependencies = [
  "bevy",
  "domain-ports",
  "flate2",
+ "objc2-foundation 0.3.2",
  "serde",
  "serde_json",
 ]
