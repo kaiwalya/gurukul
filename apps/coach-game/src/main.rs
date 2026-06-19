@@ -138,21 +138,24 @@ fn run_live(replay_audio: Option<PathBuf>) {
         ..default()
     }));
 
+    // Mint the run stamp first so telemetry and the trace recorder share
+    // the same stamp (previously the stamp was born after the coach, so
+    // telemetry had no stamp to write to).
+    let (stamp, wall_start) = trace::launch_stamp();
+    let log_prefix = trace::trace_root().join(&stamp);
+
     // Build the real coach (or WAV-swapped coach) and wrap it in the recording
     // decorator *before* it becomes the `Coach` handle, then stash the shared
     // trace buffer. The rest of the app still holds a plain `Box<dyn AppCoach>`
     // and is unaware.
     trace::install_recording_coach(
         app.world_mut(),
-        coach::build_coach_with_audio(replay_audio.clone()),
+        coach::build_coach_with_audio(replay_audio.clone(), Some(log_prefix)),
     );
 
-    // One trace file per run, under a gitignored `traces/` next to the
-    // working directory. Name + header stamped from wall-clock at launch.
-    let (stamp, wall_start) = trace::launch_stamp();
     app.insert_resource(coach_game::game::LaunchStamp(stamp.clone()));
     app.add_plugins(TracePlugin {
-        root: PathBuf::from(trace::ROOT),
+        root: trace::trace_root(),
         stamp,
         wall_start,
         replay_of: None,
@@ -182,7 +185,7 @@ fn run_live(replay_audio: Option<PathBuf>) {
 /// recorded frame, drive the clock + inputs + coach from the recording, and
 /// record a *new* trace whose header carries `replay_of`.
 fn run_replay(explicit: Option<PathBuf>, hold: bool) {
-    let root = PathBuf::from(trace::ROOT);
+    let root = trace::trace_root();
     let src = match explicit.or_else(|| trace::newest(&root)) {
         Some(p) => p,
         None => {

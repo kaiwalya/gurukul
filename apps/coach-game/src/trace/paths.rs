@@ -10,6 +10,29 @@ use std::path::{Path, PathBuf};
 /// Gitignored directory all traces live under, relative to the working dir.
 pub const ROOT: &str = "traces";
 
+/// Resolve the trace root for the current platform.
+///
+/// On iOS the working directory is not writable (sandbox), so we write into
+/// the app's Documents container instead — readable via
+/// `xcrun simctl get_app_container booted <bundle-id> data` after the run.
+///
+/// On every other platform (Mac, Linux, …) this returns `PathBuf::from(ROOT)`,
+/// preserving the existing relative-path behaviour exactly.
+#[cfg(target_os = "ios")]
+pub fn trace_root() -> PathBuf {
+    // NSHomeDirectory() returns the app's sandbox root
+    // (e.g. `.../Application/<uuid>`).  Documents/ is the conventional
+    // container-backed user location; `traces/` keeps a clean subdir.
+    use objc2_foundation::NSHomeDirectory;
+    let home = NSHomeDirectory();
+    PathBuf::from(home.to_string()).join("Documents").join(ROOT)
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn trace_root() -> PathBuf {
+    PathBuf::from(ROOT)
+}
+
 /// Fixed suffix appended to every trace file: `<stamp>-ux.jsonl.gz`.
 const SUFFIX: &str = "-ux.jsonl.gz";
 

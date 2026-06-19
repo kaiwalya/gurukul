@@ -12,7 +12,6 @@ use crate::semantic_graph::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, ResumeLocked, SelectedDevice, SongTonality};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
-use std::path::PathBuf;
 
 #[derive(Resource, Default)]
 pub struct LastFeatureHop(Option<u64>);
@@ -159,7 +158,7 @@ pub fn on_enter(
         } else {
             format!("{}-s{}", base, counter.0)
         };
-        let prefix = PathBuf::from(crate::trace::ROOT).join(&name);
+        let prefix = crate::trace::trace_root().join(&name);
         info!("recording engine input → {}.wav", prefix.display());
         prefix
     });

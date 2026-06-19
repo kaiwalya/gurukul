@@ -52,7 +52,7 @@ use bevy::ui::UiSystems;
 use crate::coach::Coach;
 use domain_ports::app_coach::AppCoach;
 
-pub use paths::{file_name, file_path, newest, ROOT};
+pub use paths::{file_name, file_path, newest, trace_root, ROOT};
 pub use record::SCHEMA_VERSION;
 pub use recording_coach::{RecordingCoach, TraceBuffer, TraceBufferHandle};
 pub use wallclock::launch_stamp;

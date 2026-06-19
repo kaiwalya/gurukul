@@ -76,6 +76,34 @@ a packaging step assembles the bundle.
 > Xcode shell project, because signing is deferred and an `.xcodeproj` buys
 > nothing until then. Revisit only if device signing makes the script unwieldy.
 
+## Retrieving trace bundles from the iOS simulator
+
+On the sim the trace root resolves to `<sandbox-home>/Documents/traces/` —
+writable by the app, readable by you off disk. The sandbox path is
+**stable across shutdown** but changes on reinstall or erase, so resolve it
+per session while the sim is booted:
+
+```sh
+# Resolve the data container (sim must be booted; bundle id from ios/Info.plist)
+DATA=$(xcrun simctl get_app_container booted com.gurukul.coach-game data)
+
+# List trace files
+ls "$DATA/Documents/traces/"
+
+# Inspect a specific bundle (example; substitute your stamp)
+gzcat "$DATA/Documents/traces/<stamp>-ux.jsonl.gz" | jq .
+```
+
+All four files from a run share the same stamp:
+- `<stamp>-engine-input.wav`
+- `<stamp>-engine-input.features.jsonl`
+- `<stamp>-engine-input.manifest.json`
+- `<stamp>-ux.jsonl.gz`
+
+Shutting down the sim does **not** delete the container. Re-installing the app
+or erasing the sim will assign a new container UUID — re-run `get_app_container`
+in that case.
+
 ## Android
 
 Deferred to Phase 1.6.6 (after iOS ships, so the iOS work informs it). Same
