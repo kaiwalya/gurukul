@@ -119,7 +119,7 @@ impl AudioDriver for IosAudioDriver {
     }
 
     fn new_devices(&self) -> Result<Box<dyn AudioDevices>, AudioInitError> {
-        use objc2_avf_audio::AVAudioSession;
+        use objc2_avf_audio::{AVAudioSession, AVAudioSessionCategoryRecord};
 
         // Guard: only activate after permission is confirmed. Re-read live
         // status (not a stale snapshot) so revocation between init_status()
@@ -130,9 +130,20 @@ impl AudioDriver for IosAudioDriver {
             AudioInitStatus::Undetermined => return Err(AudioInitError::Undetermined),
         }
 
+        // Configure the session for input *before* activating. `request()`
+        // also sets this, but that path only runs when the permission dialog
+        // fires; on a later launch that boots already-Granted, `request()` is
+        // never called, so the category would otherwise stay at its playback
+        // default and `build_input_stream` fails with a misleading
+        // `DeviceNotAvailable`. Setting it here makes every bring-up configure
+        // recording, independent of whether the dialog fired this launch.
+        let session = unsafe { AVAudioSession::sharedInstance() };
+        if let Some(category) = unsafe { AVAudioSessionCategoryRecord } {
+            let _ = unsafe { session.setCategory_error(category) };
+        }
+
         // `setActive_error(true)` returns Result<(), Retained<NSError>>; map the
         // NSError to our ActivationFailed message.
-        let session = unsafe { AVAudioSession::sharedInstance() };
         if let Err(err) = unsafe { session.setActive_error(true) } {
             return Err(AudioInitError::ActivationFailed(
                 err.localizedDescription().to_string(),

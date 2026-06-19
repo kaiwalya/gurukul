@@ -172,7 +172,13 @@ impl AudioCapture for CpalAudioCapture {
                     }
                 }
                 _ => CaptureError::DeviceUnavailable {
-                    reason: format!("build_input_stream: {e}"),
+                    reason: format!(
+                        "build_input_stream failed: variant={e:?}, \
+                         requested config: channels={}, sample_rate={}, buffer={:?}",
+                        stream_config.channels,
+                        stream_config.sample_rate,
+                        stream_config.buffer_size,
+                    ),
                 },
             })?;
 
