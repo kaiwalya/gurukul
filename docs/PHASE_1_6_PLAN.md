@@ -144,13 +144,13 @@ needs the user, not just the agent. Keep it minimal: build, sign,
 install, enter Free Practice, confirm the device's own mic drives the
 trace. **Done when:** the app captures real mic input on an iPhone.
 
-### Phase 1.6.3 — Touch input parity
+### Phase 1.6.3 — Touch input parity ✅ (landed as 1.6.2c)
 
-Add an on-screen pause/back affordance in InGame so a session is
-exitable by tap (keep Esc for desktop). Audit any other keyboard-only
-controls. Menu buttons already work via tap (Bevy UI `Button`s).
-**Done when:** a full Free-Practice round trip — enter, sing, return to
-menu — works with touch only.
+The on-screen pause/back affordance shipped: a top-right pause button in
+InGame opens the existing Paused menu on tap (Esc kept for desktop), so a
+session is exitable by touch and recordings get a stop trigger. Remaining
+audit item: confirm no *other* keyboard-only control exists in the touch
+round trip.
 
 ### Phase 1.6.4 — Orientation, layout & trace paths
 
@@ -197,6 +197,44 @@ after iOS ships so the iOS work informs it. (Detailed once iOS lands.)
 - **Signing/provisioning friction.** *Mitigation:* keep simulator-based
   iteration (no signing) as the default dev loop through 1.6.0–1.6.1;
   device signing is a gated step at 1.6.2.
+
+## Open issues (harvested from completed sub-plans)
+
+Done so far: **1.6.0** (bundle), **1.6.1/1.6.1b/1.6.1c** (mic + lifecycle),
+**1.6.2a** (permission UX), **1.6.2c** (on-screen pause button), plus the
+sim-trace / telemetry-file / recorder-finalize infra. The detailed plans for
+those were deleted once landed; the *open* items they named are folded here so
+nothing is lost.
+
+**Carry-overs that still need doing:**
+
+- **On-device mic smoke (was 1.6.2).** Sim works; physical hardware is unproven.
+  Needs Apple-ID signing/provisioning — the first user-gated step. The
+  `TODO(1.6.2)` markers left in the cpal `open()` path (route/interruption
+  observers) get exercised here. *Done when:* the app captures real mic input on
+  an iPhone.
+- **Pitch-graph jitter.** A latent erratic-needle/graph artefact, reproducible
+  on Mac via `--replay-audio` over a recovered sim WAV (`.scratch/repros/`). Not
+  platform-specific — it's in the captured signal or the pitch pipeline
+  (YIN/smoothing/projection). Diagnose before going to device so device-side
+  weirdness is unambiguous.
+- **`MediaServicesReset` recoverable rebuild** (was "terminal in 1.6.1"). On-
+  device only; the head currently exits to `Error` on this. → fold into 1.6.2/1.6.5.
+- **"Reconnecting" affordance** for silent recovery cycles (RouteChanged etc.).
+  Polish, → 1.6.5. 1.6.1 only landed exit-on-terminal-error.
+- **Surface mic errors in-UI** (a spinner/affordance vocabulary), rather than
+  sitting silently in `Error`. → 1.6.5.
+- **Mac CoreAudio route/unplug feed** for the lifecycle seam — works with the
+  fake source today; the real-listener feed is a small follow-up.
+
+**Smaller follow-ups (do only if a need appears):**
+
+- Auto-pull the iOS trace bundle off the sim (manual recipe in `BUILD.md` for now).
+- `--replay`/`--replay-audio` against sim-captured bundles (deferred at capture time).
+- Swipe/edge gesture to pause (the button covers the need; gestures cost
+  TouchInput tracking + discoverability).
+- Neutral `RunRecording` struct / shared trace-prefix extraction — only "if a
+  third consumer appears."
 
 ## Explicitly deferred
 
