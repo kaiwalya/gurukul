@@ -13,3 +13,4 @@
 # gitignored and grown unbounded — manual cleanup. See
 # docs/COACH_GAME_UX_TRACE_PLAN.md.
 traces/
+.scratch/
