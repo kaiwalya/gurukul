@@ -10,7 +10,7 @@ pub mod time_graph;
 use crate::coach::{Coach, FeatureHistoryRes, Features, LatestFeatures, MusicInfoRes};
 use crate::semantic_graph::{GraphProjector, SemanticGraph};
 use crate::state::{AppState, HasPausedSession, ResumeLocked, SelectedDevice, SongTonality};
-use crate::ui::{COLOR_TEXT_DIM, FONT_BODY};
+use crate::ui::{COLOR_TEXT_DIM, FONT_HEADER};
 use bevy::prelude::*;
 use domain_ports::app_coach::{AudioConfig, Command};
 
@@ -244,10 +244,14 @@ pub fn spawn_pause_button(mut commands: Commands, slot: Single<Entity, With<HudS
             },
         ))
         .with_children(|p| {
+            // Two ASCII pipes as pause bars. The app's default face is Noto
+            // Sans Devanagari (set in `font.rs` so Sargam renders); it lacks a
+            // pause glyph (U+23F8) and renders it as tofu, but the pipe `|` is
+            // present. Sized up so the bars read as a pause icon, not text.
             p.spawn((
-                Text::new("⏸"),
+                Text::new("||"),
                 TextFont {
-                    font_size: FONT_BODY,
+                    font_size: FONT_HEADER,
                     ..default()
                 },
                 TextColor(COLOR_TEXT_DIM),
