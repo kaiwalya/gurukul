@@ -127,6 +127,9 @@ impl Telemetry for StderrTelemetry {
             } else {
                 writeln!(f, "[{level}] {msg} {merged}")
             };
+            // Flush after every write so an iOS SIGKILL leaves a non-empty log.
+            // The file sink is a debugging aid, not a hot path.
+            let _ = f.flush();
         }
     }
 
@@ -145,6 +148,8 @@ impl Telemetry for StderrTelemetry {
         if let Some(file) = &self.file {
             let mut f = file.lock().unwrap();
             let _ = writeln!(f, "[EVENT] {stamped}");
+            // Same per-write flush as log(): survive an iOS SIGKILL.
+            let _ = f.flush();
         }
     }
 }
@@ -299,7 +304,8 @@ mod tests {
             app_version: "0.1.0",
         });
 
-        // Drop the telemetry so the BufWriter is flushed.
+        // Drop the telemetry (no longer needed for flushing — each write flushes
+        // immediately — but kept to release the file handle before reading).
         drop(tel);
 
         let log_path = log_file_path(&prefix);
