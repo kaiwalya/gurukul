@@ -9,7 +9,7 @@
 //! - **Phase A (this commit):** `AudioDriver` — AVAudioSession permission +
 //!   activation. Code lifted verbatim from adapter-audio-cpal's proven iOS path.
 //! - **Phase B (this commit):** `AudioDevices` — enumerate the input via AVAudioSession / CoreAudio.
-//! - **Phase C (TODO):** `AudioCapture` — native CoreAudio RemoteIO input unit
+//! - **Phase C (this commit):** `AudioCapture` — native CoreAudio RemoteIO input unit
 //!   (the actual fix: builds the unit cpal fails to build on device).
 //!
 //! # Platform scope
@@ -22,13 +22,13 @@
 //! Callers use these names (matching the adapter-audio-cpal surface so the
 //! wiring switch in coach.rs is a one-line cfg swap):
 //! - `new_driver` — Phase A
-//! - `new_devices` — Phase B (not yet implemented)
-//! - `new_capture` — Phase C (not yet implemented)
+//! - `new_devices` — Phase B
+//! - `new_capture` — Phase C
 
+mod capture;
 mod devices;
 mod driver;
-// TODO(Phase C): mod capture;
 
+pub use capture::new as new_capture;
 pub use devices::new as new_devices;
 pub use driver::new as new_driver;
-// TODO(Phase C): pub use capture::new as new_capture;

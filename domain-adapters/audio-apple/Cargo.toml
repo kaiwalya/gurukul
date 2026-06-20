@@ -41,3 +41,4 @@ objc2-audio-toolbox = "0.3"
 
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
+adapter-clock-std = { path = "../clock-std" }

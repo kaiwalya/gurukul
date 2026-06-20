@@ -99,6 +99,7 @@ dependencies = [
 name = "adapter-audio-apple"
 version = "0.1.0"
 dependencies = [
+ "adapter-clock-std",
  "block2 0.6.2",
  "coreaudio-rs 0.13.0",
  "domain-ports",
@@ -2051,6 +2052,7 @@ name = "coach-game"
 version = "0.1.0"
 dependencies = [
  "adapter-app-coach",
+ "adapter-audio-apple",
  "adapter-audio-cpal",
  "adapter-audio-wav",
  "adapter-clock-std",

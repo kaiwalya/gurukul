@@ -75,6 +75,34 @@ pub struct DrainReadModels<'w> {
     prompt: ResMut<'w, PermissionPrompt>,
 }
 
+/// Returns the (driver, capture) pair for the live mic path.
+/// On Apple platforms uses the native adapter; elsewhere uses cpal.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn live_audio_pair(
+    clock: Arc<dyn Clock>,
+) -> (
+    Arc<dyn domain_ports::audio_driver::AudioDriver>,
+    Arc<dyn domain_ports::audio_capture::AudioCapture>,
+) {
+    (
+        Arc::new(adapter_audio_apple::new_driver()),
+        Arc::new(adapter_audio_apple::new_capture(clock)),
+    )
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn live_audio_pair(
+    clock: Arc<dyn Clock>,
+) -> (
+    Arc<dyn domain_ports::audio_driver::AudioDriver>,
+    Arc<dyn domain_ports::audio_capture::AudioCapture>,
+) {
+    (
+        Arc::new(adapter_audio_cpal::new_driver()),
+        Arc::new(adapter_audio_cpal::new_capture(clock)),
+    )
+}
+
 /// Construct the real adapter-backed coach, optionally substituting the WAV
 /// adapter for the microphone.
 ///
@@ -101,10 +129,7 @@ pub fn build_coach_with_audio(
         Arc<dyn domain_ports::audio_driver::AudioDriver>,
         Arc<dyn domain_ports::audio_capture::AudioCapture>,
     ) = match replay_audio {
-        None => (
-            Arc::new(adapter_audio_cpal::new_driver()),
-            Arc::new(adapter_audio_cpal::new_capture(Arc::clone(&clock))),
-        ),
+        None => live_audio_pair(Arc::clone(&clock)),
         Some(wav) => (
             // WAV replay: the driver returns WAV-backed AudioDevices
             // so resolve_stream() gets the WAV stream handle (needed for

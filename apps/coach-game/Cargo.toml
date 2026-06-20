@@ -21,3 +21,6 @@ flate2 = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSString", "NSPathUtilities"] }
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+adapter-audio-apple = { path = "../../domain-adapters/audio-apple" }
