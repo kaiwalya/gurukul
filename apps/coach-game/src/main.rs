@@ -18,6 +18,13 @@
 //! never-ending mic, so the drain is detected here, app-side; see
 //! [`replay_audio`](coach_game::replay_audio)) — start again to replay it.
 //!
+//! `--autostart` skips the main menu and boots directly into a live session
+//! (the same transition the Free Practice button triggers). It is independent
+//! of `--replay-audio` — combine them to start a WAV-backed live run without
+//! first clicking Free Practice. If `--replay` is also passed, `--autostart`
+//! is silently ignored: `--replay` forces its own deterministic flow and never
+//! lands on the main menu anyway.
+//!
 //! `--replay` and `--replay-audio` are mutually exclusive (different execution
 //! modes: bypass-engine vs swap-mic). Passing both is an error.
 
@@ -38,6 +45,8 @@ struct Args {
     replay_audio: Option<PathBuf>,
     /// `--hold`: keep the window after the last replayed frame.
     hold: bool,
+    /// `--autostart`: skip the main menu, boot directly into InGame.
+    autostart: bool,
 }
 
 fn parse_args() -> Args {
@@ -57,6 +66,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut replay: Option<Option<PathBuf>> = None;
     let mut replay_audio: Option<PathBuf> = None;
     let mut hold = false;
+    let mut autostart = false;
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -86,6 +96,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             "--hold" => hold = true,
+            "--autostart" => autostart = true,
             other => eprintln!("coach-game: ignoring unknown arg {other:?}"),
         }
     }
@@ -100,20 +111,23 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
         replay,
         replay_audio,
         hold,
+        autostart,
     })
 }
 
 fn main() {
     let args = parse_args();
     match args.replay {
+        // --autostart is silently ignored in replay mode: the replay driver
+        // forces its own deterministic flow and never lands on the main menu.
         Some(path) => run_replay(path, args.hold),
-        None => run_live(args.replay_audio),
+        None => run_live(args.replay_audio, args.autostart),
     }
 }
 
 /// Live run: real adapters (or WAV-backed audio if `replay_audio` is set),
 /// recording decorator, fresh trace file.
-fn run_live(replay_audio: Option<PathBuf>) {
+fn run_live(replay_audio: Option<PathBuf>, autostart: bool) {
     // Validate the replay WAV up front. Without this, a bad path panics ~3s
     // deep in Bevy startup (after wgpu/window init) inside the WAV devices
     // adapter, burying the one fact the user needs. Mirror `--replay`'s
@@ -160,6 +174,10 @@ fn run_live(replay_audio: Option<PathBuf>) {
         wall_start,
         replay_of: None,
     });
+
+    if autostart {
+        app.insert_resource(coach_game::state::Autostart);
+    }
 
     finish(&mut app);
 

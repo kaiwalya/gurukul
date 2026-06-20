@@ -7,6 +7,7 @@
 #   ./apps/coach-game/ios/package.sh --device               # device, debug
 #   ./apps/coach-game/ios/package.sh --device --release     # device, release
 #   ./apps/coach-game/ios/package.sh --device --profile <path>  # explicit profile
+#   ./apps/coach-game/ios/package.sh --autostart            # sim: boot into InGame directly
 #
 # Output bundle: target/ios/coach-game.app  (relative to the repo root)
 #
@@ -46,6 +47,7 @@ CARGO_FLAGS=()
 BUNDLE_ID="com.kaiwalya.gurukul.game"
 MODE="sim"
 PROVISION_PROFILE=""
+AUTOSTART=""
 
 # ---------------------------------------------------------------------------
 # Parse flags
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
             fi
             PROVISION_PROFILE="$2"
             shift 2
+            ;;
+        --autostart)
+            AUTOSTART="--autostart"
+            shift
             ;;
         *)
             echo "Unknown flag: $1" >&2
@@ -286,7 +292,8 @@ sys.exit(1)
     xcrun simctl install "${BOOTED_UDID}" "${BUNDLE_OUT}"
 
     echo "==> Launching ${BUNDLE_ID}"
-    xcrun simctl launch "${BOOTED_UDID}" "${BUNDLE_ID}"
+    # shellcheck disable=SC2086
+    xcrun simctl launch "${BOOTED_UDID}" "${BUNDLE_ID}" ${AUTOSTART}
 
     echo "==> Done. coach-game is running in the simulator."
 fi

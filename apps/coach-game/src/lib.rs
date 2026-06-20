@@ -44,7 +44,7 @@ use bevy::prelude::*;
 use bevy::ui::UiSystems;
 use menu::permission::{MicStatus, PermissionPrompt};
 use state::{
-    AppSettings, AppState, HasPausedSession, KnownDevices, KnownScales, ResumeLocked,
+    AppSettings, AppState, Autostart, HasPausedSession, KnownDevices, KnownScales, ResumeLocked,
     SelectedDevice, SongTonality,
 };
 
@@ -54,6 +54,14 @@ use state::{
 /// `Coach` construction.
 pub fn build_app(app: &mut App) {
     app.init_state::<AppState>()
+        // When --autostart is passed, main inserts the `Autostart` marker before
+        // `build_app` runs. This startup system fires on the first update and
+        // jumps straight to InGame — identical to the Free Practice button path.
+        // `run_if(resource_exists)` makes this a no-op on a normal run.
+        .add_systems(
+            Startup,
+            autostart_system.run_if(resource_exists::<Autostart>),
+        )
         .init_resource::<AppSettings>()
         .init_resource::<SongTonality>()
         .init_resource::<SelectedDevice>()
@@ -229,6 +237,13 @@ pub fn build_app(app: &mut App) {
             )
                 .run_if(in_state(AppState::Paused)),
         );
+}
+
+/// Startup system: set the initial state to `InGame` when `--autostart` is
+/// active. Guarded by `run_if(resource_exists::<Autostart>)` so it is a no-op
+/// on normal runs where the `Autostart` marker is absent.
+fn autostart_system(mut next: ResMut<NextState<AppState>>) {
+    next.set(AppState::InGame);
 }
 
 fn send_boot_permission_query(coach: NonSend<coach::Coach>) {

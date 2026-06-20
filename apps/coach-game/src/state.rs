@@ -24,6 +24,13 @@ pub enum AppState {
     Paused,
 }
 
+/// Marker resource inserted by `main` when `--autostart` is passed.
+/// Consumed by a `Startup` system in `build_app` that transitions to
+/// `AppState::InGame` before the first frame renders, bypassing the main menu.
+/// Absent on a normal run — `init_state::<AppState>()` defaults to `MainMenu`.
+#[derive(Resource)]
+pub struct Autostart;
+
 /// True while there's a paused session the player can resume. Set by
 /// `OnEnter(Paused)`, cleared when the player Quits-to-Main from the
 /// pause overlay (which truly ends the run). Drives the main menu's
