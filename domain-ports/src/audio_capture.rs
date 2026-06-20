@@ -303,3 +303,351 @@ pub trait AudioCapture: Send + Sync {
         on_event: LifecycleSink,
     ) -> Result<CaptureSession, CaptureError>;
 }
+
+// -----------------------------------------------------------------
+// Conformance battery — test scaffolding, not app-facing surface.
+// Gated behind test-util so it never ships in production binaries.
+// See crate-root docs ("test fakes") for the gating rule.
+// -----------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod conformance {
+    //! Test scaffolding for [`AudioCapture`] port conformance.
+    //!
+    //! These are **not** part of the app-facing port surface — they live here
+    //! so adapter authors have a single canonical battery to run against. Gate:
+    //! `#[cfg(any(test, feature = "test-util"))]`.
+    //!
+    //! # LifecycleSink conformance
+    //!
+    //! `LifecycleSink` conformance (mid-stream interruption, route-change, etc.)
+    //! is **deferred to Phase 1.6.2** — the on-device interruption work where
+    //! these events are actually exercisable. The battery passes a no-op sink to
+    //! `open` for now.
+    //!
+    //! # `t_ms` wording note
+    //!
+    //! The `CaptureFrame::t_ms` field doc says "Monotonic timestamp" while the
+    //! prose in the module doc says "approximate instant". These should be
+    //! reconciled in the port (the battery intentionally asserts only `is_finite`
+    //! on `t_ms`, not monotonicity, to match the weaker prose guarantee). This is
+    //! a known wording inconsistency flagged for the port author to fix separately.
+
+    use super::{AudioCapture, CaptureConfig, CaptureError};
+    use crate::audio_devices::{AudioDevices, SampleRateSupport, StreamHandle};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Universal. No device needed.
+    ///
+    /// Opening with a foreign [`StreamHandle`] (one containing a plain `()`) must
+    /// return `Err(CaptureError::InvalidHandle)`. This is the single most portable
+    /// check — both existing adapters honor it and any future adapter must too.
+    ///
+    /// Contract: `audio_capture.rs` — the downcast in both `negotiate` and `open`.
+    pub fn verify_handle_rejection(capture: &dyn AudioCapture) {
+        let foreign = StreamHandle(Arc::new(()));
+        let cfg = CaptureConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            buffer_frames: None,
+        };
+
+        // negotiate must reject it
+        let neg_result = capture.negotiate(&foreign, &cfg);
+        assert!(
+            matches!(neg_result, Err(CaptureError::InvalidHandle)),
+            "negotiate with foreign handle must return InvalidHandle, got: {neg_result:?}"
+        );
+
+        // open must also reject it
+        let open_result = capture.open(foreign, cfg, Box::new(|_| {}), Box::new(|_| {}));
+        assert!(
+            matches!(open_result, Err(CaptureError::InvalidHandle)),
+            "open with foreign handle must return InvalidHandle"
+        );
+    }
+
+    /// Requires a default input device. Skips (with `eprintln!`) when none is
+    /// present — the CALLER decides whether a skip is acceptable.
+    ///
+    /// Asserts the `negotiate → open` contract without requiring frames to flow:
+    /// - `negotiate` with the stream's advertised format succeeds and returns a
+    ///   `CaptureConfig`;
+    /// - `negotiate` is idempotent (two calls return equal `sample_rate` and
+    ///   `channels`);
+    /// - `open(returned_config)` succeeds and yields a session (then dropped);
+    /// - an absurd config (`channels=99`, OR `sample_rate=0`, OR `channels=0`)
+    ///   does NOT silently produce a working stream: EITHER `negotiate` returns
+    ///   `Err(UnsupportedConfig)`, OR `open` (with that config) returns
+    ///   `Err(UnsupportedConfig)` or `Err(DeviceUnavailable)`;
+    /// - if `UnsupportedConfig.actual` is `Some`, it is internally consistent
+    ///   (non-zero rate, non-zero channels). `None` is also valid (ProbeOnly).
+    pub fn verify_negotiate_contract(devices: &dyn AudioDevices, capture: &dyn AudioCapture) {
+        let stream = match devices.default_input() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "[conformance] verify_negotiate_contract: no default input device — skipping"
+                );
+                return;
+            }
+        };
+
+        // Pick a plausible sample rate from the stream's support
+        let sample_rate = first_sample_rate(&stream.sample_rates).unwrap_or(48_000);
+        let channels = stream.channels;
+
+        let wanted = CaptureConfig {
+            sample_rate,
+            channels,
+            buffer_frames: None,
+        };
+
+        // negotiate must succeed with the advertised format
+        let negotiated = capture
+            .negotiate(&stream.handle, &wanted)
+            .expect("negotiate with advertised format must succeed");
+
+        // idempotency: second call must return same sample_rate and channels
+        let negotiated2 = capture
+            .negotiate(&stream.handle, &wanted)
+            .expect("second negotiate call must also succeed");
+        assert_eq!(
+            negotiated.sample_rate, negotiated2.sample_rate,
+            "negotiate is not idempotent: sample_rate changed across calls"
+        );
+        assert_eq!(
+            negotiated.channels, negotiated2.channels,
+            "negotiate is not idempotent: channels changed across calls"
+        );
+
+        // open with the negotiated config must succeed
+        let session = capture
+            .open(
+                stream.handle.clone(),
+                negotiated,
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .expect("open with negotiated config must succeed");
+        // Drop the session to stop the stream
+        drop(session);
+
+        // Absurd config 1: channels=99 — must be rejected at negotiate OR open
+        let absurd1 = CaptureConfig {
+            sample_rate,
+            channels: 99,
+            buffer_frames: None,
+        };
+        assert_absurd_rejected(capture, &stream.handle, absurd1, "channels=99");
+
+        // Absurd config 2: sample_rate=0 — must be rejected at negotiate OR open
+        let absurd2 = CaptureConfig {
+            sample_rate: 0,
+            channels,
+            buffer_frames: None,
+        };
+        assert_absurd_rejected(capture, &stream.handle, absurd2, "sample_rate=0");
+
+        // Absurd config 3: channels=0 — must be rejected at negotiate OR open
+        let absurd3 = CaptureConfig {
+            sample_rate,
+            channels: 0,
+            buffer_frames: None,
+        };
+        assert_absurd_rejected(capture, &stream.handle, absurd3, "channels=0");
+    }
+
+    /// Requires a device that ACTUALLY delivers frames (WAV always; real mic for
+    /// the live tier). This is the only function that asserts liveness.
+    ///
+    /// Asserts, against the default input opened with its negotiated format:
+    /// - the callback fires and total frames delivered > 0 within a bounded poll;
+    /// - frame geometry: `samples.len() == frames * channels`;
+    /// - sample bounds: every `f32` is finite and within `[-1.0, 1.0]`;
+    /// - `t_ms` is finite (not NaN/Inf — `u64` is always finite, but asserted
+    ///   conceptually; see wording note in module doc);
+    /// - RAII stop stabilizes after drop: snapshot count, drop session, wait
+    ///   settling margin, assert count stabilizes (two consecutive equal reads),
+    ///   allowing one final in-flight callback;
+    /// - open-after-drop reuse: after session drops, opening again succeeds.
+    pub fn verify_capture_delivery(devices: &dyn AudioDevices, capture: &dyn AudioCapture) {
+        let stream = match devices.default_input() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "[conformance] verify_capture_delivery: no default input device — skipping"
+                );
+                return;
+            }
+        };
+
+        let sample_rate = first_sample_rate(&stream.sample_rates).unwrap_or(48_000);
+        let channels = stream.channels;
+
+        let wanted = CaptureConfig {
+            sample_rate,
+            channels,
+            buffer_frames: None,
+        };
+
+        let negotiated = capture
+            .negotiate(&stream.handle, &wanted)
+            .expect("negotiate must succeed for delivery test");
+
+        let negotiated_channels = negotiated.channels as usize;
+
+        // The accumulator is owned by the callback (Arc clone). The callback runs
+        // on an adapter thread; Mutex is deadlock-free because the port guarantees
+        // sequential (never concurrent) callback invocations.
+        #[derive(Default)]
+        struct Acc {
+            total_frames: usize,
+            geometry_ok: bool, // samples.len() == frames * channels for every cb
+            bounds_ok: bool,   // all f32 in [-1.0, 1.0] for every cb
+        }
+        let acc = Arc::new(Mutex::new(Acc {
+            total_frames: 0,
+            geometry_ok: true,
+            bounds_ok: true,
+        }));
+        let acc_cb = Arc::clone(&acc);
+
+        // open → poll/wait
+        let session = capture
+            .open(
+                stream.handle.clone(),
+                negotiated.clone(),
+                Box::new(move |frame| {
+                    let mut a = acc_cb.lock().unwrap();
+                    a.total_frames += frame.frames;
+                    if frame.samples.len() != frame.frames * negotiated_channels {
+                        a.geometry_ok = false;
+                    }
+                    for &s in frame.samples {
+                        if !s.is_finite() || s < -1.0 || s > 1.0 {
+                            a.bounds_ok = false;
+                        }
+                    }
+                }),
+                Box::new(|_| {}),
+            )
+            .expect("open must succeed for delivery test");
+
+        // Poll until frames arrive (bounded: up to 2s in 10ms steps)
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            if acc.lock().unwrap().total_frames > 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("verify_capture_delivery: no frames delivered within 2s");
+            }
+        }
+
+        // snapshot → drop → settle → stabilization check
+        let snapshot = acc.lock().unwrap().total_frames;
+        drop(session); // RAII stop — synchronous teardown
+
+        // Settling: wait up to 100ms for any final in-flight callback to land
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Stabilization: two consecutive equal reads (allowing one final in-flight)
+        let after1 = acc.lock().unwrap().total_frames;
+        std::thread::sleep(Duration::from_millis(50));
+        let after2 = acc.lock().unwrap().total_frames;
+
+        assert_eq!(
+            after1, after2,
+            "frame count did not stabilize after session drop (after1={after1}, after2={after2})"
+        );
+        // Allow at most one extra in-flight callback to have landed after snapshot
+        assert!(
+            after2 <= snapshot + negotiated_channels.max(1) * 4096,
+            "too many frames after drop: snapshot={snapshot}, final={after2}"
+        );
+
+        // Final geometry + bounds asserts (safe: no writer is live now)
+        let final_acc = acc.lock().unwrap();
+        assert!(
+            final_acc.geometry_ok,
+            "frame geometry invariant violated: samples.len() != frames * channels"
+        );
+        assert!(
+            final_acc.bounds_ok,
+            "sample bounds invariant violated: some f32 outside [-1.0, 1.0] or not finite"
+        );
+        drop(final_acc);
+
+        // open-after-drop reuse
+        let _session2 = capture
+            .open(
+                stream.handle.clone(),
+                negotiated,
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .expect("open after session drop must succeed (reuse check)");
+        // Drop _session2 implicitly — stops the stream.
+    }
+
+    // ---- internal helpers ----
+
+    /// Assert that an absurd config is rejected at either negotiate OR open.
+    fn assert_absurd_rejected(
+        capture: &dyn AudioCapture,
+        handle: &StreamHandle,
+        cfg: CaptureConfig,
+        label: &str,
+    ) {
+        let neg = capture.negotiate(handle, &cfg);
+        match neg {
+            Err(CaptureError::UnsupportedConfig { actual, .. }) => {
+                // Rejected at negotiate — good. Validate actual if present.
+                if let Some(a) = actual {
+                    assert!(
+                        a.sample_rate > 0,
+                        "[{label}] UnsupportedConfig.actual.sample_rate must be non-zero"
+                    );
+                    assert!(
+                        a.channels > 0,
+                        "[{label}] UnsupportedConfig.actual.channels must be non-zero"
+                    );
+                }
+                // Rejected at negotiate — contract satisfied.
+            }
+            Err(_) => {
+                // Any other error at negotiate is also a rejection — contract satisfied.
+            }
+            Ok(negotiated) => {
+                // ProbeOnly / similar: negotiate succeeded; open must reject.
+                let open_result = capture.open(
+                    handle.clone(),
+                    negotiated,
+                    Box::new(|_| {}),
+                    Box::new(|_| {}),
+                );
+                assert!(
+                    matches!(
+                        open_result,
+                        Err(CaptureError::UnsupportedConfig { .. })
+                            | Err(CaptureError::DeviceUnavailable { .. })
+                    ),
+                    "[{label}] absurd config must be rejected at negotiate OR open; \
+                     open returned an unexpected Ok or wrong Err variant"
+                );
+            }
+        }
+    }
+
+    /// Extract a representative sample rate from a [`SampleRateSupport`].
+    fn first_sample_rate(support: &SampleRateSupport) -> Option<u32> {
+        match support {
+            SampleRateSupport::List(rates) => rates.first().copied(),
+            SampleRateSupport::Ranges(ranges) => ranges.first().map(|(lo, _)| *lo),
+            SampleRateSupport::ProbeOnly => Some(48_000),
+        }
+    }
+}

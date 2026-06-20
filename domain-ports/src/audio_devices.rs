@@ -187,3 +187,74 @@ pub trait AudioDevices: Send + Sync {
     /// [`list_devices`].
     fn default_input(&self) -> Option<InputStream>;
 }
+
+// -----------------------------------------------------------------
+// Conformance battery — test scaffolding, not app-facing surface.
+// -----------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod conformance {
+    //! Test scaffolding for [`AudioDevices`] port conformance.
+    //!
+    //! This is **not** part of the app-facing port surface. Gate:
+    //! `#[cfg(any(test, feature = "test-util"))]`.
+
+    use super::{AudioDevices, SampleRateSupport};
+
+    /// Universal. Passes on a headless box with zero devices.
+    ///
+    /// Shape invariants (asserted only WHEN devices are present):
+    /// - every [`InputDevice`](super::InputDevice)`.streams` is non-empty;
+    /// - every [`InputStream`](super::InputStream)`.channels >= 1`.
+    ///
+    /// When `default_input()` is `Some`:
+    /// - `channels >= 1`;
+    /// - `sample_rates` is a consistent variant:
+    ///   `List` is non-empty, `Ranges` is non-empty, or `ProbeOnly`.
+    pub fn verify_devices_contract(devices: &dyn AudioDevices) {
+        let list = devices.list_devices();
+
+        for device in &list {
+            assert!(
+                !device.streams.is_empty(),
+                "InputDevice '{}' has no streams — port requires non-empty streams",
+                device.name
+            );
+            for stream in &device.streams {
+                assert!(
+                    stream.channels >= 1,
+                    "InputStream '{}' on device '{}' has channels=0",
+                    stream.name,
+                    device.name
+                );
+            }
+        }
+
+        if let Some(stream) = devices.default_input() {
+            assert!(
+                stream.channels >= 1,
+                "default_input stream '{}' has channels=0",
+                stream.name
+            );
+            match &stream.sample_rates {
+                SampleRateSupport::List(rates) => {
+                    assert!(
+                        !rates.is_empty(),
+                        "default_input stream '{}' has SampleRateSupport::List([]) — must be non-empty",
+                        stream.name
+                    );
+                }
+                SampleRateSupport::Ranges(ranges) => {
+                    assert!(
+                        !ranges.is_empty(),
+                        "default_input stream '{}' has SampleRateSupport::Ranges([]) — must be non-empty",
+                        stream.name
+                    );
+                }
+                SampleRateSupport::ProbeOnly => {
+                    // Valid — no further assertion
+                }
+            }
+        }
+    }
+}
