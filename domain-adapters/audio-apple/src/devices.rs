@@ -10,15 +10,15 @@
 //!   succeeds or fails.
 //!
 //! - **macOS** (`#[cfg(target_os = "macos")]`): Reads the default input device
-//!   via `coreaudio::audio_unit::macos_helpers::get_default_device_id(true)`.
+//!   via raw CoreAudio `AudioObjectGetPropertyData` calls (objc2-core-audio).
 //!   Returns an empty list / `None` if no input device is present (headless CI,
 //!   Mac without a mic). The `AppleStreamHandle` carries the `AudioDeviceID`
-//!   (u32) that Phase C's capture will downcast to build the RemoteIO unit.
+//!   (u32) that capture's `open()` downcasts to build the HALOutput unit.
 //!
 //! # AppleStreamHandle
 //!
-//! A private struct stashed inside the opaque `StreamHandle(Arc<dyn Any + …>)`.
-//! Phase C's `open()` will downcast back to this to retrieve the platform info
+//! A private struct stashed inside the opaque `StreamHandle(Arc<dyn Any + ...>)`.
+//! `open()` downcasts back to this to retrieve the platform info
 //! it needs (no-info marker on iOS; `AudioDeviceID` on macOS).
 
 use domain_ports::audio_devices::{
@@ -36,7 +36,7 @@ use std::sync::Arc;
 /// re-reads `sharedInstance()` to build the RemoteIO unit.
 ///
 /// **macOS:** carries the `AudioDeviceID` (u32) of the default input so
-/// Phase C can call `macos_helpers::audio_unit_from_device_id`.
+/// capture's `open()` can build the HALOutput unit for that device.
 ///
 /// Both arms are `Send + Sync`: `u32` trivially is; the iOS unit struct has
 /// no fields. No raw ObjC pointers are stored.
@@ -48,7 +48,6 @@ pub(crate) struct AppleStreamHandle {
     /// CoreAudio device identifier for the default input.
     /// `AudioDeviceID = AudioObjectID = u32` — trivially Send+Sync.
     /// Read by Phase C's capture open path; pre-provisioned here.
-    #[allow(dead_code)]
     pub(crate) device_id: u32,
 }
 
@@ -161,59 +160,120 @@ impl AudioDevices for AppleAudioDevices {
 
 #[cfg(target_os = "macos")]
 fn build_macos_device() -> Option<InputDevice> {
-    use coreaudio::audio_unit::macos_helpers;
-
-    // None = no input device present (e.g. a headless Mac or CI box).
-    // The port contract tolerates list_devices() == [] and default_input() == None.
-    let device_id = macos_helpers::get_default_device_id(/*input=*/ true)?;
-
-    let name =
-        macos_helpers::get_device_name(device_id).unwrap_or_else(|_| "Default input".to_string());
-
-    // Sample-rate ranges from CoreAudio physical stream format query.
+    let device_id = get_default_input_device_id()?;
+    let name = "Default input".to_string();
     let sample_rates = build_sample_rate_support(device_id);
-
-    // Channel count from the default physical format.
     let channels = channels_for_device(device_id);
-
     let handle = StreamHandle(Arc::new(AppleStreamHandle { device_id }));
-
     let stream = InputStream {
         handle,
         name: name.clone(),
         channels,
         sample_rates,
     };
-
     Some(InputDevice {
-        persistent_id: None, // stable UID available via kAudioDevicePropertyDeviceUID;
-        // deferred — Phase C doesn't need it and neither does
-        // the conformance battery.
+        persistent_id: None,
         name,
-        transport: Transport::Unknown, // transport-type query deferred to Phase C if needed
+        transport: Transport::Unknown,
         streams: vec![stream],
     })
 }
 
-/// Derive sample-rate support from CoreAudio's available physical formats.
+#[cfg(target_os = "macos")]
+fn get_default_input_device_id() -> Option<u32> {
+    use objc2_core_audio::{
+        kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectSystemObject, AudioObjectGetPropertyData, AudioObjectPropertyAddress,
+    };
+    use std::os::raw::c_void;
+    use std::ptr::NonNull;
+
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: 0,
+    };
+    let mut device_id: u32 = 0u32;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as u32,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::new(&mut size).unwrap(),
+            NonNull::new(&mut device_id as *mut u32 as *mut c_void).unwrap(),
+        )
+    };
+    if status != 0 || device_id == 0 {
+        None
+    } else {
+        Some(device_id)
+    }
+}
+
+/// Derive sample-rate support from CoreAudio's available nominal sample rates.
 /// Falls back to `ProbeOnly` if the query fails (e.g. no streams yet).
 #[cfg(target_os = "macos")]
 fn build_sample_rate_support(device_id: u32) -> SampleRateSupport {
-    use coreaudio::audio_unit::macos_helpers;
+    use objc2_core_audio::{
+        kAudioDevicePropertyAvailableNominalSampleRates, kAudioObjectPropertyScopeInput,
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
+    };
+    use objc2_core_audio_types::AudioValueRange;
+    use std::os::raw::c_void;
+    use std::ptr::NonNull;
 
-    let formats = match macos_helpers::get_supported_physical_stream_formats(device_id) {
-        Ok(f) if !f.is_empty() => f,
-        _ => return SampleRateSupport::ProbeOnly,
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: 0,
     };
 
-    let ranges: Vec<(u32, u32)> = formats
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device_id,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::new(&mut size).unwrap(),
+        )
+    };
+    if status != 0 || size == 0 {
+        return SampleRateSupport::ProbeOnly;
+    }
+
+    let count = size as usize / std::mem::size_of::<AudioValueRange>();
+    if count == 0 {
+        return SampleRateSupport::ProbeOnly;
+    }
+
+    let mut ranges_raw: Vec<AudioValueRange> = vec![
+        AudioValueRange {
+            mMinimum: 0.0,
+            mMaximum: 0.0
+        };
+        count
+    ];
+    let mut size2 = size;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::new(&mut size2).unwrap(),
+            NonNull::new(ranges_raw.as_mut_ptr() as *mut c_void).unwrap(),
+        )
+    };
+    if status != 0 {
+        return SampleRateSupport::ProbeOnly;
+    }
+
+    let ranges: Vec<(u32, u32)> = ranges_raw
         .iter()
-        .map(|f| {
-            (
-                f.mSampleRateRange.mMinimum as u32,
-                f.mSampleRateRange.mMaximum as u32,
-            )
-        })
+        .map(|r| (r.mMinimum as u32, r.mMaximum as u32))
         // Deduplicate identical ranges (CoreAudio sometimes lists the same
         // range for each channel-count variant of a format).
         .fold(Vec::new(), |mut acc, r| {
@@ -230,22 +290,62 @@ fn build_sample_rate_support(device_id: u32) -> SampleRateSupport {
     }
 }
 
-/// Read the channel count from the default physical stream format.
+/// Read the channel count from the stream configuration.
 /// Falls back to 1 if the query fails.
 #[cfg(target_os = "macos")]
 fn channels_for_device(device_id: u32) -> u16 {
-    use coreaudio::audio_unit::macos_helpers;
+    use objc2_core_audio::{
+        kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput,
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
+    };
+    use objc2_core_audio_types::AudioBufferList;
+    use std::os::raw::c_void;
+    use std::ptr::NonNull;
 
-    let formats = match macos_helpers::get_supported_physical_stream_formats(device_id) {
-        Ok(f) if !f.is_empty() => f,
-        _ => return 1,
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: 0,
     };
 
-    // The first format entry's channel count is a reasonable default.
-    let ch = formats[0].mFormat.mChannelsPerFrame;
-    if ch >= 1 {
-        ch.min(u16::MAX as u32) as u16
-    } else {
-        1
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device_id,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::new(&mut size).unwrap(),
+        )
+    };
+    if status != 0 || size < std::mem::size_of::<AudioBufferList>() as u32 {
+        return 1;
     }
+
+    let mut buf: Vec<u8> = vec![0u8; size as usize];
+    let mut size2 = size;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::new(&mut size2).unwrap(),
+            NonNull::new(buf.as_mut_ptr() as *mut c_void).unwrap(),
+        )
+    };
+    if status != 0 {
+        return 1;
+    }
+
+    let abl = unsafe { &*(buf.as_ptr() as *const AudioBufferList) };
+    let n_bufs = abl.mNumberBuffers as usize;
+    if n_bufs == 0 {
+        return 1;
+    }
+    let bufs_ptr = abl.mBuffers.as_ptr();
+    let total_channels: u32 = (0..n_bufs)
+        .map(|i| unsafe { (*bufs_ptr.add(i)).mNumberChannels })
+        .sum();
+    (total_channels.max(1) as usize).min(u16::MAX as usize) as u16
 }

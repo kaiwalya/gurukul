@@ -252,9 +252,28 @@ if [[ "${MODE}" == "device" ]]; then
     xcrun devicectl device install app --device "${DEVICE_ID}" "${BUNDLE_OUT}"
 
     echo "==> Launching ${BUNDLE_ID}"
-    xcrun devicectl device process launch --terminate-existing --device "${DEVICE_ID}" "${BUNDLE_ID}"
+    # devicectl forwards trailing args to the app; --autostart boots into InGame.
+    # Capture the launched PID so --autokill can terminate it afterwards.
+    LAUNCH_JSON="$(mktemp)"
+    # shellcheck disable=SC2086
+    xcrun devicectl device process launch --terminate-existing \
+        --device "${DEVICE_ID}" --json-output "${LAUNCH_JSON}" \
+        "${BUNDLE_ID}" ${AUTOSTART}
 
-    echo "==> Done. coach-game is running on the device."
+    if [[ -n "${AUTOKILL}" ]]; then
+        APP_PID="$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["result"]["process"]["processIdentifier"])' "${LAUNCH_JSON}" 2>/dev/null)"
+        echo "==> Auto-kill in ${AUTOKILL}s (pid ${APP_PID:-unknown})"
+        sleep "${AUTOKILL}"
+        if [[ -n "${APP_PID}" ]]; then
+            xcrun devicectl device process terminate --device "${DEVICE_ID}" --pid "${APP_PID}" 2>/dev/null || true
+            echo "==> Terminated pid ${APP_PID} after ${AUTOKILL}s."
+        else
+            echo "==> Could not read PID; skipped terminate. App may still be running."
+        fi
+    else
+        echo "==> Done. coach-game is running on the device."
+    fi
+    rm -f "${LAUNCH_JSON}"
 else
     # Find a booted simulator, or boot a sensible default.
     BOOTED_UDID=$(xcrun simctl list devices booted --json \

@@ -6,25 +6,23 @@ edition = "2021"
 [dependencies]
 domain-ports = { path = "../../domain-ports" }
 
-# Apple-wide (Mac + iOS): AVAudioSession permission + activation.
+# Apple-wide (Mac + iOS): AVAudioSession permission + CoreAudio I/O.
 # Unlike adapter-audio-cpal which gates these iOS-only, this adapter targets
 # both macOS and iOS — hence `any(target_os = "ios", target_os = "macos")`.
-# objc2-avf-audio is feature-gated per Apple framework class:
-#   AVAudioApplication  — modern (iOS 17+) mic-permission API
+#
+# objc2-avf-audio: permission + activation via AVAudioSession / AVAudioApplication.
+#   AVAudioApplication  — iOS 17+ mic-permission API
 #   AVAudioSession      — category + setActive activation
 #   AVAudioSessionTypes — category constants (e.g. AVAudioSessionCategoryRecord)
-#   block2              — completion-handler block type used by requestRecordPermission
+#   block2              — completion-handler block for requestRecordPermission
 #
-# Phase B adds:
-#   coreaudio-rs 0.13 (features audio_unit, core_audio) — macOS macos_helpers for
-#     AudioDeviceID enumeration + sample-rate / channel-count queries.
-#   objc2-audio-toolbox 0.3 — EnableIO / CurrentDevice constants (Phase C needs them;
-#     adding now per spec so Phase C is a pure logic change, no dep churn).
-#   AVAudioSessionRoute feature — gates availableInputs() / AVAudioSessionPortDescription
-#     (iOS channel-count enumeration via port.channels()).
+# objc2-audio-toolbox: raw CoreAudio I/O unit (AudioComponent*, AudioUnit*, AURender*).
+#   Replaces coreaudio-rs — we configure BEFORE AudioUnitInitialize so EnableIO
+#   and StreamFormat succeed on physical iPhone (coreaudio-rs initialized inside
+#   its constructor, causing kAudioUnitErr_InvalidPropertyValue = -10851 on device).
 #
-# NOT added yet (Phase C):
-#   capture.rs itself — native RemoteIO input-unit construction.
+# objc2-core-audio: AudioObject property queries for macOS device enumeration.
+# objc2-core-audio-types: AudioStreamBasicDescription, AudioBufferList, etc.
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 objc2-avf-audio = { version = "0.3", features = [
     "AVAudioApplication",
@@ -36,8 +34,23 @@ objc2-avf-audio = { version = "0.3", features = [
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
-coreaudio-rs = { version = "0.13", default-features = false, features = ["audio_unit", "core_audio"] }
-objc2-audio-toolbox = "0.3"
+objc2-audio-toolbox = { version = "0.3", default-features = false, features = [
+    "std",
+    "AUComponent",
+    "AudioComponent",
+    "AudioOutputUnit",
+    "AudioUnitProperties",
+    "objc2-core-audio-types",
+] }
+objc2-core-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AudioHardware",
+    "objc2-core-audio-types",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+] }
 
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }
