@@ -15,19 +15,29 @@ domain-ports = { path = "../../domain-ports" }
 #   AVAudioSessionTypes — category constants (e.g. AVAudioSessionCategoryRecord)
 #   block2              — completion-handler block type used by requestRecordPermission
 #
+# Phase B adds:
+#   coreaudio-rs 0.13 (features audio_unit, core_audio) — macOS macos_helpers for
+#     AudioDeviceID enumeration + sample-rate / channel-count queries.
+#   objc2-audio-toolbox 0.3 — EnableIO / CurrentDevice constants (Phase C needs them;
+#     adding now per spec so Phase C is a pure logic change, no dep churn).
+#   AVAudioSessionRoute feature — gates availableInputs() / AVAudioSessionPortDescription
+#     (iOS channel-count enumeration via port.channels()).
+#
 # NOT added yet (Phase C):
-#   coreaudio-rs 0.13 (features audio_unit, core_audio) — native RemoteIO input unit
-#   objc2-audio-toolbox 0.3 — EnableIO / CurrentDevice constants not re-exported by coreaudio-rs
+#   capture.rs itself — native RemoteIO input-unit construction.
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 objc2-avf-audio = { version = "0.3", features = [
     "AVAudioApplication",
     "AVAudioSession",
+    "AVAudioSessionRoute",
     "AVAudioSessionTypes",
     "block2",
 ] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
+coreaudio-rs = { version = "0.13", default-features = false, features = ["audio_unit", "core_audio"] }
+objc2-audio-toolbox = "0.3"
 
 [dev-dependencies]
 domain-ports = { path = "../../domain-ports", features = ["test-util"] }

@@ -100,8 +100,10 @@ name = "adapter-audio-apple"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
+ "coreaudio-rs 0.13.0",
  "domain-ports",
  "objc2 0.6.4",
+ "objc2-audio-toolbox",
  "objc2-avf-audio",
  "objc2-foundation 0.3.2",
 ]
@@ -4336,6 +4338,7 @@ checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
 dependencies = [
  "bitflags 2.11.1",
  "block2 0.6.2",
+ "dispatch2",
  "libc",
  "objc2 0.6.4",
  "objc2-core-audio",

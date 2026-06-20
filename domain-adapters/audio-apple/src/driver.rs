@@ -19,9 +19,7 @@ use domain_ports::audio_driver::{
     AudioDriver, AudioInitError, AudioInitStatus, AudioPermissionSink,
 };
 
-// devices::new() is called by new_devices() on both platforms.
-// TODO(Phase B): uncomment when devices module lands.
-// use crate::devices;
+// devices::new() is called by new_devices() on both platforms (Phase B).
 
 /// Build an `AudioDriver` appropriate for the current Apple platform.
 pub fn new() -> impl AudioDriver {
@@ -61,10 +59,7 @@ impl AudioDriver for MacAudioDriver {
     fn new_devices(
         &self,
     ) -> Result<Box<dyn domain_ports::audio_devices::AudioDevices>, AudioInitError> {
-        // TODO(Phase B): replace with Ok(Box::new(crate::devices::new()))
-        Err(AudioInitError::ActivationFailed(
-            "audio-apple devices not yet implemented (Phase B)".to_string(),
-        ))
+        Ok(Box::new(crate::devices::new()))
     }
 }
 
@@ -166,9 +161,6 @@ impl AudioDriver for IosAudioDriver {
             ));
         }
 
-        // TODO(Phase B): replace with Ok(Box::new(crate::devices::new()))
-        Err(AudioInitError::ActivationFailed(
-            "audio-apple devices not yet implemented (Phase B)".to_string(),
-        ))
+        Ok(Box::new(crate::devices::new()))
     }
 }
