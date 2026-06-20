@@ -635,7 +635,15 @@ impl ControlPlane {
             .sample_rate
             .unwrap_or_else(|| preferred_sample_rate(&stream_info.sample_rates));
         let channels = stream_info.channels;
-        let buffer_frames = intent.cfg.buffer_frames.or(Some(sample_rate / 100));
+        // Honor the caller's buffer request as-is. Do NOT fabricate a fixed
+        // buffer when the caller passes None: the head passes None so each
+        // platform's backend picks a buffer via cpal::BufferSize::Default. A
+        // real iOS audio unit rejects BufferSize::Fixed (cpal reports it as a
+        // misleading DeviceNotAvailable); macOS/sim tolerate it, which masked
+        // this. The data plane re-chunks variable cpal frames into BLOCK_FRAMES
+        // anyway, so a pinned capture buffer was never needed. Callers that
+        // pass Some(n) explicitly (WAV-replay feeders, tests) still get Fixed.
+        let buffer_frames = intent.cfg.buffer_frames;
 
         let requested_cfg = CaptureConfig {
             sample_rate,

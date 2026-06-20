@@ -1,6 +1,0 @@
-[alias]
-# Build, bundle, and launch coach-game on the iOS simulator.
-# Add --release for a release build.
-# Packaging doctrine: cargo compiles; apps/coach-game/ios/package.sh packages.
-ios = "!apps/coach-game/ios/package.sh"
-ios-release = "!apps/coach-game/ios/package.sh --release"

@@ -97,7 +97,10 @@ something. Bugs that only exist *live* — viewport jitter, frame-batching
 glitches, despawn flicker, anything a human reports as "it looks wrong" —
 have a fourth surface: every `cargo run` writes a UX trace (file location
 and mechanics in [`AGENTS.md`](AGENTS.md); record schema in
-`src/trace/record.rs`; design rationale in `src/trace/mod.rs`).
+`src/trace/record.rs`; design rationale in `src/trace/mod.rs`). On iOS —
+where there is no `cargo run` and the trace lives in the app sandbox —
+getting at it (sim, physical device, device syslog) is in
+[`PLATFORM-DEBUGGING.md`](PLATFORM-DEBUGGING.md).
 Saw the bug happen? Press **F10 in the moment** — it writes a `mark` record
 that turns "I saw it flicker once" into a frame number.
 

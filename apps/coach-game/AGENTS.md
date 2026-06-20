@@ -21,7 +21,9 @@ crate-level shared pitch/time projection that feeds them.
 Crate structure and the widget-slice doctrine live in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) (the *what/why*); the build workflow
 lives in [`CONTRIBUTING.md`](CONTRIBUTING.md) (the *how*); per-platform
-compile + packaging (iOS/Android) lives in [`BUILD.md`](BUILD.md). This file
+compile + packaging (iOS/Android) lives in [`BUILD.md`](BUILD.md); getting at
+traces/logs per platform (sim, physical device, device syslog) lives in
+[`PLATFORM-DEBUGGING.md`](PLATFORM-DEBUGGING.md). This file
 owns the Bevy mechanics and local app conventions.
 
 ## Running it
@@ -55,7 +57,9 @@ with the tolerant one-liner
 `mark` record ("the bug is happening *now*"). Recording is wired in
 `main.rs`, not `build_app`, so tests and other heads don't write traces.
 To *debug* from a trace, see [`CONTRIBUTING.md`](CONTRIBUTING.md)
-("Debugging live runs from the trace").
+("Debugging live runs from the trace"). For getting at traces/logs on iOS
+(sim and physical device) and reading the device system log, see
+[`PLATFORM-DEBUGGING.md`](PLATFORM-DEBUGGING.md).
 
 A trace can be re-run: `cargo run -p coach-game -- --replay
 [traces/<file>]` (default: newest) skips mic and engine entirely and

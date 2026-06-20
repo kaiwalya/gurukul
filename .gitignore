@@ -14,3 +14,9 @@
 # docs/COACH_GAME_UX_TRACE_PLAN.md.
 traces/
 .scratch/
+
+# Provisioning profiles — generated on developer.apple.com, kept out of git.
+apps/coach-game/ios/*.mobileprovision
+
+# Local environment config (personal — e.g. iOS signing). Template: .env.example.
+/.env
