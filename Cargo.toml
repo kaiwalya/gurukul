@@ -23,6 +23,7 @@ members = [
     "domain-adapters/clock-std",
     "domain-adapters/telemetry-std",
     "domain-adapters/app-coach",
+    "domain-adapters/audio-apple",
     "domain-adapters/audio-cpal",
     "domain-adapters/audio-wav",
     "apps/coach-cli",

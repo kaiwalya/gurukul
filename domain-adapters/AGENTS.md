@@ -17,7 +17,9 @@ that affect this directory:
 
 Naming: each adapter is qualified by a *flavor* suffix identifying the
 backing tech / platform (`-std` for std-library / host OS defaults,
-`-mac` for CoreAudio / AppKit / etc., `-watch` for watchOS, ...). One
+`-mac` for CoreAudio / AppKit / etc., `-watch` for watchOS,
+`-apple` for Apple-wide Mac+iOS via AVAudioSession / native CoreAudio
+(distinct from `-mac` which is macOS-only AppKit/CoreAudio), ...). One
 port can have multiple sibling adapters (`telemetry-std`,
 `telemetry-mac`), so flavors are required even when only one exists
 today.

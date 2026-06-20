@@ -1,0 +1,33 @@
+[package]
+name = "adapter-audio-apple"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain-ports = { path = "../../domain-ports" }
+
+# Apple-wide (Mac + iOS): AVAudioSession permission + activation.
+# Unlike adapter-audio-cpal which gates these iOS-only, this adapter targets
+# both macOS and iOS — hence `any(target_os = "ios", target_os = "macos")`.
+# objc2-avf-audio is feature-gated per Apple framework class:
+#   AVAudioApplication  — modern (iOS 17+) mic-permission API
+#   AVAudioSession      — category + setActive activation
+#   AVAudioSessionTypes — category constants (e.g. AVAudioSessionCategoryRecord)
+#   block2              — completion-handler block type used by requestRecordPermission
+#
+# NOT added yet (Phase C):
+#   coreaudio-rs 0.13 (features audio_unit, core_audio) — native RemoteIO input unit
+#   objc2-audio-toolbox 0.3 — EnableIO / CurrentDevice constants not re-exported by coreaudio-rs
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+objc2-avf-audio = { version = "0.3", features = [
+    "AVAudioApplication",
+    "AVAudioSession",
+    "AVAudioSessionTypes",
+    "block2",
+] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+
+[dev-dependencies]
+domain-ports = { path = "../../domain-ports", features = ["test-util"] }

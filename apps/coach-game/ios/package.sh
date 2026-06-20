@@ -8,6 +8,7 @@
 #   ./apps/coach-game/ios/package.sh --device --release     # device, release
 #   ./apps/coach-game/ios/package.sh --device --profile <path>  # explicit profile
 #   ./apps/coach-game/ios/package.sh --autostart            # sim: boot into InGame directly
+#   ./apps/coach-game/ios/package.sh --autostart --autokill 10  # sim: boot in, kill after 10s (small traces)
 #
 # Output bundle: target/ios/coach-game.app  (relative to the repo root)
 #
@@ -48,6 +49,7 @@ BUNDLE_ID="com.kaiwalya.gurukul.game"
 MODE="sim"
 PROVISION_PROFILE=""
 AUTOSTART=""
+AUTOKILL=""
 
 # ---------------------------------------------------------------------------
 # Parse flags
@@ -75,6 +77,14 @@ while [[ $# -gt 0 ]]; do
         --autostart)
             AUTOSTART="--autostart"
             shift
+            ;;
+        --autokill)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --autokill requires a seconds argument" >&2
+                exit 1
+            fi
+            AUTOKILL="$2"
+            shift 2
             ;;
         *)
             echo "Unknown flag: $1" >&2
@@ -295,5 +305,16 @@ sys.exit(1)
     # shellcheck disable=SC2086
     xcrun simctl launch "${BOOTED_UDID}" "${BUNDLE_ID}" ${AUTOSTART}
 
-    echo "==> Done. coach-game is running in the simulator."
+    if [[ -n "${AUTOKILL}" ]]; then
+        # Automated test runs: let the app live ${AUTOKILL}s (long enough to
+        # bring up audio + emit a few feature snapshots), then terminate so the
+        # UX/audio traces stay small. The app finalizes its gzip trace on a
+        # clean terminate, so the latest run remains readable.
+        echo "==> Auto-kill in ${AUTOKILL}s"
+        sleep "${AUTOKILL}"
+        xcrun simctl terminate "${BOOTED_UDID}" "${BUNDLE_ID}" 2>/dev/null || true
+        echo "==> Terminated ${BUNDLE_ID} after ${AUTOKILL}s."
+    else
+        echo "==> Done. coach-game is running in the simulator."
+    fi
 fi
