@@ -57,8 +57,9 @@ pub struct DialSlot;
 pub struct PauseButton;
 
 pub fn spawn_root(mut commands: Commands) {
-    use crate::widgets::note_dial::DIAL_BOX_PX;
-    const BREATHING: f32 = 80.0;
+    // One breathing unit between/around the content widgets. Replaces the old
+    // 80px dial inset that pooled dead space in the middle of a landscape row.
+    const GUTTER: f32 = 24.0;
 
     let hud_slot = commands
         .spawn((
@@ -84,6 +85,10 @@ pub fn spawn_root(mut commands: Commands) {
             Name::new("graph_slot"),
             Node {
                 flex_grow: 1.0,
+                // Explicit full height: the row now centers its items
+                // (`align_items: Center`), which would otherwise collapse this
+                // slot to its content height. The graph fills the row.
+                height: Val::Percent(100.0),
                 ..default()
             },
         ))
@@ -94,16 +99,25 @@ pub fn spawn_root(mut commands: Commands) {
             DialSlot,
             Name::new("dial_slot"),
             Node {
-                width: px(DIAL_BOX_PX + BREATHING),
-                // Fixed rail: never let a narrow window squeeze the dial
-                // below its intrinsic box (responsive reflow is deferred).
+                // A-outer: the dial is height-driven and square, so the slot
+                // sizes to it instead of pinning a fixed-width rail. The dial
+                // fills the column height and its width follows via
+                // aspect_ratio; `flex_shrink: 0` stops a narrow row from
+                // squeezing the rail. Centered both ways so the dial sits in
+                // the middle of its slot, not jammed into a corner — paired
+                // with the row's `align_items: Center` this vertically centers
+                // the dial against the graph panel. The right padding is one
+                // breathing unit (was 80px, which pooled dead space mid-row).
                 flex_shrink: 0.0,
+                // Full height so the dial's `height: 100%` resolves against the
+                // row height (the row centers items, so this slot would
+                // otherwise be content-height and the dial would collapse).
+                height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::FlexEnd,
-                align_items: AlignItems::FlexEnd,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
                 padding: UiRect {
-                    right: px(BREATHING),
-                    bottom: px(BREATHING),
+                    right: px(GUTTER),
                     ..default()
                 },
                 ..default()
@@ -118,7 +132,11 @@ pub fn spawn_root(mut commands: Commands) {
             Node {
                 flex_direction: FlexDirection::Row,
                 flex_grow: 1.0,
-                column_gap: px(28),
+                // Center the dial vertically against the graph panel (kills the
+                // top-heavy "floating" look), and keep a tight gutter between
+                // them so they read as one composition, not two apps.
+                align_items: AlignItems::Center,
+                column_gap: px(GUTTER),
                 ..default()
             },
         ))

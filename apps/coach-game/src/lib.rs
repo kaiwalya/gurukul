@@ -100,13 +100,21 @@ pub fn build_app(app: &mut App) {
                 coach::query_on_foreground,
                 ui::update_button_colors,
                 ui::send_scroll_events,
-                // Order: rebuild_slots spawns slot children; apply_state
-                // paints them. `.chain()` inserts the sync point that
-                // flushes the rebuild's spawn commands so apply_state
-                // sees the new SlotDot entities on the same frame.
+                // Order: update_dial_metrics reads ComputedNode and writes
+                // DialMetrics; rebuild_slots spawns slot children;
+                // apply_state paints them. `.chain()` at each level
+                // flushes Commands so the next system sees the new entities.
+                // update_hub_size also depends on DialMetrics and runs
+                // after rebuild_slots/apply_state (parallel is fine, but
+                // chaining keeps the order explicit and avoids confusion).
                 (
-                    widgets::note_dial::systems::rebuild_slots,
-                    widgets::note_dial::systems::apply_state,
+                    widgets::note_dial::systems::update_dial_metrics,
+                    (
+                        widgets::note_dial::systems::rebuild_slots,
+                        widgets::note_dial::systems::apply_state,
+                    )
+                        .chain(),
+                    widgets::note_dial::systems::update_hub_size,
                 )
                     .chain(),
             ),

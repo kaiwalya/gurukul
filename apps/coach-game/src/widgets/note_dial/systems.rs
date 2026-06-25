@@ -44,6 +44,19 @@ pub struct SlotDot {
 #[derive(Component)]
 pub struct NeedleEntity;
 
+/// Scale factor derived from the live measured box size.
+///
+/// `k` is in `(0.0, 1.0]` — `1.0` means the box is at its intrinsic size
+/// (`DIAL_BOX_PX`). Every internal dimension is `CONSTANT * k`.
+///
+/// Stored as **logical pixels** — the measuring system converts
+/// `ComputedNode` (physical) → logical via `inverse_scale_factor()` once,
+/// here; consumers can multiply by k directly without knowing the DPI.
+#[derive(Component, Default)]
+pub struct DialMetrics {
+    pub k: f32,
+}
+
 // --- Visual constants -------------------------------------------------
 
 const DIAL_RADIUS_PX: f32 = 140.0;
@@ -96,8 +109,15 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
             Button,
             ButtonSelected,
             Node {
-                width: px(DIAL_BOX_PX),
-                height: px(DIAL_BOX_PX),
+                // A-outer responsive sizing: fill the available height but stay
+                // square (width follows height via aspect_ratio), capped at the
+                // intrinsic box so a tall/portrait viewport doesn't blow it up.
+                // Landscape (short height) shrinks the dial instead of pushing
+                // the content row off-screen. Internals are still fixed px — if
+                // they overflow a shrunk dial, escalate to scaling them too.
+                height: Val::Percent(100.0),
+                max_height: px(DIAL_BOX_PX),
+                aspect_ratio: Some(1.0),
                 // Center the hub child over the dial's middle (Sa).
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
@@ -105,6 +125,7 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
             },
             DialScale { slots: Vec::new() },
             DialState::default(),
+            DialMetrics::default(),
         ))
         .id();
 
@@ -150,6 +171,24 @@ pub fn hub_colors(state: HubState) -> (Color, Color) {
     }
 }
 
+// --- Metrics ----------------------------------------------------------
+
+/// Measure the live box size and update `DialMetrics::k` so every
+/// internal element can scale proportionally. Runs once per frame only
+/// when `ComputedNode` actually changed (Bevy change detection).
+pub fn update_dial_metrics(
+    mut dials: Query<
+        (&ComputedNode, &mut DialMetrics),
+        (With<NoteDialRoot>, Changed<ComputedNode>),
+    >,
+) {
+    for (computed, mut metrics) in dials.iter_mut() {
+        let logical = computed.size().x * computed.inverse_scale_factor();
+        let k = (logical / DIAL_BOX_PX).clamp(0.1, 1.0);
+        metrics.k = k;
+    }
+}
+
 // --- Painting ---------------------------------------------------------
 
 /// Rebuild slot child entities whenever `DialScale` changes. Each slot
@@ -157,27 +196,35 @@ pub fn hub_colors(state: HubState) -> (Color, Color) {
 /// `DIAL_RADIUS_PX`, centred on the parent (via absolute positioning).
 pub fn rebuild_slots(
     mut commands: Commands,
-    dials: Query<(Entity, &DialScale), Changed<DialScale>>,
+    dials: Query<
+        (Entity, &DialScale, &DialMetrics),
+        Or<(Changed<DialScale>, Changed<DialMetrics>)>,
+    >,
     existing_slots: Query<(Entity, &ChildOf), With<SlotDot>>,
 ) {
-    for (dial_entity, scale) in dials.iter() {
+    for (dial_entity, scale, metrics) in dials.iter() {
         for (child, parent) in existing_slots.iter() {
             if parent.parent() == dial_entity {
                 commands.entity(child).despawn();
             }
         }
+        let k = metrics.k;
+        let radius = DIAL_RADIUS_PX * k;
+        let slot_size = SLOT_SIZE_PX * k;
+        let slot_border = SLOT_BORDER_PX * k;
+        let centre = DIAL_CENTRE_PX * k;
         for (i, slot) in scale.slots.iter().enumerate() {
-            let (x, y) = polar_to_offset(slot.angle, DIAL_RADIUS_PX);
+            let (x, y) = polar_to_offset(slot.angle, radius);
             commands.spawn((
                 SlotDot { index: i },
                 ChildOf(dial_entity),
                 Node {
                     position_type: PositionType::Absolute,
-                    width: Val::Px(SLOT_SIZE_PX),
-                    height: Val::Px(SLOT_SIZE_PX),
-                    left: Val::Px(DIAL_CENTRE_PX + x - SLOT_SIZE_PX / 2.0),
-                    top: Val::Px(DIAL_CENTRE_PX + y - SLOT_SIZE_PX / 2.0),
-                    border: UiRect::all(Val::Px(SLOT_BORDER_PX)),
+                    width: Val::Px(slot_size),
+                    height: Val::Px(slot_size),
+                    left: Val::Px(centre + x - slot_size / 2.0),
+                    top: Val::Px(centre + y - slot_size / 2.0),
+                    border: UiRect::all(Val::Px(slot_border)),
                     border_radius: BorderRadius::all(Val::Percent(50.0)),
                     ..default()
                 },
@@ -193,11 +240,14 @@ pub fn rebuild_slots(
 /// `rebuild_slots` just spawned, on the same frame).
 pub fn apply_state(
     mut commands: Commands,
-    dials: Query<(Entity, &DialScale, &DialState), Or<(Changed<DialState>, Changed<DialScale>)>>,
+    dials: Query<
+        (Entity, &DialScale, &DialState, &DialMetrics),
+        Or<(Changed<DialState>, Changed<DialScale>, Changed<DialMetrics>)>,
+    >,
     mut slots: Query<(&SlotDot, &ChildOf, &mut BackgroundColor, &mut BorderColor)>,
     existing_needles: Query<(Entity, &ChildOf), With<NeedleEntity>>,
 ) {
-    for (dial_entity, scale, state) in dials.iter() {
+    for (dial_entity, scale, state, metrics) in dials.iter() {
         let current = current_slot(scale, state);
 
         for (dot, parent, mut bg, mut border) in slots.iter_mut() {
@@ -228,10 +278,15 @@ pub fn apply_state(
                 commands.entity(child).despawn();
             }
         }
+        let k = metrics.k;
+        let centre = DIAL_CENTRE_PX * k;
+        let needle_length = NEEDLE_LENGTH_PX * k;
+        let needle_width_primary = NEEDLE_WIDTH_PRIMARY_PX * k;
+        let needle_width_secondary = NEEDLE_WIDTH_SECONDARY_PX * k;
         for needle in &state.needles {
             let (base_color, width) = match needle.style {
-                NeedleStyle::Primary => (COLOR_NEEDLE_PRIMARY, NEEDLE_WIDTH_PRIMARY_PX),
-                NeedleStyle::Secondary => (COLOR_NEEDLE_SECONDARY, NEEDLE_WIDTH_SECONDARY_PX),
+                NeedleStyle::Primary => (COLOR_NEEDLE_PRIMARY, needle_width_primary),
+                NeedleStyle::Secondary => (COLOR_NEEDLE_SECONDARY, needle_width_secondary),
             };
             let color = base_color.with_alpha(base_color.alpha() * needle.brightness);
             // Wrap the needle in a zero-size pivot node at the centre,
@@ -245,8 +300,8 @@ pub fn apply_state(
                         position_type: PositionType::Absolute,
                         width: Val::Px(0.0),
                         height: Val::Px(0.0),
-                        left: Val::Px(DIAL_CENTRE_PX),
-                        top: Val::Px(DIAL_CENTRE_PX),
+                        left: Val::Px(centre),
+                        top: Val::Px(centre),
                         ..default()
                     },
                     UiTransform::from_rotation(Rot2::radians(needle.angle)),
@@ -257,13 +312,37 @@ pub fn apply_state(
                 Node {
                     position_type: PositionType::Absolute,
                     width: Val::Px(width),
-                    height: Val::Px(NEEDLE_LENGTH_PX),
+                    height: Val::Px(needle_length),
                     left: Val::Px(-width / 2.0),
-                    top: Val::Px(-NEEDLE_LENGTH_PX),
+                    top: Val::Px(-needle_length),
                     ..default()
                 },
                 BackgroundColor(color),
             ));
+        }
+    }
+}
+
+/// Resize the hub dot *and its label's font* whenever `DialMetrics` changes.
+/// The hub box scales by `k`; the label's font must scale with it or the text
+/// (a fixed `FONT_BODY`) overflows the shrunk hub at small `k` (landscape).
+pub fn update_hub_size(
+    dials: Query<(&DialMetrics, &Children), (With<NoteDialRoot>, Changed<DialMetrics>)>,
+    mut hubs: Query<(&mut Node, &Children), With<DialHub>>,
+    mut labels: Query<&mut TextFont, With<DialHubLabel>>,
+) {
+    for (metrics, children) in dials.iter() {
+        let hub_size = HUB_SIZE_PX * metrics.k;
+        for child in children.iter() {
+            if let Ok((mut node, hub_children)) = hubs.get_mut(child) {
+                node.width = px(hub_size);
+                node.height = px(hub_size);
+                for label in hub_children.iter() {
+                    if let Ok(mut font) = labels.get_mut(label) {
+                        font.font_size = FONT_BODY * metrics.k;
+                    }
+                }
+            }
         }
     }
 }
