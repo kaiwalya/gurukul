@@ -144,11 +144,29 @@ fn run_live(replay_audio: Option<PathBuf>, autostart: bool) {
     }
 
     let mut app = App::new();
+    // GURUKUL_DEVICE_SIZE="w,h,scale" forces a fixed logical size + scale-factor
+    // override, to preview the iOS layout on Mac without the simulator. iOS is
+    // landscape-locked (see BUILD.md), so width > height — e.g. "852,393,3" for
+    // iPhone 15. Documented in PLATFORM-DEBUGGING.md (macOS).
+    let mut base_window = Window {
+        title: "Gurukul".to_string(),
+        ..platform_window()
+    };
+    if let Ok(spec) = std::env::var("GURUKUL_DEVICE_SIZE") {
+        let nums: Vec<f32> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if let [lw, lh, sf] = nums[..] {
+            let sf = sf.max(0.01);
+            base_window.resolution = WindowResolution::new((lw * sf) as u32, (lh * sf) as u32)
+                .with_scale_factor_override(sf);
+            base_window.resizable = false;
+            eprintln!("GURUKUL_DEVICE_SIZE: {lw}x{lh} @{sf}x");
+        }
+    }
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Gurukul".to_string(),
-            ..platform_window()
-        }),
+        primary_window: Some(base_window),
         ..default()
     }));
 

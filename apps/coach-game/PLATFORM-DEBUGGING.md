@@ -33,6 +33,29 @@ Quick reminders that bite:
 - **Bevy logs to stderr.** Capture with `2>&1`, not `>file` alone.
 - Latest trace = lexicographically greatest file in `traces/`.
 
+### Previewing the iOS layout on Mac (no simulator)
+
+To eyeball how the UI lays out at phone dimensions without booting the
+simulator, set `GURUKUL_DEVICE_SIZE="w,h,scale"` — it forces a fixed logical
+window size and scale-factor override. iOS is **landscape-locked** (see
+[`BUILD.md`](BUILD.md)), so width > height:
+
+```
+GURUKUL_DEVICE_SIZE="852,393,3" cargo run -p coach-game   # iPhone 15
+```
+
+| device (landscape) | value |
+| --- | --- |
+| iPhone 15 / 14 Pro | `852,393,3` |
+| iPhone SE | `667,375,2` |
+| iPhone 15 Pro Max | `932,430,3` |
+| iPad mini | `1133,744,2` |
+
+This is a **layout proxy only** — it shows fit, spacing, overflow, and scale.
+It does *not* reproduce touch input, safe-area insets (notch/home-bar), the
+iOS audio-session/mic path, or the `BorderlessFullscreen` surface quirk. For
+those, use the real simulator or device (below).
+
 ## iOS
 
 iOS SIGKILLs an app on suspend (no `Drop`/destructors run), and in Free
