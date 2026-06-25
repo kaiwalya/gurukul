@@ -56,6 +56,30 @@ It does *not* reproduce touch input, safe-area insets (notch/home-bar), the
 iOS audio-session/mic path, or the `BorderlessFullscreen` surface quirk. For
 those, use the real simulator or device (below).
 
+### Screenshotting the running window
+
+Use [`scripts/shot.sh`](scripts/shot.sh) (`apps/coach-game/scripts/shot.sh
+[out.png]`) to capture the live window. **Don't** reach for AppleScript window
+bounds or a fixed `screencapture -R x,y,w,h` region:
+
+- `cargo run` launches an **unbundled raw binary** (no `.app`), so the app is
+  *not* AppleScript-scriptable — `System Events … front window` returns
+  nothing, and a hardcoded `-R` region silently drifts out of alignment,
+  producing a stretched/shifted image that misreads the layout (e.g. a
+  centered dial looks off-center). Trust the UX **trace** over such a shot.
+- The fix `shot.sh` uses: CoreGraphics' on-screen window list *does* see the
+  window (owner `coach-game`), giving a stable window ID that
+  `screencapture -l<id>` crops exactly. It's a built-in `swift` snippet — no
+  install, and it needs only **Screen Recording** permission, which the
+  terminal already holds (Automation/Accessibility is *not* needed).
+
+If a capture comes back **all black**, that terminal lacks Screen Recording —
+grant it in *System Settings → Privacy & Security → Screen Recording* (the
+permission is per-terminal-app, so a new terminal needs its own grant). For
+geometry questions where a shot is ambiguous, the UX trace's `geom` channel is
+the authoritative source — it is the app's own measured pixels and cannot be
+distorted by capture tooling.
+
 ## iOS
 
 iOS SIGKILLs an app on suspend (no `Drop`/destructors run), and in Free
