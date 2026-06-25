@@ -28,7 +28,6 @@ const COLOR_TRACE: Color = Color::srgb(0.94, 0.94, 0.98);
 /// warmer and more saturated than the amber `COLOR_ONSET` so the two remain
 /// visually separable at a glance.
 const COLOR_VIBRATO: Color = Color::srgb(1.0, 0.45, 0.42);
-const TRACE_MIN_ALPHA: f32 = 0.25;
 const TRACE_MAX_ALPHA: f32 = 0.95;
 
 #[derive(Component)]
@@ -359,8 +358,13 @@ fn trace_segment_geom(
 }
 
 fn trace_color(confidence: f32, vibrato_strength: f32) -> Color {
-    let alpha =
-        (TRACE_MIN_ALPHA + confidence * (TRACE_MAX_ALPHA - TRACE_MIN_ALPHA)).clamp(0.0, 1.0);
+    // Match the note-dial needle: confidence drives alpha through a 4th-power
+    // curve (`note_dial::model::project_needle`), fading the trace all the way
+    // to invisible at noise-floor confidence (no alpha floor) while confident
+    // voice stays solid. Weak pitch leaves an invisible gap in the line, just
+    // as the needle vanishes when unsure.
+    let conf = confidence.clamp(0.0, 1.0).powi(4);
+    let alpha = (conf * TRACE_MAX_ALPHA).clamp(0.0, 1.0);
     COLOR_TRACE
         .mix(&COLOR_VIBRATO, vibrato_strength)
         .with_alpha(alpha)
