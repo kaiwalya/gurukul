@@ -32,6 +32,38 @@ Quick reminders that bite:
   before the window/mic/first frame.
 - **Bevy logs to stderr.** Capture with `2>&1`, not `>file` alone.
 - Latest trace = lexicographically greatest file in `traces/`.
+- **Test live audio in `--release` only** — see below.
+
+### Live audio needs `--release` (debug silently drops ~half the samples)
+
+Any run that captures audio — real mic *or* `--replay-audio <wav>` — must be
+built `--release`. In **debug**, the engine (YIN pitch detection over a 2048
+window every 512-sample block) is unoptimized and runs **slower than
+realtime**, so the data-plane worker can't drain its ~85 ms ring fast enough.
+The realtime side then drops whatever doesn't fit — measured at **~45 % of all
+samples** for the sa-re-ga-ma clip. The recorded `-engine-input.wav` comes out
+roughly **half the length** of the input, glitchy, and with a garbage pitch
+track; live audio sounds the same way. The only on-screen tell is a single
+summary line at shutdown: `data-plane: RT samples dropped (worker fell
+behind)`.
+
+This is the same "DSP is prohibitively slow in debug" rule from the workspace
+`CLAUDE.md`, applied to live audio. Proof: the identical WAV through
+`cargo run --release` records a **bit-perfect** copy of the input (normalized
+cross-correlation 1.0, no drops); through `cargo run` (debug) it loses 45 %.
+
+```
+cargo run -p coach-game --release -- --replay-audio <wav>   # clean
+cargo run -p coach-game            -- --replay-audio <wav>   # ~45% dropped
+```
+
+To diagnose a suspected drop, compare the input WAV against the recorded
+`traces/<stamp>-engine-input.wav`: matching length + high cross-correlation =
+healthy pipeline; a short, low-correlation output = the worker fell behind
+(rebuild `--release`). Note the recorded WAV is **32-bit IEEE float**
+(`WAVE_FORMAT_EXTENSIBLE`, subformat 3) while the test clip is 16-bit PCM, so a
+naive reader that assumes PCM will fail to parse it — read the `fmt ` chunk's
+subformat, don't trust the top-level tag.
 
 ### Previewing the iOS layout on Mac (no simulator)
 
