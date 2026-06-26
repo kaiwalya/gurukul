@@ -27,6 +27,10 @@
 //!
 //! `--replay` and `--replay-audio` are mutually exclusive (different execution
 //! modes: bypass-engine vs swap-mic). Passing both is an error.
+//!
+//! `--mesh-trace` switches the pitch trace from CSS rectangle nodes to a GPU
+//! triangle-mesh renderer. The rectangle renderer stays default-on; this flag
+//! opts into the mesh path instead. Works in both live and replay modes.
 
 use std::path::PathBuf;
 
@@ -34,7 +38,7 @@ use bevy::prelude::*;
 use bevy::window::{Window, WindowResolution};
 use coach_game::trace::replay;
 use coach_game::trace::TracePlugin;
-use coach_game::{build_app, coach, font, replay_audio, trace};
+use coach_game::{add_mesh_trace_plugin, build_app, coach, font, replay_audio, trace};
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -47,6 +51,9 @@ struct Args {
     hold: bool,
     /// `--autostart`: skip the main menu, boot directly into InGame.
     autostart: bool,
+    /// `--mesh-trace`: use GPU triangle-mesh rendering for the pitch trace
+    /// instead of the default CSS rectangle nodes.
+    mesh_trace: bool,
 }
 
 fn parse_args() -> Args {
@@ -67,6 +74,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut replay_audio: Option<PathBuf> = None;
     let mut hold = false;
     let mut autostart = false;
+    let mut mesh_trace = false;
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -97,6 +105,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--hold" => hold = true,
             "--autostart" => autostart = true,
+            "--mesh-trace" => mesh_trace = true,
             other => eprintln!("coach-game: ignoring unknown arg {other:?}"),
         }
     }
@@ -112,6 +121,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Args, String> {
         replay_audio,
         hold,
         autostart,
+        mesh_trace,
     })
 }
 
@@ -120,14 +130,14 @@ fn main() {
     match args.replay {
         // --autostart is silently ignored in replay mode: the replay driver
         // forces its own deterministic flow and never lands on the main menu.
-        Some(path) => run_replay(path, args.hold),
-        None => run_live(args.replay_audio, args.autostart),
+        Some(path) => run_replay(path, args.hold, args.mesh_trace),
+        None => run_live(args.replay_audio, args.autostart, args.mesh_trace),
     }
 }
 
 /// Live run: real adapters (or WAV-backed audio if `replay_audio` is set),
 /// recording decorator, fresh trace file.
-fn run_live(replay_audio: Option<PathBuf>, autostart: bool) {
+fn run_live(replay_audio: Option<PathBuf>, autostart: bool, mesh_trace: bool) {
     // Validate the replay WAV up front. Without this, a bad path panics ~3s
     // deep in Bevy startup (after wgpu/window init) inside the WAV devices
     // adapter, burying the one fact the user needs. Mirror `--replay`'s
@@ -196,6 +206,9 @@ fn run_live(replay_audio: Option<PathBuf>, autostart: bool) {
     if autostart {
         app.insert_resource(coach_game::state::Autostart);
     }
+    if mesh_trace {
+        app.insert_resource(coach_game::widgets::time_graph::MeshTrace);
+    }
 
     finish(&mut app);
 
@@ -220,7 +233,7 @@ fn run_live(replay_audio: Option<PathBuf>, autostart: bool) {
 /// Replay run: no adapters, no mic. Load the trace, force the window to the
 /// recorded frame, drive the clock + inputs + coach from the recording, and
 /// record a *new* trace whose header carries `replay_of`.
-fn run_replay(explicit: Option<PathBuf>, hold: bool) {
+fn run_replay(explicit: Option<PathBuf>, hold: bool, mesh_trace: bool) {
     let root = trace::trace_root();
     let src = match explicit.or_else(|| trace::newest(&root)) {
         Some(p) => p,
@@ -294,6 +307,10 @@ fn run_replay(explicit: Option<PathBuf>, hold: bool) {
     // reads (the ReplayCoach is not a RecordingCoach). That's correct — the
     // value being verified is the *geom* channel, which records identically.
 
+    if mesh_trace {
+        app.insert_resource(coach_game::widgets::time_graph::MeshTrace);
+    }
+
     finish(&mut app);
     app.run();
 }
@@ -318,6 +335,10 @@ fn finish(app: &mut App) {
     // Promote the Devanagari font to the default slot once it loads.
     // Runs every frame until the asset lands, then removes its marker.
     app.add_systems(Update, font::promote_to_default);
+    // Register the mesh-trace material plugin here (not in build_app) so
+    // headless tests, which use MinimalPlugins, are not broken by the
+    // EmbeddedAssetRegistry requirement.
+    add_mesh_trace_plugin(app);
     build_app(app);
 }
 

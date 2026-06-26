@@ -16,6 +16,7 @@ pub use scene::{
     TimeGraphPitchLanePhysRect, TimeGraphPitchLaneScale, TimeGraphPitchLaneSize, TimeGraphScene,
 };
 pub use systems::{
-    spawn, BreathSpanMarker, GridlineLayer, GrooveLineMarker, LastTraceGeom, OnsetTickMarker,
-    TimeGraphEventsLane, TimeGraphPitchLane, TimeGraphRoot, TraceLayer, TraceSegmentBody,
+    spawn, BreathSpanMarker, GridlineLayer, GrooveLineMarker, LastTraceGeom, MeshTrace,
+    OnsetTickMarker, TimeGraphEventsLane, TimeGraphPitchLane, TimeGraphRoot, TraceLayer,
+    TraceMaterial, TraceMeshCamera, TraceMeshEntity, TraceSegmentBody,
 };
