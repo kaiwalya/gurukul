@@ -45,16 +45,9 @@ pub struct TimeGraphPitchLane;
 #[derive(Component)]
 pub struct TimeGraphEventsLane;
 
-/// Back layer of the pitch lane: holds the tonal gridlines. A full-size
-/// child of the lane, kept separate from [`TraceLayer`] so the two never
-/// share a parent — the structural fix for the despawn-fight hazard (see
-/// `ARCHITECTURE.md`). Each layer's painter clears only its own layer.
+/// Back layer of the pitch lane: holds the tonal gridlines.
 #[derive(Component)]
 pub struct GridlineLayer;
-
-/// Front layer of the pitch lane: holds the pitch trace bodies.
-#[derive(Component)]
-pub struct TraceLayer;
 
 #[derive(Component)]
 pub struct GrooveLineMarker;
@@ -64,14 +57,6 @@ pub struct OnsetTickMarker;
 
 #[derive(Component)]
 pub struct BreathSpanMarker;
-
-/// Marker resource: when present (via `--mesh-trace`), GPU triangle-mesh
-/// trace is active and rectangle renderer is suppressed.
-#[derive(Resource, Default)]
-pub struct MeshTrace;
-
-#[derive(Component)]
-pub struct TraceSegmentBody;
 
 /// Marker component for the overlay camera used by the mesh-trace path.
 #[derive(Component)]
@@ -93,23 +78,63 @@ pub struct TraceMeshHandles {
 }
 
 /// Marker component for the 2d background-fill quad that replaces the opaque
-/// UI lane background when `--mesh-trace` is active.
+/// UI lane background in the mesh-trace render path.
 #[derive(Component)]
 pub struct LaneBgMeshEntity;
 
 /// Marker component for 2d horizontal gridline quads spawned by
-/// [`apply_mesh_gridlines`] when `--mesh-trace` is active.
+/// [`apply_mesh_gridlines`].
 #[derive(Component)]
 pub struct GridlineMeshEntity;
 
-/// GPU material for the pitch-trace polyline mesh. Clips the mesh to the
-/// pitch lane rect in world space and applies per-vertex colour with a
-/// right-edge fade.
+/// GPU material for the pitch-lane interior meshes (trace, gridlines, and the
+/// background fill). Clips to the pitch-lane rect in world space and applies
+/// per-vertex colour. `params.x` toggles the right-edge fade: `1.0` for the
+/// trace (its leading head dissolves), `0.0` for the opaque background fill and
+/// the gridlines (full coverage, no see-through edge against the app
+/// background).
 #[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
 pub struct TraceMaterial {
     /// `[min_x, min_y, max_x, max_y]` in world (y-up) coordinates.
     #[uniform(0)]
     pub clip_rect: Vec4,
+    /// `x` = right-edge fade flag (1 = fade the leading edge, 0 = no fade).
+    /// `y` = opaque flag (1 = opaque alpha-mode, 0 = blended). `zw` padding for
+    /// 16-byte uniform alignment.
+    #[uniform(1)]
+    pub params: Vec4,
+}
+
+impl TraceMaterial {
+    /// The trace material: right-edge fade on, alpha-blended (confidence alpha).
+    fn trace(clip_rect: Vec4) -> Self {
+        Self {
+            clip_rect,
+            params: Vec4::new(1.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    /// The opaque background fill: no fade, opaque alpha-mode, so its edges
+    /// fully cover and never let the moving app background flicker through.
+    fn fill(clip_rect: Vec4) -> Self {
+        Self {
+            clip_rect,
+            params: Vec4::new(0.0, 1.0, 0.0, 0.0),
+        }
+    }
+
+    /// The gridline material: no fade, blended (gridlines are intentionally
+    /// faint, so they keep their low alpha).
+    fn gridline(clip_rect: Vec4) -> Self {
+        Self {
+            clip_rect,
+            params: Vec4::ZERO,
+        }
+    }
+
+    fn opaque(&self) -> bool {
+        self.params.y > 0.5
+    }
 }
 
 impl Material2d for TraceMaterial {
@@ -118,7 +143,15 @@ impl Material2d for TraceMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+        // The fill (background + gridlines) is opaque so its edges fully cover
+        // the app background — a blended fill shimmers against the moving
+        // backdrop behind the overlay camera. Only the trace blends (for its
+        // confidence-driven alpha and head fade).
+        if self.opaque() {
+            AlphaMode2d::Opaque
+        } else {
+            AlphaMode2d::Blend
+        }
     }
 }
 
@@ -160,33 +193,6 @@ impl LaneWorldRect {
     pub fn clip_rect_uniform(&self) -> Vec4 {
         Vec4::new(self.world[0], self.world[1], self.world[2], self.world[3])
     }
-}
-
-/// One segment's polyline data for the `poly` trace channel.
-pub struct TraceSegmentSnapshot {
-    /// Lane-local logical px points (one per segment point, not per pair).
-    pub lane_logical: Vec<[f32; 2]>,
-    /// Physical px AABB `[min_x, min_y, max_x, max_y]` of this segment's
-    /// trace centerlines.
-    pub aabb_px: [f32; 4],
-    /// Post-clip AABB (intersection with lane physical rect).
-    pub clipped_aabb_px: [f32; 4],
-    /// Scale factor used for the conversion.
-    pub scale_factor: f32,
-}
-
-/// Populated by `apply_trace` each frame with the lane-local polyline and
-/// physical-px bounds for each trace segment. Read by `record_poly` in the
-/// trace plugin. The resource is always initialized (even empty), so
-/// `record_poly` can read it unconditionally.
-#[derive(Resource, Default)]
-pub struct LastTraceGeom(pub Vec<TraceSegmentSnapshot>);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TraceSegmentGeom {
-    center: Vec2,
-    length: f32,
-    angle: f32,
 }
 
 /// Spawn the time-graph root and its two lanes under `parent`, returning
@@ -237,12 +243,6 @@ pub fn spawn(commands: &mut Commands, parent: Entity) -> Entity {
                     layer_node(),
                     ZIndex(0),
                 ));
-                lane.spawn((
-                    TraceLayer,
-                    Name::new("trace_layer"),
-                    layer_node(),
-                    ZIndex(1),
-                ));
             });
         parent.spawn((
             TimeGraphEventsLane,
@@ -271,57 +271,6 @@ fn layer_node() -> Node {
         right: px(0),
         bottom: px(0),
         ..default()
-    }
-}
-
-/// Repaint the tonal gridlines into the gridline layer. Gated on the
-/// slow-cadence grid scene, so it only runs when the grooves actually
-/// change (the glue value-gates the write). The gridline layer is *not*
-/// shared with the trace, so this can clear its own children wholesale.
-///
-/// When `--mesh-trace` is active ([`MeshTrace`] resource is present), the
-/// UI groove spawn loop is suppressed; [`apply_mesh_gridlines`] owns
-/// gridline rendering instead.
-pub fn apply_gridlines(
-    mut commands: Commands,
-    grid: Res<TimeGraphGridSceneRes>,
-    layer: Query<Entity, With<GridlineLayer>>,
-    grooves: Query<Entity, With<GrooveLineMarker>>,
-    mesh_trace: Option<Res<MeshTrace>>,
-) {
-    let already_painted = !grooves.is_empty();
-    if !grid.is_changed() && already_painted {
-        return;
-    }
-    let Ok(layer_entity) = layer.single() else {
-        return;
-    };
-    for entity in grooves.iter() {
-        commands.entity(entity).despawn();
-    }
-
-    // When mesh-trace is active, gridlines are drawn in 2d by apply_mesh_gridlines.
-    if mesh_trace.is_some() {
-        return;
-    }
-
-    for groove in &grid.grooves {
-        commands.entity(layer_entity).with_child((
-            GrooveLineMarker,
-            Node {
-                position_type: PositionType::Absolute,
-                left: percent(0.0),
-                top: percent((1.0 - groove.y).clamp(0.0, 1.0) * 100.0),
-                width: percent(100.0),
-                height: px(GROOVE_HEIGHT),
-                ..default()
-            },
-            BackgroundColor(if groove.active {
-                COLOR_GROOVE_ACTIVE
-            } else {
-                COLOR_GROOVE_INACTIVE
-            }),
-        ));
     }
 }
 
@@ -375,109 +324,6 @@ pub fn apply_events(
             },
             BackgroundColor(COLOR_BREATH.with_alpha((0.15 + span.peak * 0.35).clamp(0.0, 1.0))),
         ));
-    }
-}
-
-/// Repaint the pitch trace into the trace layer. Gated on the fast-cadence
-/// live scene plus the measured lane size (the trace geometry is in logical
-/// pixels). The trace layer is its own entity, so the despawn is a simple
-/// wholesale clear — no parent-filtering, no coupling to the gridlines.
-///
-/// When `--mesh-trace` is active ([`MeshTrace`] resource is present), the
-/// rect-spawn loop is suppressed; [`apply_mesh_trace`] owns rendering instead.
-/// [`LastTraceGeom`] is always populated regardless of the flag so the `poly`
-/// trace channel keeps working.
-#[allow(clippy::too_many_arguments)]
-pub fn apply_trace(
-    mut commands: Commands,
-    live: Res<TimeGraphLiveSceneRes>,
-    layer: Query<Entity, With<TraceLayer>>,
-    lane_size: Res<TimeGraphPitchLaneSize>,
-    existing_bodies: Query<Entity, With<TraceSegmentBody>>,
-    mut last_geom: ResMut<LastTraceGeom>,
-    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
-    scale_res: Res<TimeGraphPitchLaneScale>,
-    mesh_trace: Option<Res<MeshTrace>>,
-) {
-    let has_existing = !existing_bodies.is_empty();
-    if !live.is_changed() && has_existing {
-        return;
-    }
-    let Ok(layer_entity) = layer.single() else {
-        return;
-    };
-    let Some(size) = lane_size.0.map(LogicalSize::get) else {
-        return;
-    };
-    if size.x <= 0.0 || size.y <= 0.0 {
-        return;
-    }
-
-    // Clear last frame's poly data now that we know we are repainting.
-    last_geom.0.clear();
-
-    for entity in existing_bodies.iter() {
-        commands.entity(entity).despawn();
-    }
-
-    for segment in &live.pitch_segments {
-        // Poly channel: collect lane-local logical px for all points (not just pairs).
-        let lane_logical: Vec<[f32; 2]> = segment
-            .points
-            .iter()
-            .map(|tp| {
-                let p = normalized_to_lane(tp.point, size);
-                [p.x, p.y]
-            })
-            .collect();
-
-        if !lane_logical.is_empty() {
-            let scale_factor = scale_res.0;
-            let aabb_px = if let Some(rect) = lane_phys_rect.0 {
-                let origin = [rect[0], rect[1]];
-                segment_phys_aabb(&lane_logical, scale_factor, origin)
-            } else {
-                [0.0, 0.0, 0.0, 0.0]
-            };
-            let clipped_aabb_px = if let Some(rect) = lane_phys_rect.0 {
-                intersect_aabb(aabb_px, rect)
-            } else {
-                aabb_px
-            };
-            last_geom.0.push(TraceSegmentSnapshot {
-                lane_logical,
-                aabb_px,
-                clipped_aabb_px,
-                scale_factor,
-            });
-        }
-
-        if mesh_trace.is_none() {
-            for pair in segment.points.windows(2) {
-                let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
-                    continue;
-                };
-                let avg_confidence =
-                    ((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0);
-                let avg_vibrato =
-                    ((pair[0].vibrato_strength + pair[1].vibrato_strength) * 0.5).clamp(0.0, 1.0);
-                let color = trace_color(avg_confidence, avg_vibrato);
-                commands.spawn((
-                    TraceSegmentBody,
-                    ChildOf(layer_entity),
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(geom.center.x - geom.length * 0.5),
-                        top: px(geom.center.y - TRACE_WIDTH * 0.5),
-                        width: px(geom.length),
-                        height: px(TRACE_WIDTH),
-                        ..default()
-                    },
-                    UiTransform::from_rotation(Rot2::radians(geom.angle)),
-                    BackgroundColor(color),
-                ));
-            }
-        }
     }
 }
 
@@ -644,8 +490,7 @@ pub fn clear_trace_mesh_handles(mut commands: Commands) {
 }
 
 /// Spawn the overlay [`Camera2d`] that renders mesh-trace entities on
-/// [`RenderLayers::layer(1)`]. Gated by `resource_exists::<MeshTrace>` in
-/// `lib.rs`.
+/// [`RenderLayers::layer(1)`].
 pub fn spawn_trace_overlay_camera(mut commands: Commands) {
     commands.spawn((
         TraceMeshCamera,
@@ -758,7 +603,7 @@ pub fn apply_mesh_trace(
         // First run: create the single persistent entity + handles.
         None => {
             let mesh_handle = meshes.add(mesh);
-            let mat_handle = materials.add(TraceMaterial { clip_rect });
+            let mat_handle = materials.add(TraceMaterial::trace(clip_rect));
             let entity = commands
                 .spawn((
                     TraceMeshEntity,
@@ -784,8 +629,8 @@ pub fn apply_mesh_trace(
 }
 
 /// Make the pitch-lane UI background transparent so the 2d mesh layer shows
-/// through. Runs every frame (cheap, idempotent) when `--mesh-trace` is active.
-/// Also clears the root background so the lane rect is fully visible.
+/// through. Runs every frame (cheap, idempotent). Also clears the root
+/// background so the lane rect is fully visible.
 pub fn clear_pitch_lane_bg_for_mesh(
     mut pitch_lanes: Query<&mut BackgroundColor, With<TimeGraphPitchLane>>,
     mut roots: Query<&mut BackgroundColor, (With<TimeGraphRoot>, Without<TimeGraphPitchLane>)>,
@@ -855,7 +700,7 @@ pub fn apply_mesh_lane_bg(
     commands.spawn((
         LaneBgMeshEntity,
         Mesh2d(meshes.add(mesh)),
-        MeshMaterial2d(materials.add(TraceMaterial { clip_rect })),
+        MeshMaterial2d(materials.add(TraceMaterial::fill(clip_rect))),
         Visibility::Visible,
         RenderLayers::layer(1),
         DespawnOnExit(crate::state::AppState::InGame),
@@ -933,7 +778,7 @@ pub fn apply_mesh_gridlines(
         commands.spawn((
             GridlineMeshEntity,
             Mesh2d(meshes.add(mesh)),
-            MeshMaterial2d(materials.add(TraceMaterial { clip_rect })),
+            MeshMaterial2d(materials.add(TraceMaterial::gridline(clip_rect))),
             Visibility::Visible,
             RenderLayers::layer(1),
             DespawnOnExit(crate::state::AppState::InGame),
@@ -995,25 +840,6 @@ fn normalized_to_lane(point: NormalizedPoint, size: Vec2) -> Vec2 {
     )
 }
 
-fn trace_segment_geom(
-    start: NormalizedPoint,
-    end: NormalizedPoint,
-    lane_size: Vec2,
-) -> Option<TraceSegmentGeom> {
-    let start = normalized_to_lane(start, lane_size);
-    let end = normalized_to_lane(end, lane_size);
-    let delta = end - start;
-    let length = delta.length();
-    if length <= f32::EPSILON {
-        return None;
-    }
-    Some(TraceSegmentGeom {
-        center: (start + end) * 0.5,
-        length,
-        angle: delta.y.atan2(delta.x),
-    })
-}
-
 /// Compute the physical-px AABB of a set of lane-local logical-px polyline
 /// points, expanded by the trace stroke's half-width.
 pub fn segment_phys_aabb(
@@ -1059,19 +885,6 @@ pub fn intersect_aabb(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
         a[2].min(b[2]),
         a[3].min(b[3]),
     ]
-}
-
-fn trace_color(confidence: f32, vibrato_strength: f32) -> Color {
-    // Match the note-dial needle: confidence drives alpha through a 4th-power
-    // curve (`note_dial::model::project_needle`), fading the trace all the way
-    // to invisible at noise-floor confidence (no alpha floor) while confident
-    // voice stays solid. Weak pitch leaves an invisible gap in the line, just
-    // as the needle vanishes when unsure.
-    let conf = confidence.clamp(0.0, 1.0).powi(4);
-    let alpha = (conf * TRACE_MAX_ALPHA).clamp(0.0, 1.0);
-    COLOR_TRACE
-        .mix(&COLOR_VIBRATO, vibrato_strength)
-        .with_alpha(alpha)
 }
 
 #[cfg(test)]
@@ -1127,21 +940,6 @@ mod tests {
         let lane = [0.0f32, 0.0, 10.0, 10.0];
         let clipped = intersect_aabb(aabb, lane);
         assert_eq!(clipped, aabb);
-    }
-
-    #[test]
-    fn trace_segment_geom_maps_lane_local_screen_space() {
-        let Some(geom) = trace_segment_geom(
-            NormalizedPoint { x: 0.25, y: 0.25 },
-            NormalizedPoint { x: 0.75, y: 0.75 },
-            Vec2::new(200.0, 100.0),
-        ) else {
-            panic!("expected segment geometry");
-        };
-        assert!((geom.center.x - 100.0).abs() < 1e-5);
-        assert!((geom.center.y - 50.0).abs() < 1e-5);
-        assert!(geom.length > 0.0);
-        assert!(geom.angle < 0.0);
     }
 
     // ── Mesh generator tests ───────────────────────────────────────────────

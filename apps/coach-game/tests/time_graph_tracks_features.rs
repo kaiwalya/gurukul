@@ -6,8 +6,8 @@ use bevy::prelude::*;
 use coach_game::game::InGameRoot;
 use coach_game::menu::main_menu::NewGameButton;
 use coach_game::widgets::time_graph::{
-    BreathSpanMarker, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane,
-    TimeGraphGridSceneRes, TimeGraphLiveSceneRes, TimeGraphPitchLane, TimeGraphRoot,
+    BreathSpanMarker, OnsetTickMarker, TimeGraphEventsLane, TimeGraphGridSceneRes,
+    TimeGraphLiveSceneRes, TimeGraphPitchLane, TimeGraphRoot,
 };
 use common::{build_test_app, pump};
 use domain_ports::app_coach::{CoachEvent, FeatureSnapshot, MusicInfo};
@@ -132,15 +132,10 @@ fn semantic_graph_projects_into_tree_and_lane_nodes() {
     assert_eq!(pitch_lane[0].0, graph_roots[0].1);
     assert_eq!(events_lane[0].0, graph_roots[0].1);
 
-    let grooves = world
-        .query_filtered::<(&GrooveLineMarker, &Node), With<GrooveLineMarker>>()
-        .iter(world)
-        .collect::<Vec<_>>();
-    assert_eq!(grooves.len(), grid.grooves.len());
-    let groove_y = grid.grooves[0].y;
-    assert!(grooves.iter().any(
-        |(_, node)| matches!(node.top, Val::Percent(v) if (v - (1.0 - groove_y) * 100.0).abs() < 1e-5)
-    ));
+    // The mesh renderer does not spawn GrooveLineMarker UI nodes — grooves are
+    // rendered as GPU quads. The scene resource already verifies grooves are
+    // projected (assert!(!grid.grooves.is_empty()) above). The remainder of the
+    // test covers the events-lane nodes which the UI-based apply_events still spawns.
 
     let ticks = world
         .query_filtered::<(&OnsetTickMarker, &Node), With<OnsetTickMarker>>()

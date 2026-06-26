@@ -58,6 +58,32 @@ pub fn add_mesh_trace_plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "widgets/time_graph/trace.wgsl");
 }
 
+/// Register the GPU mesh-trace systems (overlay camera, lane bg, gridlines,
+/// trace polyline). Kept separate from `build_app` so headless tests — which
+/// use `MinimalPlugins` and have no `Assets<Mesh>` or `Assets<TraceMaterial>`
+/// — are unaffected. Must be called after `build_app`.
+pub fn add_mesh_trace_systems(app: &mut App) {
+    use state::AppState;
+    app.add_systems(
+        OnExit(AppState::InGame),
+        widgets::time_graph::systems::clear_trace_mesh_handles,
+    )
+    .add_systems(
+        OnEnter(AppState::InGame),
+        widgets::time_graph::systems::spawn_trace_overlay_camera,
+    )
+    .add_systems(
+        Update,
+        (
+            widgets::time_graph::systems::clear_pitch_lane_bg_for_mesh,
+            widgets::time_graph::systems::apply_mesh_lane_bg,
+            widgets::time_graph::systems::apply_mesh_gridlines,
+            widgets::time_graph::systems::apply_mesh_trace,
+        )
+            .run_if(in_state(AppState::InGame)),
+    );
+}
+
 /// Register the game's state, resources, and systems. Split out of
 /// `main` so headless tests can call it after `MinimalPlugins +
 /// StatesPlugin` without dragging in the renderer or the production
@@ -97,7 +123,6 @@ pub fn build_app(app: &mut App) {
         .init_resource::<widgets::time_graph::scene::TimeGraphPitchLaneSize>()
         .init_resource::<widgets::time_graph::scene::TimeGraphPitchLanePhysRect>()
         .init_resource::<widgets::time_graph::scene::TimeGraphPitchLaneScale>()
-        .init_resource::<widgets::time_graph::systems::LastTraceGeom>()
         .init_resource::<widgets::time_graph::scene::TimeGraphGridSceneRes>()
         .init_resource::<widgets::time_graph::scene::TimeGraphLiveSceneRes>()
         .init_resource::<widgets::hud::scene::HudSceneRes>()
@@ -194,37 +219,12 @@ pub fn build_app(app: &mut App) {
         )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
         .add_systems(
-            OnExit(AppState::InGame),
-            widgets::time_graph::systems::clear_trace_mesh_handles
-                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
-        )
-        // Mesh-trace overlay camera and painter — only active when `--mesh-trace`
-        // is passed (resource_exists guard; no-op otherwise).
-        .add_systems(
-            OnEnter(AppState::InGame),
-            widgets::time_graph::systems::spawn_trace_overlay_camera
-                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
-        )
-        .add_systems(
-            Update,
-            (
-                widgets::time_graph::systems::clear_pitch_lane_bg_for_mesh,
-                widgets::time_graph::systems::apply_mesh_lane_bg,
-                widgets::time_graph::systems::apply_mesh_gridlines,
-                widgets::time_graph::systems::apply_mesh_trace,
-            )
-                .run_if(in_state(AppState::InGame))
-                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
-        )
-        .add_systems(
             Update,
             (
                 game::log_features,
                 (
                     game::refresh_semantic_graph,
                     game::time_graph::refresh_scene,
-                    widgets::time_graph::systems::apply_gridlines,
-                    widgets::time_graph::systems::apply_trace,
                     widgets::time_graph::systems::apply_events,
                 )
                     .chain(),

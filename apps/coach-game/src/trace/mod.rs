@@ -176,7 +176,7 @@ impl Plugin for TracePlugin {
         );
         app.add_systems(
             PostUpdate,
-            (systems::record_geom, systems::record_poly).after(UiSystems::PostLayout),
+            systems::record_geom.after(UiSystems::PostLayout),
         );
         app.add_systems(
             Last,

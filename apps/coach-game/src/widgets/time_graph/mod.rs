@@ -17,6 +17,6 @@ pub use scene::{
 };
 pub use systems::{
     spawn, BreathSpanMarker, GridlineLayer, GridlineMeshEntity, GrooveLineMarker, LaneBgMeshEntity,
-    LastTraceGeom, MeshTrace, OnsetTickMarker, TimeGraphEventsLane, TimeGraphPitchLane,
-    TimeGraphRoot, TraceLayer, TraceMaterial, TraceMeshCamera, TraceMeshEntity, TraceSegmentBody,
+    OnsetTickMarker, TimeGraphEventsLane, TimeGraphPitchLane, TimeGraphRoot, TraceMaterial,
+    TraceMeshCamera, TraceMeshEntity,
 };
