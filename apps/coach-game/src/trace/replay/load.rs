@@ -218,9 +218,9 @@ pub fn load(path: &Path) -> io::Result<LoadedTrace> {
                         .map_err(|e| err(format!("bad input record: {e}")))?,
                 );
             }
-            // `state`, `cmd`, `geom`, `mark` carry no input the driver replays
-            // (cmd/geom/mark are outputs; state is re-derived by the app). They
-            // stay in the file for diffing but the loader ignores them.
+            // Output-only channels are not replayed as inputs. Listed explicitly
+            // so a `grep "poly"` finds this site.
+            "poly" | "state" | "cmd" | "geom" | "mark" => {}
             _ => {}
         }
     }
@@ -288,14 +288,14 @@ mod tests {
         path
     }
 
-    const HEADER_V3: &str = r#"{"f":0,"k":"run","schema":3,"app_version":"0.1.0","window_logical":[800.0,600.0],"scale_factor":2.0,"wall_start":"2026-06-10 00:00:00 UTC"}"#;
+    const HEADER_V4: &str = r#"{"f":0,"k":"run","schema":4,"app_version":"0.1.0","window_logical":[800.0,600.0],"scale_factor":2.0,"wall_start":"2026-06-10 00:00:00 UTC"}"#;
 
     #[test]
     fn parses_each_record_kind() {
         let path = write_trace(
             "kinds",
             &[
-                HEADER_V3,
+                HEADER_V4,
                 r#"{"f":1,"k":"frame","delta_s":0.016}"#,
                 r#"{"f":1,"k":"coach","drained":[{"hop_index":1,"f0_hz":222.0,"confidence":0.7,"onset":0.0,"breath":0.0,"vibrato_rate":0.0,"vibrato_depth":0.0,"t_ms":1010}]}"#,
                 r#"{"f":1,"k":"input","input":"cursor","pos":[640.0,360.0]}"#,
@@ -306,7 +306,7 @@ mod tests {
             ],
         );
         let trace = load(&path).expect("loads");
-        assert_eq!(trace.header.schema, 3);
+        assert_eq!(trace.header.schema, 4);
         assert_eq!(trace.header.window_logical, [800.0, 600.0]);
         assert_eq!(trace.header.scale_factor, 2.0);
         assert_eq!(trace.frames.len(), 2, "two frames produced records");
@@ -423,7 +423,7 @@ mod tests {
     fn truncated_stream_recovers_flushed_lines() {
         let raw = trailerless_gz(
             &[
-                HEADER_V3,
+                HEADER_V4,
                 r#"{"f":1,"k":"frame","delta_s":0.016}"#,
                 r#"{"f":2,"k":"frame","delta_s":0.017}"#,
             ],
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn truncated_stream_drops_partial_final_line() {
         let raw = trailerless_gz(
-            &[HEADER_V3, r#"{"f":1,"k":"frame","delta_s":0.016}"#],
+            &[HEADER_V4, r#"{"f":1,"k":"frame","delta_s":0.016}"#],
             // A half-written next record: no closing brace, no newline.
             br#"{"f":2,"k":"fra"#,
         );

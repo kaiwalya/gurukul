@@ -130,7 +130,7 @@ fn records_run_header_frame_coach_and_input_channels() {
 
     // Header first, exactly once.
     assert_eq!(records[0]["k"], "run", "first line must be the run header");
-    assert_eq!(records[0]["schema"], 3);
+    assert_eq!(records[0]["schema"], 4);
     assert_eq!(records[0]["replay_of"], Value::Null);
 
     // Frame records exist (one per update).

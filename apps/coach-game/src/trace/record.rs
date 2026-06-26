@@ -33,7 +33,15 @@ use domain_ports::app_coach::{CoachEvent, Command, FeatureSnapshot};
 /// applied to the coach channel. The `InputRecord` set widened to the variants
 /// that drive downstream state (hover enter/leave, touch, focus-lost). A
 /// schema-≤2 trace is simply re-recorded.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// `4`: the `poly` *output* channel records the pitch-trace polyline that a
+/// future GPU-mesh renderer won't expose through the UI-node `geom` channel.
+/// Two coord stages per segment: lane-local logical px (stage 1, where
+/// "inside the lane?" is answerable) and physical-px AABB plus post-clip
+/// drawn bounds (stage 2). Output-only — replay ignores `poly` records as
+/// inputs but a re-run reproduces them bit-for-bit from the same `geom`
+/// channel. A schema-≤3 trace is simply re-recorded.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One line of the trace. Flattened so the JSON is `{"f":…,"k":"…",…payload}`
 /// rather than a nested `{"f":…,"payload":{…}}` — friendlier to `jq`/grep.
@@ -81,6 +89,9 @@ pub enum Body {
     },
     /// On a per-entity geometry change after layout (or a despawn).
     Geom(GeomRecord),
+    /// On each pitch-trace segment this frame (two coord stages for offline
+    /// coord/clip debugging — see [`PolyRecord`]).
+    Poly(PolyRecord),
     /// F10 pressed.
     Mark { marker: u32 },
 }
@@ -171,6 +182,38 @@ impl CoachRead {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty() && self.latest.is_none() && self.drained.is_empty()
     }
+}
+
+/// Per-segment pitch-trace polyline snapshot. Two coordinate stages for
+/// offline coord/clip debugging:
+/// - STAGE 1 (`lane_logical`): polyline points in **lane-local logical px**
+///   (origin = lane top-left, y-down). Produced before any screen/world
+///   conversion — "is this point inside the lane?" is answerable here.
+/// - STAGE 2 (`aabb_px`, `clipped_aabb_px`): rendered bounds in **physical
+///   px** (overall AABB and post-clip drawn bounds).
+///
+/// One record per trace segment per frame (mirrors `geom`'s per-entity
+/// granularity), so `point_count == lane_logical.len()` is an invariant an
+/// offline checker can assert.
+#[derive(Debug, Serialize)]
+pub struct PolyRecord {
+    /// Stable logical path (not a UI node, but greppable like `geom`).
+    pub path: String,
+    /// STAGE 1: polyline points in lane-local logical px, one per segment
+    /// point (not per pair).
+    pub lane_logical: Vec<[f32; 2]>,
+    /// Number of input points; must equal `lane_logical.len()`.
+    pub point_count: usize,
+    /// Logical lane size this frame (`[width, height]`), the reference box for
+    /// stage-1 coordinates.
+    pub lane_size: [f32; 2],
+    /// STAGE 2: overall trace AABB in physical px `[min_x, min_y, max_x,
+    /// max_y]`, computed from all segment-pair centerlines.
+    pub aabb_px: [f32; 4],
+    /// STAGE 2: post-clip drawn bounds (intersection of `aabb_px` with the
+    /// lane's physical rect) `[min_x, min_y, max_x, max_y]`.
+    pub clipped_aabb_px: [f32; 4],
+    pub scale_factor: f32,
 }
 
 /// Per-entity geometry after layout. Keyed by `path` (widget-`Name` ancestry,

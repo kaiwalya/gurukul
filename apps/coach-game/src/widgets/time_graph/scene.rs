@@ -122,3 +122,22 @@ pub struct TimeGraphLiveSceneRes {
 /// system cannot accidentally consume a physical size.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
 pub struct TimeGraphPitchLaneSize(pub Option<LogicalSize>);
+
+/// Pitch lane's global physical rect, captured alongside [`TimeGraphPitchLaneSize`]
+/// after `PostLayout`. Used by the `poly` trace channel to compute stage-2
+/// physical-px AABBs without re-querying the node hierarchy.
+/// `[min_x, min_y, max_x, max_y]` in physical pixels.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct TimeGraphPitchLanePhysRect(pub Option<[f32; 4]>);
+
+/// Scale factor captured from the pitch lane's [`ComputedNode`], derived as
+/// `1.0 / inverse_scale_factor`. Default 1.0 so downstream consumers are valid
+/// before the first layout.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct TimeGraphPitchLaneScale(pub f32);
+
+impl Default for TimeGraphPitchLaneScale {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}

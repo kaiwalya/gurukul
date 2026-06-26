@@ -17,7 +17,7 @@ use bevy::window::WindowEvent;
 
 use crate::state::AppState;
 
-use super::record::{Body, CoachRead, GeomRecord, InputRecord};
+use super::record::{Body, CoachRead, GeomRecord, InputRecord, PolyRecord};
 use super::recording_coach::TraceBufferHandle;
 use super::writer::TraceWriter;
 
@@ -249,6 +249,43 @@ pub fn record_geom(
     }
 
     memory.0 = seen;
+}
+
+/// `PostUpdate` after `UiSystems::PostLayout`: write one `poly` record per
+/// trace segment populated this frame by `apply_trace`. Runs in `PostUpdate`
+/// (after `Update` where `apply_trace` runs), so the resource is always
+/// current. Written unconditionally when the resource is non-empty — the
+/// trace scrolls every frame, so segments change every frame anyway.
+pub fn record_poly(
+    mut writer: ResMut<TraceWriter>,
+    frame: Res<FrameCount>,
+    last_geom: Option<Res<crate::widgets::time_graph::systems::LastTraceGeom>>,
+    lane_size: Option<Res<crate::widgets::time_graph::scene::TimeGraphPitchLaneSize>>,
+) {
+    let Some(last_geom) = last_geom else {
+        return;
+    };
+    let f = frame.0;
+    let logical_size = lane_size
+        .as_ref()
+        .and_then(|ls| ls.0)
+        .map(|ls| ls.get())
+        .unwrap_or(Vec2::ZERO);
+    for snapshot in last_geom.0.iter() {
+        let point_count = snapshot.lane_logical.len();
+        writer.write(
+            f,
+            Body::Poly(PolyRecord {
+                path: "time_graph/pitch_lane/trace".to_string(),
+                lane_logical: snapshot.lane_logical.clone(),
+                point_count,
+                lane_size: [logical_size.x, logical_size.y],
+                aabb_px: snapshot.aabb_px,
+                clipped_aabb_px: snapshot.clipped_aabb_px,
+                scale_factor: snapshot.scale_factor,
+            }),
+        );
+    }
 }
 
 /// `Last`: flush the buffered writer so a crash next frame keeps every line.

@@ -13,9 +13,9 @@ pub use model::project_scene;
 pub use scene::{
     LogicalSize, NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
     NormalizedTracePoint, NormalizedTraceSegment, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
-    TimeGraphPitchLaneSize, TimeGraphScene,
+    TimeGraphPitchLanePhysRect, TimeGraphPitchLaneScale, TimeGraphPitchLaneSize, TimeGraphScene,
 };
 pub use systems::{
-    spawn, BreathSpanMarker, GridlineLayer, GrooveLineMarker, OnsetTickMarker, TimeGraphEventsLane,
-    TimeGraphPitchLane, TimeGraphRoot, TraceLayer, TraceSegmentBody,
+    spawn, BreathSpanMarker, GridlineLayer, GrooveLineMarker, LastTraceGeom, OnsetTickMarker,
+    TimeGraphEventsLane, TimeGraphPitchLane, TimeGraphRoot, TraceLayer, TraceSegmentBody,
 };

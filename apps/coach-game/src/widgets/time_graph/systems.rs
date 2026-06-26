@@ -3,11 +3,11 @@
 //! domain.
 
 use bevy::prelude::*;
-use bevy::ui::ComputedNode;
+use bevy::ui::{ComputedNode, UiGlobalTransform};
 
 use super::scene::{
     LogicalSize, NormalizedPoint, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
-    TimeGraphPitchLaneSize,
+    TimeGraphPitchLanePhysRect, TimeGraphPitchLaneScale, TimeGraphPitchLaneSize,
 };
 
 const LANE_GAP: f32 = 12.0;
@@ -61,6 +61,26 @@ pub struct BreathSpanMarker;
 
 #[derive(Component)]
 pub struct TraceSegmentBody;
+
+/// One segment's polyline data for the `poly` trace channel.
+pub struct TraceSegmentSnapshot {
+    /// Lane-local logical px points (one per segment point, not per pair).
+    pub lane_logical: Vec<[f32; 2]>,
+    /// Physical px AABB `[min_x, min_y, max_x, max_y]` of this segment's
+    /// trace centerlines.
+    pub aabb_px: [f32; 4],
+    /// Post-clip AABB (intersection with lane physical rect).
+    pub clipped_aabb_px: [f32; 4],
+    /// Scale factor used for the conversion.
+    pub scale_factor: f32,
+}
+
+/// Populated by `apply_trace` each frame with the lane-local polyline and
+/// physical-px bounds for each trace segment. Read by `record_poly` in the
+/// trace plugin. The resource is always initialized (even empty), so
+/// `record_poly` can read it unconditionally.
+#[derive(Resource, Default)]
+pub struct LastTraceGeom(pub Vec<TraceSegmentSnapshot>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TraceSegmentGeom {
@@ -252,12 +272,16 @@ pub fn apply_events(
 /// live scene plus the measured lane size (the trace geometry is in logical
 /// pixels). The trace layer is its own entity, so the despawn is a simple
 /// wholesale clear — no parent-filtering, no coupling to the gridlines.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_trace(
     mut commands: Commands,
     live: Res<TimeGraphLiveSceneRes>,
     layer: Query<Entity, With<TraceLayer>>,
     lane_size: Res<TimeGraphPitchLaneSize>,
     existing_bodies: Query<Entity, With<TraceSegmentBody>>,
+    mut last_geom: ResMut<LastTraceGeom>,
+    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
+    scale_res: Res<TimeGraphPitchLaneScale>,
 ) {
     let has_existing = !existing_bodies.is_empty();
     if !live.is_changed() && has_existing {
@@ -273,11 +297,45 @@ pub fn apply_trace(
         return;
     }
 
+    // Clear last frame's poly data now that we know we are repainting.
+    last_geom.0.clear();
+
     for entity in existing_bodies.iter() {
         commands.entity(entity).despawn();
     }
 
     for segment in &live.pitch_segments {
+        // Poly channel: collect lane-local logical px for all points (not just pairs).
+        let lane_logical: Vec<[f32; 2]> = segment
+            .points
+            .iter()
+            .map(|tp| {
+                let p = normalized_to_lane(tp.point, size);
+                [p.x, p.y]
+            })
+            .collect();
+
+        if !lane_logical.is_empty() {
+            let scale_factor = scale_res.0;
+            let aabb_px = if let Some(rect) = lane_phys_rect.0 {
+                let origin = [rect[0], rect[1]];
+                segment_phys_aabb(&lane_logical, scale_factor, origin)
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+            let clipped_aabb_px = if let Some(rect) = lane_phys_rect.0 {
+                intersect_aabb(aabb_px, rect)
+            } else {
+                aabb_px
+            };
+            last_geom.0.push(TraceSegmentSnapshot {
+                lane_logical,
+                aabb_px,
+                clipped_aabb_px,
+                scale_factor,
+            });
+        }
+
         for pair in segment.points.windows(2) {
             let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
                 continue;
@@ -305,10 +363,12 @@ pub fn apply_trace(
 }
 
 pub fn capture_pitch_lane_size(
-    pitch_lane: Query<&ComputedNode, With<TimeGraphPitchLane>>,
+    pitch_lane: Query<(&ComputedNode, &UiGlobalTransform), With<TimeGraphPitchLane>>,
     mut lane_size: ResMut<TimeGraphPitchLaneSize>,
+    mut lane_phys_rect: ResMut<TimeGraphPitchLanePhysRect>,
+    mut lane_scale: ResMut<TimeGraphPitchLaneScale>,
 ) {
-    let Ok(node) = pitch_lane.single() else {
+    let Ok((node, xform)) = pitch_lane.single() else {
         return;
     };
     // Convert physical → logical here, once, behind the frame newtype, so
@@ -317,6 +377,24 @@ pub fn capture_pitch_lane_size(
     if lane_size.0 != Some(size) {
         lane_size.0 = Some(size);
     }
+    // Physical rect: center from global affine, corners from physical size.
+    let phys_size = node.size(); // physical px
+    let center = xform.affine().transform_point2(Vec2::ZERO);
+    let half = phys_size * 0.5;
+    let rect = [
+        center.x - half.x,
+        center.y - half.y,
+        center.x + half.x,
+        center.y + half.y,
+    ];
+    lane_phys_rect.0 = Some(rect);
+    // Scale factor: 1 / inverse_scale_factor (guard against zero).
+    let sf = if node.inverse_scale_factor() > 0.0 {
+        1.0 / node.inverse_scale_factor()
+    } else {
+        1.0
+    };
+    lane_scale.0 = sf;
 }
 
 /// Map a lane-local normalized point into logical lane pixels, insetting
@@ -357,6 +435,53 @@ fn trace_segment_geom(
     })
 }
 
+/// Compute the physical-px AABB of a set of lane-local logical-px polyline
+/// points, expanded by the trace stroke's half-width.
+pub fn segment_phys_aabb(
+    lane_logical: &[[f32; 2]],
+    scale_factor: f32,
+    lane_origin: [f32; 2],
+) -> [f32; 4] {
+    let half_stroke = TRACE_WIDTH * scale_factor * 0.5;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in lane_logical {
+        let px = p[0] * scale_factor + lane_origin[0];
+        let py = p[1] * scale_factor + lane_origin[1];
+        if px < min_x {
+            min_x = px;
+        }
+        if py < min_y {
+            min_y = py;
+        }
+        if px > max_x {
+            max_x = px;
+        }
+        if py > max_y {
+            max_y = py;
+        }
+    }
+    [
+        min_x - half_stroke,
+        min_y - half_stroke,
+        max_x + half_stroke,
+        max_y + half_stroke,
+    ]
+}
+
+/// Intersect two AABBs `[min_x, min_y, max_x, max_y]`. Returns a degenerate
+/// (min > max) rect if they do not overlap.
+pub fn intersect_aabb(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ]
+}
+
 fn trace_color(confidence: f32, vibrato_strength: f32) -> Color {
     // Match the note-dial needle: confidence drives alpha through a 4th-power
     // curve (`note_dial::model::project_needle`), fading the trace all the way
@@ -373,6 +498,57 @@ fn trace_color(confidence: f32, vibrato_strength: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_to_lane_corners() {
+        let size = Vec2::new(100.0, 80.0);
+        let half = TRACE_WIDTH * 0.5;
+        let drawable = size - Vec2::splat(TRACE_WIDTH);
+        // Top of the normalized range (y=1) maps to the top of the drawable area.
+        let top_left = normalized_to_lane(NormalizedPoint { x: 0.0, y: 1.0 }, size);
+        assert!((top_left.x - half).abs() < 1e-5, "x at normalized 0");
+        assert!((top_left.y - half).abs() < 1e-5, "y at normalized top");
+        // Bottom of normalized range (y=0) maps to the bottom.
+        let bot_right = normalized_to_lane(NormalizedPoint { x: 1.0, y: 0.0 }, size);
+        assert!(
+            (bot_right.x - (half + drawable.x)).abs() < 1e-5,
+            "x at normalized 1"
+        );
+        assert!(
+            (bot_right.y - (half + drawable.y)).abs() < 1e-5,
+            "y at normalized bottom"
+        );
+    }
+
+    #[test]
+    fn segment_phys_aabb_basic() {
+        // Single point at lane-local logical [1.5, 1.5], scale 2.0, lane origin [10.0, 20.0]:
+        // phys pt = [1.5*2 + 10, 1.5*2 + 20] = [13.0, 23.0]
+        // half_stroke = TRACE_WIDTH * 2.0 * 0.5 = TRACE_WIDTH = 3.0
+        let pts = vec![[1.5f32, 1.5f32]];
+        let aabb = segment_phys_aabb(&pts, 2.0, [10.0, 20.0]);
+        let half_stroke = TRACE_WIDTH * 2.0 * 0.5;
+        assert!((aabb[0] - (13.0 - half_stroke)).abs() < 1e-4, "min_x");
+        assert!((aabb[1] - (23.0 - half_stroke)).abs() < 1e-4, "min_y");
+        assert!((aabb[2] - (13.0 + half_stroke)).abs() < 1e-4, "max_x");
+        assert!((aabb[3] - (23.0 + half_stroke)).abs() < 1e-4, "max_y");
+    }
+
+    #[test]
+    fn intersect_aabb_clipping() {
+        let aabb = [5.0f32, 5.0, 15.0, 15.0];
+        let lane = [0.0f32, 0.0, 10.0, 10.0];
+        let clipped = intersect_aabb(aabb, lane);
+        assert_eq!(clipped, [5.0, 5.0, 10.0, 10.0]);
+    }
+
+    #[test]
+    fn intersect_aabb_fully_inside() {
+        let aabb = [2.0f32, 2.0, 8.0, 8.0];
+        let lane = [0.0f32, 0.0, 10.0, 10.0];
+        let clipped = intersect_aabb(aabb, lane);
+        assert_eq!(clipped, aabb);
+    }
 
     #[test]
     fn trace_segment_geom_maps_lane_local_screen_space() {
