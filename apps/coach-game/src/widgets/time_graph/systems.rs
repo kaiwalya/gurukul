@@ -81,6 +81,17 @@ pub struct TraceMeshCamera;
 #[derive(Component)]
 pub struct TraceMeshEntity;
 
+/// Persistent handles for the single mesh-trace entity. The trace is one
+/// entity whose `Mesh` asset is mutated in place every frame — never
+/// despawned/respawned — so the trace never blinks out for a frame between a
+/// despawn and the next spawn (the old per-frame churn flickered badly).
+#[derive(Resource)]
+pub struct TraceMeshHandles {
+    pub entity: Entity,
+    pub mesh: Handle<Mesh>,
+    pub material: Handle<TraceMaterial>,
+}
+
 /// Marker component for the 2d background-fill quad that replaces the opaque
 /// UI lane background when `--mesh-trace` is active.
 #[derive(Component)]
@@ -473,17 +484,23 @@ pub fn apply_trace(
 const HALF_WIDTH: f32 = 1.5;
 const MITER_LIMIT_COS: f32 = 0.342; // cos(70°)
 
-/// Build a triangle-strip [`Mesh`] for a polyline in world space. Each segment
-/// is a quad expanded by ±[`HALF_WIDTH`]; sharp joints get a bevel triangle.
-/// Returns `None` if fewer than two points are supplied.
-pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Mesh> {
+/// Append one polyline segment's triangles into shared mesh buffers. Each
+/// point-pair becomes a quad expanded by ±[`HALF_WIDTH`]; sharp joints get a
+/// bevel triangle. A no-op when fewer than two points are supplied. Indices are
+/// emitted relative to the current `positions` length, so several segments can
+/// share one mesh (each its own disjoint strip — no spurious bridge between the
+/// gaps where pitch was unvoiced).
+fn append_trace_segment(
+    world_points: &[Vec2],
+    colors: &[[f32; 4]],
+    positions: &mut Vec<[f32; 3]>,
+    vertex_colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
     if world_points.len() < 2 {
-        return None;
+        return;
     }
     let n = world_points.len();
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 4);
-    let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(n * 4);
-    let mut indices: Vec<u32> = Vec::with_capacity((n - 1) * 6);
 
     fn perp(d: Vec2) -> Vec2 {
         Vec2::new(-d.y, d.x)
@@ -500,7 +517,7 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
         })
         .collect();
 
-    let mut base: u32 = 0;
+    let mut base: u32 = positions.len() as u32;
     for seg in 0..n - 1 {
         let p0 = world_points[seg];
         let p1 = world_points[seg + 1];
@@ -589,7 +606,26 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
             }
         }
     }
+}
 
+/// Build a single triangle-list [`Mesh`] for one polyline in world space.
+/// Thin wrapper over [`append_trace_segment`] for isolated/test use.
+/// Returns `None` if fewer than two points are supplied.
+pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Mesh> {
+    if world_points.len() < 2 {
+        return None;
+    }
+    let n = world_points.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 4);
+    let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(n * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity((n - 1) * 6);
+    append_trace_segment(
+        world_points,
+        colors,
+        &mut positions,
+        &mut vertex_colors,
+        &mut indices,
+    );
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
@@ -598,6 +634,13 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
     mesh.insert_indices(Indices::U32(indices));
     Some(mesh)
+}
+
+/// Drop the persistent trace-mesh handles on leaving InGame. The entity itself
+/// is removed by its `DespawnOnExit`, so the stored `Entity` would dangle; clear
+/// the resource so the next InGame session recreates the entity fresh.
+pub fn clear_trace_mesh_handles(mut commands: Commands) {
+    commands.remove_resource::<TraceMeshHandles>();
 }
 
 /// Spawn the overlay [`Camera2d`] that renders mesh-trace entities on
@@ -617,10 +660,12 @@ pub fn spawn_trace_overlay_camera(mut commands: Commands) {
     ));
 }
 
-/// Rebuild the mesh-trace polyline meshes whenever the live scene changes.
-/// Each [`NormalizedTraceSegment`] becomes one [`TraceMeshEntity`] with a
-/// [`TraceMaterial`] that clips to the pitch-lane rect.  Old entities are
-/// despawned wholesale before the rebuild.
+/// Rebuild the mesh-trace polyline whenever the live scene changes. All
+/// [`NormalizedTraceSegment`]s are flattened into ONE mesh (each its own
+/// disjoint strip) carried by a single persistent [`TraceMeshEntity`]. The
+/// mesh asset is mutated in place — the entity is created once and never
+/// despawned — so the trace can't blink out for a frame the way the old
+/// despawn/respawn-per-frame churn did.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_mesh_trace(
     mut commands: Commands,
@@ -629,17 +674,13 @@ pub fn apply_mesh_trace(
     lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
     scale_res: Res<TimeGraphPitchLaneScale>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    existing: Query<Entity, With<TraceMeshEntity>>,
+    handles: Option<Res<TraceMeshHandles>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TraceMaterial>>,
 ) {
-    let has_existing = !existing.is_empty();
-    if !live.is_changed() && has_existing {
+    // Only rebuild when the scene actually changed — once the entity exists.
+    if !live.is_changed() && handles.is_some() {
         return;
-    }
-
-    for entity in existing.iter() {
-        commands.entity(entity).despawn();
     }
 
     let Some(size) = lane_size.0.map(LogicalSize::get) else {
@@ -657,11 +698,14 @@ pub fn apply_mesh_trace(
     let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
     let clip_rect = lane_world.clip_rect_uniform();
 
+    // Flatten every segment into one set of buffers.
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut vertex_colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
     for segment in &live.pitch_segments {
         if segment.points.len() < 2 {
             continue;
         }
-
         let world_points: Vec<Vec2> = segment
             .points
             .iter()
@@ -670,7 +714,6 @@ pub fn apply_mesh_trace(
                 lane_world.lane_local_to_world(local)
             })
             .collect();
-
         let colors: Vec<[f32; 4]> = segment
             .points
             .iter()
@@ -686,26 +729,57 @@ pub fn apply_mesh_trace(
                 [lin.red, lin.green, lin.blue, lin.alpha]
             })
             .collect();
+        append_trace_segment(
+            &world_points,
+            &colors,
+            &mut positions,
+            &mut vertex_colors,
+            &mut indices,
+        );
+    }
 
-        let Some(mesh) = build_trace_mesh(&world_points, &colors) else {
-            continue;
-        };
-        let mesh_handle = meshes.add(mesh);
-        let mat_handle = materials.add(TraceMaterial { clip_rect });
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
+    mesh.insert_indices(Indices::U32(indices));
 
-        commands.spawn((
-            TraceMeshEntity,
-            Mesh2d(mesh_handle),
-            MeshMaterial2d(mat_handle),
-            // `Mesh2d` only requires `Transform`, not `Visibility`. The mesh2d
-            // render extraction skips any entity whose `ViewVisibility` is unset
-            // / false, so without an explicit `Visibility` the trace is culled
-            // before it ever rasterises (geometry + clip are correct, but
-            // nothing draws). `Visibility::Visible` pulls in the
-            // `InheritedVisibility`/`ViewVisibility` chain.
-            Visibility::Visible,
-            RenderLayers::layer(1),
-        ));
+    match handles.as_deref() {
+        // Entity exists: overwrite the mesh in place and refresh the clip rect.
+        Some(h) => {
+            // We hold a strong handle, so insert cannot fail; ignore the Result.
+            let _ = meshes.insert(&h.mesh, mesh);
+            if let Some(mat) = materials.get_mut(&h.material) {
+                mat.clip_rect = clip_rect;
+            }
+        }
+        // First run: create the single persistent entity + handles.
+        None => {
+            let mesh_handle = meshes.add(mesh);
+            let mat_handle = materials.add(TraceMaterial { clip_rect });
+            let entity = commands
+                .spawn((
+                    TraceMeshEntity,
+                    Mesh2d(mesh_handle.clone()),
+                    MeshMaterial2d(mat_handle.clone()),
+                    // `Mesh2d` only requires `Transform`, not `Visibility`. The
+                    // mesh2d render extraction skips any entity whose
+                    // `ViewVisibility` is unset/false, so an explicit
+                    // `Visibility::Visible` is needed or the trace is culled
+                    // before it rasterises.
+                    Visibility::Visible,
+                    RenderLayers::layer(1),
+                    DespawnOnExit(crate::state::AppState::InGame),
+                ))
+                .id();
+            commands.insert_resource(TraceMeshHandles {
+                entity,
+                mesh: mesh_handle,
+                material: mat_handle,
+            });
+        }
     }
 }
 

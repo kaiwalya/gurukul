@@ -193,6 +193,11 @@ pub fn build_app(app: &mut App) {
             ),
         )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
+        .add_systems(
+            OnExit(AppState::InGame),
+            widgets::time_graph::systems::clear_trace_mesh_handles
+                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
+        )
         // Mesh-trace overlay camera and painter — only active when `--mesh-trace`
         // is passed (resource_exists guard; no-op otherwise).
         .add_systems(
