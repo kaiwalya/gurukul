@@ -41,12 +41,22 @@ pub mod ui;
 pub mod widgets;
 
 use bevy::prelude::*;
+use bevy::sprite_render::Material2dPlugin;
 use bevy::ui::UiSystems;
 use menu::permission::{MicStatus, PermissionPrompt};
 use state::{
     AppSettings, AppState, Autostart, HasPausedSession, KnownDevices, KnownScales, ResumeLocked,
     SelectedDevice, SongTonality,
 };
+
+/// Register the GPU mesh-trace material plugin and embed its WGSL shader.
+///
+/// Called from `main::finish` (not from `build_app`) so headless tests — which
+/// use `MinimalPlugins` and have no `EmbeddedAssetRegistry` — are unaffected.
+pub fn add_mesh_trace_plugin(app: &mut App) {
+    app.add_plugins(Material2dPlugin::<widgets::time_graph::TraceMaterial>::default());
+    bevy::asset::embedded_asset!(app, "widgets/time_graph/trace.wgsl");
+}
 
 /// Register the game's state, resources, and systems. Split out of
 /// `main` so headless tests can call it after `MinimalPlugins +
@@ -183,6 +193,19 @@ pub fn build_app(app: &mut App) {
             ),
         )
         .add_systems(OnExit(AppState::InGame), game::on_exit)
+        // Mesh-trace overlay camera and painter — only active when `--mesh-trace`
+        // is passed (resource_exists guard; no-op otherwise).
+        .add_systems(
+            OnEnter(AppState::InGame),
+            widgets::time_graph::systems::spawn_trace_overlay_camera
+                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
+        )
+        .add_systems(
+            Update,
+            widgets::time_graph::systems::apply_mesh_trace
+                .run_if(in_state(AppState::InGame))
+                .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
+        )
         .add_systems(
             Update,
             (

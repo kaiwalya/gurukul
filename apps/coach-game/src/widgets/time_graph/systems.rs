@@ -2,7 +2,13 @@
 //! capture. Reads the [scene](super::scene), knows the engine, not the
 //! domain.
 
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::RenderLayers;
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::ShaderRef;
+use bevy::sprite_render::{AlphaMode2d, Material2d, MeshMaterial2d};
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 
 use super::scene::{
@@ -59,8 +65,81 @@ pub struct OnsetTickMarker;
 #[derive(Component)]
 pub struct BreathSpanMarker;
 
+/// Marker resource: when present (via `--mesh-trace`), GPU triangle-mesh
+/// trace is active and rectangle renderer is suppressed.
+#[derive(Resource, Default)]
+pub struct MeshTrace;
+
 #[derive(Component)]
 pub struct TraceSegmentBody;
+
+/// Marker component for the overlay camera used by the mesh-trace path.
+#[derive(Component)]
+pub struct TraceMeshCamera;
+
+/// Marker component for mesh-trace triangle-strip entities.
+#[derive(Component)]
+pub struct TraceMeshEntity;
+
+/// GPU material for the pitch-trace polyline mesh. Clips the mesh to the
+/// pitch lane rect in world space and applies per-vertex colour with a
+/// right-edge fade.
+#[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
+pub struct TraceMaterial {
+    /// `[min_x, min_y, max_x, max_y]` in world (y-up) coordinates.
+    #[uniform(0)]
+    pub clip_rect: Vec4,
+}
+
+impl Material2d for TraceMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://coach_game/widgets/time_graph/trace.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
+}
+
+/// Pitch-lane bounds in Bevy world space (y-up, origin at window centre).
+#[derive(Debug, Clone, Copy)]
+pub struct LaneWorldRect {
+    /// `[min_x, min_y, max_x, max_y]` in world space.
+    pub world: [f32; 4],
+}
+
+impl LaneWorldRect {
+    /// Convert a physical-px lane rect (from [`TimeGraphPitchLanePhysRect`]) to
+    /// world space.  `window_logical` is the window size in logical pixels.
+    pub fn from_phys(phys_rect: [f32; 4], scale_factor: f32, window_logical: Vec2) -> Self {
+        let sf = scale_factor.max(f32::EPSILON);
+        let lx0 = phys_rect[0] / sf;
+        let ly0 = phys_rect[1] / sf;
+        let lx1 = phys_rect[2] / sf;
+        let ly1 = phys_rect[3] / sf;
+        let hw = window_logical.x * 0.5;
+        let hh = window_logical.y * 0.5;
+        // UI y is top-down; world y is up.
+        let wx0 = lx0 - hw;
+        let wy0 = hh - ly1;
+        let wx1 = lx1 - hw;
+        let wy1 = hh - ly0;
+        Self {
+            world: [wx0, wy0, wx1, wy1],
+        }
+    }
+
+    /// Convert a lane-local logical-px point (origin top-left, y-down) to world
+    /// space.
+    pub fn lane_local_to_world(&self, local: Vec2) -> Vec2 {
+        Vec2::new(self.world[0] + local.x, self.world[3] - local.y)
+    }
+
+    /// Return the clip rect as a `Vec4` suitable for a uniform binding.
+    pub fn clip_rect_uniform(&self) -> Vec4 {
+        Vec4::new(self.world[0], self.world[1], self.world[2], self.world[3])
+    }
+}
 
 /// One segment's polyline data for the `poly` trace channel.
 pub struct TraceSegmentSnapshot {
@@ -272,6 +351,11 @@ pub fn apply_events(
 /// live scene plus the measured lane size (the trace geometry is in logical
 /// pixels). The trace layer is its own entity, so the despawn is a simple
 /// wholesale clear — no parent-filtering, no coupling to the gridlines.
+///
+/// When `--mesh-trace` is active ([`MeshTrace`] resource is present), the
+/// rect-spawn loop is suppressed; [`apply_mesh_trace`] owns rendering instead.
+/// [`LastTraceGeom`] is always populated regardless of the flag so the `poly`
+/// trace channel keeps working.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_trace(
     mut commands: Commands,
@@ -282,6 +366,7 @@ pub fn apply_trace(
     mut last_geom: ResMut<LastTraceGeom>,
     lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
     scale_res: Res<TimeGraphPitchLaneScale>,
+    mesh_trace: Option<Res<MeshTrace>>,
 ) {
     let has_existing = !existing_bodies.is_empty();
     if !live.is_changed() && has_existing {
@@ -336,29 +421,262 @@ pub fn apply_trace(
             });
         }
 
-        for pair in segment.points.windows(2) {
-            let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
-                continue;
-            };
-            let avg_confidence = ((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0);
-            let avg_vibrato =
-                ((pair[0].vibrato_strength + pair[1].vibrato_strength) * 0.5).clamp(0.0, 1.0);
-            let color = trace_color(avg_confidence, avg_vibrato);
-            commands.spawn((
-                TraceSegmentBody,
-                ChildOf(layer_entity),
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(geom.center.x - geom.length * 0.5),
-                    top: px(geom.center.y - TRACE_WIDTH * 0.5),
-                    width: px(geom.length),
-                    height: px(TRACE_WIDTH),
-                    ..default()
-                },
-                UiTransform::from_rotation(Rot2::radians(geom.angle)),
-                BackgroundColor(color),
-            ));
+        if mesh_trace.is_none() {
+            for pair in segment.points.windows(2) {
+                let Some(geom) = trace_segment_geom(pair[0].point, pair[1].point, size) else {
+                    continue;
+                };
+                let avg_confidence =
+                    ((pair[0].confidence + pair[1].confidence) * 0.5).clamp(0.0, 1.0);
+                let avg_vibrato =
+                    ((pair[0].vibrato_strength + pair[1].vibrato_strength) * 0.5).clamp(0.0, 1.0);
+                let color = trace_color(avg_confidence, avg_vibrato);
+                commands.spawn((
+                    TraceSegmentBody,
+                    ChildOf(layer_entity),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(geom.center.x - geom.length * 0.5),
+                        top: px(geom.center.y - TRACE_WIDTH * 0.5),
+                        width: px(geom.length),
+                        height: px(TRACE_WIDTH),
+                        ..default()
+                    },
+                    UiTransform::from_rotation(Rot2::radians(geom.angle)),
+                    BackgroundColor(color),
+                ));
+            }
         }
+    }
+}
+
+const HALF_WIDTH: f32 = 1.5;
+const MITER_LIMIT_COS: f32 = 0.342; // cos(70°)
+
+/// Build a triangle-strip [`Mesh`] for a polyline in world space. Each segment
+/// is a quad expanded by ±[`HALF_WIDTH`]; sharp joints get a bevel triangle.
+/// Returns `None` if fewer than two points are supplied.
+pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Mesh> {
+    if world_points.len() < 2 {
+        return None;
+    }
+    let n = world_points.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 4);
+    let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(n * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity((n - 1) * 6);
+
+    fn perp(d: Vec2) -> Vec2 {
+        Vec2::new(-d.y, d.x)
+    }
+
+    let dirs: Vec<Vec2> = (0..n - 1)
+        .map(|i| {
+            let d = world_points[i + 1] - world_points[i];
+            if d.length_squared() < f32::EPSILON {
+                Vec2::X
+            } else {
+                d.normalize()
+            }
+        })
+        .collect();
+
+    let mut base: u32 = 0;
+    for seg in 0..n - 1 {
+        let p0 = world_points[seg];
+        let p1 = world_points[seg + 1];
+        let dir = dirs[seg];
+        let norm = perp(dir);
+
+        let start_offset = if seg == 0 {
+            norm * HALF_WIDTH
+        } else {
+            let prev_norm = perp(dirs[seg - 1]);
+            let miter = (norm + prev_norm).normalize_or(norm);
+            let dot = norm.dot(prev_norm);
+            if dot < MITER_LIMIT_COS {
+                norm * HALF_WIDTH
+            } else {
+                let miter_len = HALF_WIDTH / miter.dot(norm).max(0.1);
+                miter * miter_len
+            }
+        };
+
+        let end_offset = if seg == n - 2 {
+            norm * HALF_WIDTH
+        } else {
+            let next_norm = perp(dirs[seg + 1]);
+            let miter = (norm + next_norm).normalize_or(norm);
+            let dot = norm.dot(next_norm);
+            if dot < MITER_LIMIT_COS {
+                norm * HALF_WIDTH
+            } else {
+                let miter_len = HALF_WIDTH / miter.dot(norm).max(0.1);
+                miter * miter_len
+            }
+        };
+
+        let c0 = colors[seg];
+        let c1 = colors[seg + 1];
+        let v0 = p0 + start_offset;
+        let v1 = p0 - start_offset;
+        let v2 = p1 + end_offset;
+        let v3 = p1 - end_offset;
+
+        positions.extend([
+            [v0.x, v0.y, 0.0],
+            [v1.x, v1.y, 0.0],
+            [v2.x, v2.y, 0.0],
+            [v3.x, v3.y, 0.0],
+        ]);
+        vertex_colors.extend([c0, c0, c1, c1]);
+        indices.extend([base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        base += 4;
+
+        // Bevel fill at sharp joints.
+        if seg < n - 2 {
+            let next_norm = perp(dirs[seg + 1]);
+            let dot = norm.dot(next_norm);
+            if dot < MITER_LIMIT_COS {
+                let cross = dir.perp_dot(dirs[seg + 1]);
+                let p_center = world_points[seg + 1];
+                let bc = colors[seg + 1];
+                if cross > 0.0 {
+                    let next_offset = next_norm * HALF_WIDTH;
+                    let ba = p_center + end_offset;
+                    let bb = p_center + next_offset;
+                    let bc_pt = p_center;
+                    positions.extend([
+                        [ba.x, ba.y, 0.0],
+                        [bb.x, bb.y, 0.0],
+                        [bc_pt.x, bc_pt.y, 0.0],
+                    ]);
+                    vertex_colors.extend([bc, bc, bc]);
+                    indices.extend([base, base + 1, base + 2]);
+                } else {
+                    let next_offset = next_norm * HALF_WIDTH;
+                    let ba = p_center - end_offset;
+                    let bb = p_center - next_offset;
+                    let bc_pt = p_center;
+                    positions.extend([
+                        [ba.x, ba.y, 0.0],
+                        [bb.x, bb.y, 0.0],
+                        [bc_pt.x, bc_pt.y, 0.0],
+                    ]);
+                    vertex_colors.extend([bc, bc, bc]);
+                    indices.extend([base, base + 2, base + 1]);
+                }
+                base += 3;
+            }
+        }
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
+    mesh.insert_indices(Indices::U32(indices));
+    Some(mesh)
+}
+
+/// Spawn the overlay [`Camera2d`] that renders mesh-trace entities on
+/// [`RenderLayers::layer(1)`]. Gated by `resource_exists::<MeshTrace>` in
+/// `lib.rs`.
+pub fn spawn_trace_overlay_camera(mut commands: Commands) {
+    commands.spawn((
+        TraceMeshCamera,
+        Camera2d,
+        Camera {
+            order: 1,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        RenderLayers::layer(1),
+        DespawnOnExit(crate::state::AppState::InGame),
+    ));
+}
+
+/// Rebuild the mesh-trace polyline meshes whenever the live scene changes.
+/// Each [`NormalizedTraceSegment`] becomes one [`TraceMeshEntity`] with a
+/// [`TraceMaterial`] that clips to the pitch-lane rect.  Old entities are
+/// despawned wholesale before the rebuild.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_mesh_trace(
+    mut commands: Commands,
+    live: Res<TimeGraphLiveSceneRes>,
+    lane_size: Res<TimeGraphPitchLaneSize>,
+    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
+    scale_res: Res<TimeGraphPitchLaneScale>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    existing: Query<Entity, With<TraceMeshEntity>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TraceMaterial>>,
+) {
+    let has_existing = !existing.is_empty();
+    if !live.is_changed() && has_existing {
+        return;
+    }
+
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    let Some(size) = lane_size.0.map(LogicalSize::get) else {
+        return;
+    };
+    let Some(phys_rect) = lane_phys_rect.0 else {
+        return;
+    };
+    let scale_factor = scale_res.0;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let window_logical = Vec2::new(window.width(), window.height());
+
+    let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
+    let clip_rect = lane_world.clip_rect_uniform();
+
+    for segment in &live.pitch_segments {
+        if segment.points.len() < 2 {
+            continue;
+        }
+
+        let world_points: Vec<Vec2> = segment
+            .points
+            .iter()
+            .map(|tp| {
+                let local = normalized_to_lane(tp.point, size);
+                lane_world.lane_local_to_world(local)
+            })
+            .collect();
+
+        let colors: Vec<[f32; 4]> = segment
+            .points
+            .iter()
+            .map(|tp| {
+                let conf = tp.confidence.clamp(0.0, 1.0).powi(4);
+                let alpha = (conf * TRACE_MAX_ALPHA).clamp(0.0, 1.0);
+                let c = COLOR_TRACE
+                    .mix(&COLOR_VIBRATO, tp.vibrato_strength)
+                    .with_alpha(alpha);
+                let srgba = c.to_srgba();
+                [srgba.red, srgba.green, srgba.blue, srgba.alpha]
+            })
+            .collect();
+
+        let Some(mesh) = build_trace_mesh(&world_points, &colors) else {
+            continue;
+        };
+        let mesh_handle = meshes.add(mesh);
+        let mat_handle = materials.add(TraceMaterial { clip_rect });
+
+        commands.spawn((
+            TraceMeshEntity,
+            Mesh2d(mesh_handle),
+            MeshMaterial2d(mat_handle),
+            RenderLayers::layer(1),
+        ));
     }
 }
 
