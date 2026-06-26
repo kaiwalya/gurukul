@@ -202,7 +202,12 @@ pub fn build_app(app: &mut App) {
         )
         .add_systems(
             Update,
-            widgets::time_graph::systems::apply_mesh_trace
+            (
+                widgets::time_graph::systems::clear_pitch_lane_bg_for_mesh,
+                widgets::time_graph::systems::apply_mesh_lane_bg,
+                widgets::time_graph::systems::apply_mesh_gridlines,
+                widgets::time_graph::systems::apply_mesh_trace,
+            )
                 .run_if(in_state(AppState::InGame))
                 .run_if(resource_exists::<widgets::time_graph::MeshTrace>),
         )

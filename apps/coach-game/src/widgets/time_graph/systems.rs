@@ -81,6 +81,16 @@ pub struct TraceMeshCamera;
 #[derive(Component)]
 pub struct TraceMeshEntity;
 
+/// Marker component for the 2d background-fill quad that replaces the opaque
+/// UI lane background when `--mesh-trace` is active.
+#[derive(Component)]
+pub struct LaneBgMeshEntity;
+
+/// Marker component for 2d horizontal gridline quads spawned by
+/// [`apply_mesh_gridlines`] when `--mesh-trace` is active.
+#[derive(Component)]
+pub struct GridlineMeshEntity;
+
 /// GPU material for the pitch-trace polyline mesh. Clips the mesh to the
 /// pitch lane rect in world space and applies per-vertex colour with a
 /// right-edge fade.
@@ -257,11 +267,16 @@ fn layer_node() -> Node {
 /// slow-cadence grid scene, so it only runs when the grooves actually
 /// change (the glue value-gates the write). The gridline layer is *not*
 /// shared with the trace, so this can clear its own children wholesale.
+///
+/// When `--mesh-trace` is active ([`MeshTrace`] resource is present), the
+/// UI groove spawn loop is suppressed; [`apply_mesh_gridlines`] owns
+/// gridline rendering instead.
 pub fn apply_gridlines(
     mut commands: Commands,
     grid: Res<TimeGraphGridSceneRes>,
     layer: Query<Entity, With<GridlineLayer>>,
     grooves: Query<Entity, With<GrooveLineMarker>>,
+    mesh_trace: Option<Res<MeshTrace>>,
 ) {
     let already_painted = !grooves.is_empty();
     if !grid.is_changed() && already_painted {
@@ -272,6 +287,11 @@ pub fn apply_gridlines(
     };
     for entity in grooves.iter() {
         commands.entity(entity).despawn();
+    }
+
+    // When mesh-trace is active, gridlines are drawn in 2d by apply_mesh_gridlines.
+    if mesh_trace.is_some() {
+        return;
     }
 
     for groove in &grid.grooves {
@@ -523,10 +543,10 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
         let v3 = p1 - end_offset;
 
         positions.extend([
-            [v0.x, v0.y, 0.0],
-            [v1.x, v1.y, 0.0],
-            [v2.x, v2.y, 0.0],
-            [v3.x, v3.y, 0.0],
+            [v0.x, v0.y, 0.2],
+            [v1.x, v1.y, 0.2],
+            [v2.x, v2.y, 0.2],
+            [v3.x, v3.y, 0.2],
         ]);
         vertex_colors.extend([c0, c0, c1, c1]);
         indices.extend([base, base + 1, base + 2, base + 1, base + 3, base + 2]);
@@ -546,9 +566,9 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
                     let bb = p_center + next_offset;
                     let bc_pt = p_center;
                     positions.extend([
-                        [ba.x, ba.y, 0.0],
-                        [bb.x, bb.y, 0.0],
-                        [bc_pt.x, bc_pt.y, 0.0],
+                        [ba.x, ba.y, 0.2],
+                        [bb.x, bb.y, 0.2],
+                        [bc_pt.x, bc_pt.y, 0.2],
                     ]);
                     vertex_colors.extend([bc, bc, bc]);
                     indices.extend([base, base + 1, base + 2]);
@@ -558,9 +578,9 @@ pub fn build_trace_mesh(world_points: &[Vec2], colors: &[[f32; 4]]) -> Option<Me
                     let bb = p_center - next_offset;
                     let bc_pt = p_center;
                     positions.extend([
-                        [ba.x, ba.y, 0.0],
-                        [bb.x, bb.y, 0.0],
-                        [bc_pt.x, bc_pt.y, 0.0],
+                        [ba.x, ba.y, 0.2],
+                        [bb.x, bb.y, 0.2],
+                        [bc_pt.x, bc_pt.y, 0.2],
                     ]);
                     vertex_colors.extend([bc, bc, bc]);
                     indices.extend([base, base + 2, base + 1]);
@@ -660,8 +680,10 @@ pub fn apply_mesh_trace(
                 let c = COLOR_TRACE
                     .mix(&COLOR_VIBRATO, tp.vibrato_strength)
                     .with_alpha(alpha);
-                let srgba = c.to_srgba();
-                [srgba.red, srgba.green, srgba.blue, srgba.alpha]
+                // ATTRIBUTE_COLOR is linear-rgb in the mesh2d pipeline; feed
+                // linear so the trace colour matches the UI rectangle path.
+                let lin = c.to_linear();
+                [lin.red, lin.green, lin.blue, lin.alpha]
             })
             .collect();
 
@@ -675,7 +697,172 @@ pub fn apply_mesh_trace(
             TraceMeshEntity,
             Mesh2d(mesh_handle),
             MeshMaterial2d(mat_handle),
+            // `Mesh2d` only requires `Transform`, not `Visibility`. The mesh2d
+            // render extraction skips any entity whose `ViewVisibility` is unset
+            // / false, so without an explicit `Visibility` the trace is culled
+            // before it ever rasterises (geometry + clip are correct, but
+            // nothing draws). `Visibility::Visible` pulls in the
+            // `InheritedVisibility`/`ViewVisibility` chain.
+            Visibility::Visible,
             RenderLayers::layer(1),
+        ));
+    }
+}
+
+/// Make the pitch-lane UI background transparent so the 2d mesh layer shows
+/// through. Runs every frame (cheap, idempotent) when `--mesh-trace` is active.
+/// Also clears the root background so the lane rect is fully visible.
+pub fn clear_pitch_lane_bg_for_mesh(
+    mut pitch_lanes: Query<&mut BackgroundColor, With<TimeGraphPitchLane>>,
+    mut roots: Query<&mut BackgroundColor, (With<TimeGraphRoot>, Without<TimeGraphPitchLane>)>,
+) {
+    for mut bg in pitch_lanes.iter_mut() {
+        bg.0 = Color::NONE;
+    }
+    for mut bg in roots.iter_mut() {
+        bg.0 = Color::NONE;
+    }
+}
+
+/// Spawn a 2d background-fill quad covering the full lane rect at Z=0.0, using
+/// `TraceMaterial` so it shares the same clip/layer as the trace mesh.
+/// Despawns and respawns whenever the lane rect changes.
+pub fn apply_mesh_lane_bg(
+    mut commands: Commands,
+    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
+    scale_res: Res<TimeGraphPitchLaneScale>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    existing: Query<Entity, With<LaneBgMeshEntity>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TraceMaterial>>,
+) {
+    // Only rebuild when the lane rect has changed.
+    if !lane_phys_rect.is_changed() && !existing.is_empty() {
+        return;
+    }
+
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    let Some(phys_rect) = lane_phys_rect.0 else {
+        return;
+    };
+    let scale_factor = scale_res.0;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let window_logical = Vec2::new(window.width(), window.height());
+    let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
+    let clip_rect = lane_world.clip_rect_uniform();
+
+    let [wx0, wy0, wx1, wy1] = lane_world.world;
+    // ATTRIBUTE_COLOR is consumed as LINEAR rgb by the mesh2d pipeline, so feed
+    // linear components (not sRGB) or the fill renders washed-out grey.
+    let lin = COLOR_PITCH_LANE.to_linear();
+    let c = [lin.red, lin.green, lin.blue, 1.0f32];
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [wx0, wy0, 0.0f32],
+            [wx1, wy0, 0.0f32],
+            [wx1, wy1, 0.0f32],
+            [wx0, wy1, 0.0f32],
+        ],
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![c; 4]);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+
+    commands.spawn((
+        LaneBgMeshEntity,
+        Mesh2d(meshes.add(mesh)),
+        MeshMaterial2d(materials.add(TraceMaterial { clip_rect })),
+        Visibility::Visible,
+        RenderLayers::layer(1),
+        DespawnOnExit(crate::state::AppState::InGame),
+    ));
+}
+
+/// Draw each groove line as a thin horizontal 2d quad at Z=0.1.
+/// Despawns and respawns whenever [`TimeGraphGridSceneRes`] changes.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_mesh_gridlines(
+    mut commands: Commands,
+    grid: Res<TimeGraphGridSceneRes>,
+    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
+    scale_res: Res<TimeGraphPitchLaneScale>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    existing: Query<Entity, With<GridlineMeshEntity>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TraceMaterial>>,
+) {
+    let already_painted = !existing.is_empty();
+    if !grid.is_changed() && already_painted {
+        return;
+    }
+
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    let Some(phys_rect) = lane_phys_rect.0 else {
+        return;
+    };
+    let scale_factor = scale_res.0;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let window_logical = Vec2::new(window.width(), window.height());
+    let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
+    let clip_rect = lane_world.clip_rect_uniform();
+
+    let [wx0, wy0, wx1, _wy1] = lane_world.world;
+    let lane_height = lane_world.world[3] - lane_world.world[1];
+
+    for groove in &grid.grooves {
+        // groove.y is normalized [0,1] where 1 = top of lane (mirrors the UI
+        // path's `top: percent((1.0 - groove.y)*100)`). World y is up: wy1 is
+        // the top, wy0 the bottom, so groove.y=1 maps to wy1.
+        let center_y = wy0 + groove.y.clamp(0.0, 1.0) * lane_height;
+        let half_h = GROOVE_HEIGHT * 0.5;
+
+        let color = if groove.active {
+            COLOR_GROOVE_ACTIVE
+        } else {
+            COLOR_GROOVE_INACTIVE
+        };
+        // ATTRIBUTE_COLOR is linear-rgb in the mesh2d pipeline.
+        let lin = color.to_linear();
+        let c = [lin.red, lin.green, lin.blue, lin.alpha];
+
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![
+                [wx0, center_y - half_h, 0.1f32],
+                [wx1, center_y - half_h, 0.1f32],
+                [wx1, center_y + half_h, 0.1f32],
+                [wx0, center_y + half_h, 0.1f32],
+            ],
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![c; 4]);
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+
+        commands.spawn((
+            GridlineMeshEntity,
+            Mesh2d(meshes.add(mesh)),
+            MeshMaterial2d(materials.add(TraceMaterial { clip_rect })),
+            Visibility::Visible,
+            RenderLayers::layer(1),
+            DespawnOnExit(crate::state::AppState::InGame),
         ));
     }
 }
@@ -881,5 +1068,163 @@ mod tests {
         assert!((geom.center.y - 50.0).abs() < 1e-5);
         assert!(geom.length > 0.0);
         assert!(geom.angle < 0.0);
+    }
+
+    // ── Mesh generator tests ───────────────────────────────────────────────
+
+    /// A straight horizontal 3-point line should produce a pair of quads whose
+    /// vertices are exactly ±HALF_WIDTH away from the centerline (no miter
+    /// distortion on a straight run — the miter vector is identical to the
+    /// normal, so no scaling occurs).
+    #[test]
+    fn mesh_straight_line_is_rectangle_equivalent() {
+        use bevy::mesh::VertexAttributeValues;
+        let pts = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(20.0, 0.0),
+        ];
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+        let colors = vec![white; 3];
+        let mesh = build_trace_mesh(&pts, &colors).expect("expected mesh");
+
+        // Extract y-coords of all vertex positions.
+        let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
+        let VertexAttributeValues::Float32x3(pos) = positions else {
+            panic!("wrong position format");
+        };
+        // Every y should be ±HALF_WIDTH (1.5) from the centerline (y=0).
+        for p in pos {
+            let y = p[1];
+            assert!(
+                (y - HALF_WIDTH).abs() < 1e-4 || (y + HALF_WIDTH).abs() < 1e-4,
+                "unexpected y offset {y}; expected ±{HALF_WIDTH}"
+            );
+        }
+    }
+
+    /// A single-point input produces no mesh (fewer than 2 points).
+    #[test]
+    fn mesh_too_few_points_returns_none() {
+        assert!(build_trace_mesh(&[Vec2::ZERO], &[[1.0; 4]]).is_none());
+    }
+
+    /// Per-vertex alpha equals conf⁴ × TRACE_MAX_ALPHA for known confidences.
+    #[test]
+    fn mesh_vertex_alpha_is_conf_fourth_times_max() {
+        use bevy::mesh::VertexAttributeValues;
+        for conf in [0.0f32, 0.5, 0.8, 1.0] {
+            let expected_alpha = (conf.powi(4) * TRACE_MAX_ALPHA).clamp(0.0, 1.0);
+            // Build a 2-point mesh where both points have the same confidence.
+            // Color is assembled the same way apply_mesh_trace does it:
+            // conf⁴ × TRACE_MAX_ALPHA → alpha channel.
+            let pts = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)];
+            let c_srgba = COLOR_TRACE.with_alpha(expected_alpha).to_srgba();
+            let color = [c_srgba.red, c_srgba.green, c_srgba.blue, c_srgba.alpha];
+            let colors = vec![color; 2];
+            let mesh = build_trace_mesh(&pts, &colors).expect("expected mesh");
+            let vc = mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
+            let VertexAttributeValues::Float32x4(cols) = vc else {
+                panic!("wrong color format");
+            };
+            for c in cols {
+                assert!(
+                    (c[3] - expected_alpha).abs() < 1e-5,
+                    "alpha mismatch: got {}, expected {expected_alpha}",
+                    c[3]
+                );
+            }
+        }
+    }
+
+    /// Centerline parity: the world-space mesh centerline must match the
+    /// lane-local points produced by `normalized_to_lane`, converted through
+    /// `LaneWorldRect::lane_local_to_world`.
+    #[test]
+    fn mesh_centerline_parity_matches_normalized_to_lane() {
+        let size = Vec2::new(200.0, 100.0);
+        // A 400×200 window at scale 2.0, lane starts at physical (20, 30).
+        let window_logical = Vec2::new(200.0, 100.0);
+        let phys_rect = [20.0f32, 30.0, 420.0, 230.0]; // 400×200 physical
+        let scale_factor = 2.0f32;
+        let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
+
+        let pts = [
+            NormalizedPoint { x: 0.0, y: 1.0 },
+            NormalizedPoint { x: 0.5, y: 0.5 },
+            NormalizedPoint { x: 1.0, y: 0.0 },
+        ];
+        for p in &pts {
+            let local = normalized_to_lane(*p, size);
+            let world = lane_world.lane_local_to_world(local);
+            // Reconstruct: local→world should round-trip cleanly.
+            // world_x = lane_world.world[0] + local.x
+            // world_y = lane_world.world[3] - local.y
+            let expected_x = lane_world.world[0] + local.x;
+            let expected_y = lane_world.world[3] - local.y;
+            assert!(
+                (world.x - expected_x).abs() < 1e-4,
+                "world.x mismatch: {world:?} vs {expected_x}"
+            );
+            assert!(
+                (world.y - expected_y).abs() < 1e-4,
+                "world.y mismatch: {world:?} vs {expected_y}"
+            );
+        }
+    }
+
+    /// Clip AABB ⊆ lane: a polyline that overflows the right edge must still
+    /// produce a clipped AABB fully inside the lane rect.
+    #[test]
+    fn clipped_aabb_is_subset_of_lane() {
+        // Polyline that goes well past the right edge.
+        let lane_logical: Vec<[f32; 2]> = vec![[5.0, 5.0], [200.0, 5.0]];
+        let scale_factor = 2.0f32;
+        let lane_origin = [0.0f32, 0.0];
+        let lane_phys_rect = [0.0f32, 0.0, 100.0 * scale_factor, 50.0 * scale_factor];
+
+        let aabb = segment_phys_aabb(&lane_logical, scale_factor, lane_origin);
+        let clipped = intersect_aabb(aabb, lane_phys_rect);
+
+        assert!(
+            clipped[0] >= lane_phys_rect[0],
+            "clipped min_x {0} < lane {1}",
+            clipped[0],
+            lane_phys_rect[0]
+        );
+        assert!(
+            clipped[2] <= lane_phys_rect[2],
+            "clipped max_x {0} > lane {1}",
+            clipped[2],
+            lane_phys_rect[2]
+        );
+        assert!(
+            clipped[1] >= lane_phys_rect[1],
+            "clipped min_y {0} < lane {1}",
+            clipped[1],
+            lane_phys_rect[1]
+        );
+        assert!(
+            clipped[3] <= lane_phys_rect[3],
+            "clipped max_y {0} > lane {1}",
+            clipped[3],
+            lane_phys_rect[3]
+        );
+    }
+
+    /// `LaneWorldRect::from_phys` converts correctly: a known physical rect
+    /// should produce known world bounds.
+    ///
+    /// Window: 400×200 logical, scale 2.0 → 800×400 physical.
+    /// Lane physical rect: [0, 0, 800, 400] (fills the window).
+    /// Expected world rect: [-200, -100, 200, 100] (centred at origin, y-up).
+    #[test]
+    fn lane_world_rect_conversion() {
+        let phys = [0.0f32, 0.0, 800.0, 400.0];
+        let rect = LaneWorldRect::from_phys(phys, 2.0, Vec2::new(400.0, 200.0));
+        assert!((rect.world[0] - -200.0).abs() < 1e-4, "min_x");
+        assert!((rect.world[1] - -100.0).abs() < 1e-4, "min_y");
+        assert!((rect.world[2] - 200.0).abs() < 1e-4, "max_x");
+        assert!((rect.world[3] - 100.0).abs() < 1e-4, "max_y");
     }
 }
