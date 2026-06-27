@@ -40,6 +40,13 @@ const VIBRATO_RATE_HIGH_FULL: f32 = 6.5;
 /// Rate at which the band fades to zero on the high side (Hz).
 const VIBRATO_RATE_HIGH_ZERO: f32 = 7.5;
 
+/// Number of points in the symmetric moving-average window used to smooth the
+/// per-point band half-heights. A 5-point window spans ~250 ms at 20 Hz and
+/// kills single-hop spikes while tracking real depth changes quickly enough.
+/// Chosen over a one-pole IIR because it has zero warm-up latency for the
+/// initial points and needs no per-segment state.
+const BAND_SMOOTH_WINDOW: usize = 5;
+
 use super::scene::{
     NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
     NormalizedTracePoint, NormalizedTraceSegment, TimeGraphScene,
@@ -94,25 +101,70 @@ fn normalize_trace_segment(
     time_window: TimeWindow,
     pitch_window: PitchWindow,
 ) -> Option<NormalizedTraceSegment> {
+    let octave_span = pitch_window.max.0 - pitch_window.min.0;
+
+    // Build a parallel list of raw (unsmoothed) band half-heights alongside
+    // the normalized points. The half-height is gated by vibrato_strength: a
+    // point with zero strength (not real vibrato) contributes zero height so
+    // the band never appears over non-vibrato stretches.
+    let mut raw_half_heights: Vec<f32> = Vec::with_capacity(segment.points.len());
     let points = segment
         .points
         .iter()
         .filter_map(|point| {
+            let strength =
+                vibrato_strength(point.vibrato_rate, point.vibrato_depth, point.confidence);
+            // Project depth_cents → normalized-y half-height, then gate by
+            // strength. When strength is 0 the band vanishes; when it's 1
+            // the full measured depth is shown. Intermediate values blend.
+            let raw_hh = if octave_span > 0.0 {
+                (point.vibrato_depth / 1200.0) / octave_span * strength
+            } else {
+                0.0
+            };
+            raw_half_heights.push(raw_hh);
             Some(NormalizedTracePoint {
                 point: NormalizedPoint {
                     x: normalize_time(point.t_ms, time_window)?,
                     y: normalize_pitch(point.pitch, pitch_window)?,
                 },
                 confidence: point.confidence,
-                vibrato_strength: vibrato_strength(
-                    point.vibrato_rate,
-                    point.vibrato_depth,
-                    point.confidence,
-                ),
+                vibrato_strength: strength,
+                band_half_height: 0.0, // filled in below after smoothing
             })
         })
         .collect::<Vec<_>>();
-    (!points.is_empty()).then_some(NormalizedTraceSegment { points })
+
+    if points.is_empty() {
+        return None;
+    }
+
+    // Smooth the raw half-heights with a symmetric moving average of window
+    // BAND_SMOOTH_WINDOW. The radius is floor(window/2); for a 5-point window
+    // that is 2 on each side. Edge points use whatever neighbours are
+    // available (they are not zero-padded, so the head and tail see a smaller
+    // window rather than a biased one).
+    let half_w = BAND_SMOOTH_WINDOW / 2;
+    let n = raw_half_heights.len();
+    let smoothed: Vec<f32> = (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(half_w);
+            let hi = (i + half_w + 1).min(n);
+            let sum: f32 = raw_half_heights[lo..hi].iter().sum();
+            sum / (hi - lo) as f32
+        })
+        .collect();
+
+    let points = points
+        .into_iter()
+        .zip(smoothed)
+        .map(|(mut tp, hh)| {
+            tp.band_half_height = hh;
+            tp
+        })
+        .collect();
+
+    Some(NormalizedTraceSegment { points })
 }
 
 fn normalize_groove(groove: GrooveLine, pitch_window: PitchWindow) -> Option<NormalizedGrooveLine> {
@@ -602,5 +654,72 @@ mod tests {
         assert_eq!(vibrato_strength(f32::NAN, 60.0, 0.9), 0.0);
         assert_eq!(vibrato_strength(5.5, f32::NAN, 0.9), 0.0);
         assert_eq!(vibrato_strength(5.5, 60.0, f32::NAN), 0.0);
+    }
+
+    /// A point with a known depth in cents should project to a predictable
+    /// `band_half_height`. Arithmetic (by hand):
+    ///   pitch_window span = 10.0 - 8.0 = 2.0 octaves
+    ///   depth_cents = 120.0
+    ///   raw_hh = (120.0 / 1200.0) / 2.0 = 0.1 / 2.0 = 0.05
+    ///   vibrato_strength at rate=5.5, depth=120, conf=1.0 = 1.0 (above full gate)
+    ///   gated_hh = 0.05 * 1.0 = 0.05
+    ///   single-point segment → smoother window = 1 → smoothed = 0.05
+    #[test]
+    fn band_half_height_known_depth_projects_correctly() {
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: 0,
+                end_ms: 100,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(8.0),
+                max: PitchLog2(10.0),
+            }),
+            trace_segments: vec![TraceSegment {
+                points: vec![TracePoint {
+                    t_ms: 50,
+                    pitch: PitchLog2(9.0),
+                    confidence: 1.0,
+                    vibrato_rate: 5.5,    // band centre
+                    vibrato_depth: 120.0, // well above full gate
+                }],
+            }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+        let scene = project_scene(&graph);
+        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        assert!((hh - 0.05).abs() < 1e-4, "expected 0.05, got {hh}");
+    }
+
+    /// A point with zero vibrato strength must yield `band_half_height = 0`.
+    #[test]
+    fn band_half_height_zero_for_non_vibrato_point() {
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: 0,
+                end_ms: 100,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(8.0),
+                max: PitchLog2(10.0),
+            }),
+            trace_segments: vec![TraceSegment {
+                points: vec![TracePoint {
+                    t_ms: 50,
+                    pitch: PitchLog2(9.0),
+                    confidence: 0.9,
+                    vibrato_rate: 0.0, // off-band rate → strength = 0
+                    vibrato_depth: 0.0,
+                }],
+            }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+        let scene = project_scene(&graph);
+        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        assert_eq!(hh, 0.0, "non-vibrato point must have zero band_half_height");
     }
 }

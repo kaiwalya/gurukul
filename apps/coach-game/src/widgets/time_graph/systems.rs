@@ -30,11 +30,13 @@ const COLOR_GROOVE_INACTIVE: Color = Color::srgba(0.56, 0.56, 0.63, 0.03);
 const COLOR_ONSET: Color = Color::srgb(1.0, 0.86, 0.44);
 const COLOR_BREATH: Color = Color::srgba(0.88, 0.64, 0.95, 0.34);
 const COLOR_TRACE: Color = Color::srgb(0.94, 0.94, 0.98);
-/// Coral/salmon tint shown where stable vibrato is detected. Intentionally
-/// warmer and more saturated than the amber `COLOR_ONSET` so the two remain
-/// visually separable at a glance.
-const COLOR_VIBRATO: Color = Color::srgb(1.0, 0.45, 0.42);
 const TRACE_MAX_ALPHA: f32 = 0.95;
+/// Desaturated blue-grey band shown behind the trace during vibrato. Neutral
+/// enough to not compete with the trace or groove lines while still being
+/// legible against the dark lane background.
+const COLOR_BAND: Color = Color::srgba(0.55, 0.65, 0.82, 1.0);
+/// Maximum alpha for the vibrato band at full vibrato strength.
+const BAND_MAX_ALPHA: f32 = 0.22;
 
 #[derive(Component)]
 pub struct TimeGraphRoot;
@@ -72,6 +74,19 @@ pub struct TraceMeshEntity;
 /// despawn and the next spawn (the old per-frame churn flickered badly).
 #[derive(Resource)]
 pub struct TraceMeshHandles {
+    pub entity: Entity,
+    pub mesh: Handle<Mesh>,
+    pub material: Handle<TraceMaterial>,
+}
+
+/// Marker component for the vibrato-band filled-ribbon mesh entity.
+#[derive(Component)]
+pub struct BandMeshEntity;
+
+/// Persistent handles for the single vibrato-band mesh entity. Mirrors the
+/// `TraceMeshHandles` pattern: one entity mutated in place, never respawned.
+#[derive(Resource)]
+pub struct BandMeshHandles {
     pub entity: Entity,
     pub mesh: Handle<Mesh>,
     pub material: Handle<TraceMaterial>,
@@ -489,6 +504,56 @@ pub fn clear_trace_mesh_handles(mut commands: Commands) {
     commands.remove_resource::<TraceMeshHandles>();
 }
 
+/// Build a filled ribbon [`Mesh`] representing the vibrato band. For each
+/// adjacent pair of points, two triangles connect (top_i, bottom_i,
+/// top_{i+1}, bottom_{i+1}). Colors encode vibrato strength via alpha.
+/// Returns `None` if fewer than two points are supplied.
+pub fn build_band_mesh(
+    world_centers: &[Vec2],
+    half_heights_world: &[f32],
+    colors: &[[f32; 4]],
+) -> Option<Mesh> {
+    if world_centers.len() < 2 {
+        return None;
+    }
+    let n = world_centers.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 2);
+    let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(n * 2);
+    let mut indices: Vec<u32> = Vec::with_capacity((n - 1) * 6);
+
+    for i in 0..n {
+        let cx = world_centers[i].x;
+        let cy = world_centers[i].y;
+        let hh = half_heights_world[i];
+        positions.push([cx, cy + hh, 0.15]);
+        positions.push([cx, cy - hh, 0.15]);
+        vertex_colors.push(colors[i]);
+        vertex_colors.push(colors[i]);
+    }
+
+    for i in 0..n - 1 {
+        let base = (i * 2) as u32;
+        // top_i, bottom_i, top_{i+1}
+        indices.extend([base, base + 1, base + 2]);
+        // bottom_i, bottom_{i+1}, top_{i+1}
+        indices.extend([base + 1, base + 3, base + 2]);
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
+    mesh.insert_indices(Indices::U32(indices));
+    Some(mesh)
+}
+
+/// Drop the persistent band-mesh handles on leaving InGame.
+pub fn clear_band_mesh_handles(mut commands: Commands) {
+    commands.remove_resource::<BandMeshHandles>();
+}
+
 /// Spawn the overlay [`Camera2d`] that renders mesh-trace entities on
 /// [`RenderLayers::layer(1)`].
 pub fn spawn_trace_overlay_camera(mut commands: Commands) {
@@ -565,9 +630,7 @@ pub fn apply_mesh_trace(
             .map(|tp| {
                 let conf = tp.confidence.clamp(0.0, 1.0).powi(4);
                 let alpha = (conf * TRACE_MAX_ALPHA).clamp(0.0, 1.0);
-                let c = COLOR_TRACE
-                    .mix(&COLOR_VIBRATO, tp.vibrato_strength)
-                    .with_alpha(alpha);
+                let c = COLOR_TRACE.with_alpha(alpha);
                 // ATTRIBUTE_COLOR is linear-rgb in the mesh2d pipeline; feed
                 // linear so the trace colour matches the UI rectangle path.
                 let lin = c.to_linear();
@@ -620,6 +683,108 @@ pub fn apply_mesh_trace(
                 ))
                 .id();
             commands.insert_resource(TraceMeshHandles {
+                entity,
+                mesh: mesh_handle,
+                material: mat_handle,
+            });
+        }
+    }
+}
+
+/// Rebuild the vibrato-band filled ribbon whenever the live scene changes.
+/// All segments are flattened into ONE mesh carried by a single persistent
+/// [`BandMeshEntity`], mutated in place — same pattern as `apply_mesh_trace`.
+/// Z = 0.15, between gridlines (0.1) and the trace (0.2).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_mesh_band(
+    mut commands: Commands,
+    live: Res<TimeGraphLiveSceneRes>,
+    lane_size: Res<TimeGraphPitchLaneSize>,
+    lane_phys_rect: Res<TimeGraphPitchLanePhysRect>,
+    scale_res: Res<TimeGraphPitchLaneScale>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    handles: Option<Res<BandMeshHandles>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TraceMaterial>>,
+) {
+    if !live.is_changed() && handles.is_some() {
+        return;
+    }
+
+    let Some(size) = lane_size.0.map(LogicalSize::get) else {
+        return;
+    };
+    let Some(phys_rect) = lane_phys_rect.0 else {
+        return;
+    };
+    let scale_factor = scale_res.0;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let window_logical = Vec2::new(window.width(), window.height());
+    let lane_world = LaneWorldRect::from_phys(phys_rect, scale_factor, window_logical);
+    let clip_rect = lane_world.clip_rect_uniform();
+    let lane_height = lane_world.world[3] - lane_world.world[1];
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut vertex_colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    let lin_band = COLOR_BAND.to_linear();
+
+    for segment in &live.pitch_segments {
+        if segment.points.len() < 2 {
+            continue;
+        }
+        let n = segment.points.len();
+        let seg_base = (positions.len() / 2) as u32;
+        for tp in segment.points.iter() {
+            let local = normalized_to_lane(tp.point, size);
+            let world_center = lane_world.lane_local_to_world(local);
+            let hh_world = tp.band_half_height * lane_height;
+            let alpha = (tp.vibrato_strength * BAND_MAX_ALPHA).clamp(0.0, 1.0);
+            let c = [lin_band.red, lin_band.green, lin_band.blue, alpha];
+
+            positions.push([world_center.x, world_center.y + hh_world, 0.15]);
+            positions.push([world_center.x, world_center.y - hh_world, 0.15]);
+            vertex_colors.push(c);
+            vertex_colors.push(c);
+        }
+        for i in 0..n - 1 {
+            let b = seg_base + (i as u32) * 2;
+            indices.extend([b, b + 1, b + 2, b + 1, b + 3, b + 2]);
+        }
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
+    mesh.insert_indices(Indices::U32(indices));
+
+    match handles.as_deref() {
+        Some(h) => {
+            let _ = meshes.insert(&h.mesh, mesh);
+            if let Some(mat) = materials.get_mut(&h.material) {
+                mat.clip_rect = clip_rect;
+            }
+        }
+        None => {
+            let mesh_handle = meshes.add(mesh);
+            let mat_handle = materials.add(TraceMaterial::trace(clip_rect));
+            let entity = commands
+                .spawn((
+                    BandMeshEntity,
+                    Mesh2d(mesh_handle.clone()),
+                    MeshMaterial2d(mat_handle.clone()),
+                    Visibility::Visible,
+                    RenderLayers::layer(1),
+                    DespawnOnExit(crate::state::AppState::InGame),
+                ))
+                .id();
+            commands.insert_resource(BandMeshHandles {
                 entity,
                 mesh: mesh_handle,
                 material: mat_handle,
@@ -1098,5 +1263,40 @@ mod tests {
         assert!((rect.world[1] - -100.0).abs() < 1e-4, "min_y");
         assert!((rect.world[2] - 200.0).abs() < 1e-4, "max_x");
         assert!((rect.world[3] - 100.0).abs() < 1e-4, "max_y");
+    }
+
+    /// A 2-point band segment with a known half-height produces top/bottom
+    /// verts at center ± expected world offset. Center y = 0.0; half_height =
+    /// 5.0 → top y = +5.0, bottom y = -5.0.
+    #[test]
+    fn build_band_mesh_top_bottom_offsets() {
+        use bevy::mesh::VertexAttributeValues;
+        let centers = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)];
+        let half_heights = vec![5.0f32, 5.0f32];
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+        let colors = vec![white; 2];
+        let mesh = build_band_mesh(&centers, &half_heights, &colors).expect("expected mesh");
+
+        let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
+        let VertexAttributeValues::Float32x3(pos) = positions else {
+            panic!("wrong position format");
+        };
+        // 2 points × 2 verts = 4 vertices. Each pair should be ±5.0 in y.
+        assert_eq!(pos.len(), 4);
+        for p in pos {
+            let y = p[1];
+            assert!(
+                (y - 5.0).abs() < 1e-4 || (y + 5.0).abs() < 1e-4,
+                "unexpected y {y}; expected ±5.0"
+            );
+            // Z must be 0.15 (band layer, below trace at 0.2).
+            assert!((p[2] - 0.15).abs() < 1e-4, "unexpected z {}", p[2]);
+        }
+    }
+
+    /// Single-point input returns None (fewer than 2 points).
+    #[test]
+    fn build_band_mesh_too_few_points_returns_none() {
+        assert!(build_band_mesh(&[Vec2::ZERO], &[1.0], &[[1.0; 4]]).is_none());
     }
 }

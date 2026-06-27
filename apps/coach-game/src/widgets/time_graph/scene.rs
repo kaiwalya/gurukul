@@ -52,6 +52,11 @@ pub struct NormalizedTracePoint {
     /// depth gate, rate band, and confidence into a single tint signal.
     /// Music-blind: no Hz or cents here — the model has already spent those.
     pub vibrato_strength: f32,
+    /// Smoothed vibrato-depth projected into normalized-y half-height units.
+    /// `0.0` when no vibrato is present. Music-blind: no cents or Hz here —
+    /// the model spent those in [`super::model`]. Mirrors `vibrato_strength`'s
+    /// music-blind contract.
+    pub band_half_height: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

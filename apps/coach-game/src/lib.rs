@@ -66,7 +66,10 @@ pub fn add_mesh_trace_systems(app: &mut App) {
     use state::AppState;
     app.add_systems(
         OnExit(AppState::InGame),
-        widgets::time_graph::systems::clear_trace_mesh_handles,
+        (
+            widgets::time_graph::systems::clear_trace_mesh_handles,
+            widgets::time_graph::systems::clear_band_mesh_handles,
+        ),
     )
     .add_systems(
         OnEnter(AppState::InGame),
@@ -78,6 +81,7 @@ pub fn add_mesh_trace_systems(app: &mut App) {
             widgets::time_graph::systems::clear_pitch_lane_bg_for_mesh,
             widgets::time_graph::systems::apply_mesh_lane_bg,
             widgets::time_graph::systems::apply_mesh_gridlines,
+            widgets::time_graph::systems::apply_mesh_band,
             widgets::time_graph::systems::apply_mesh_trace,
         )
             .run_if(in_state(AppState::InGame)),
