@@ -21,8 +21,13 @@ pub const BREATH_ACTIVE_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeWindow {
+    /// Oldest retained sample (may be 0 during the first `span_ms` of a session).
     pub start_ms: u64,
+    /// Newest sample — pinned to the right edge of the display.
     pub end_ms: u64,
+    /// Fixed display width in milliseconds. Always equals the history retention
+    /// window, regardless of how little history has accumulated so far.
+    pub span_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,9 +96,11 @@ impl GraphProjector {
         history: &FeatureHistory,
         music: Option<&MusicInfo>,
     ) -> SemanticGraph {
-        let time_window = history
-            .time_bounds()
-            .map(|(start_ms, end_ms)| TimeWindow { start_ms, end_ms });
+        let time_window = history.time_bounds().map(|(start_ms, end_ms)| TimeWindow {
+            start_ms,
+            end_ms,
+            span_ms: history.window_ms(),
+        });
         let newest_ms = time_window.map(|window| window.end_ms);
         let target = target_pitch_window(history);
         self.update_pitch_window(target, newest_ms);

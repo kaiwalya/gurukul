@@ -47,6 +47,13 @@ const VIBRATO_RATE_HIGH_ZERO: f32 = 7.5;
 /// initial points and needs no per-segment state.
 const BAND_SMOOTH_WINDOW: usize = 5;
 
+/// Number of points in the symmetric moving-average window used to smooth
+/// the per-point band centre (mean pitch). Wider than [`BAND_SMOOTH_WINDOW`]
+/// so one full vibrato cycle is averaged out and the ribbon rails stay
+/// steady: at ~5.5 Hz vibrato and 50 ms/point a full cycle is ~4 points;
+/// a 9-point window covers ~1 full cycle plus margin on each side.
+const BAND_CENTER_SMOOTH_WINDOW: usize = 9;
+
 use super::scene::{
     NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
     NormalizedTracePoint, NormalizedTraceSegment, TimeGraphScene,
@@ -96,6 +103,24 @@ pub fn project_scene(graph: &SemanticGraph) -> TimeGraphScene {
     }
 }
 
+/// Symmetric moving-average smoother. For each index `i` the output is the
+/// mean of the window `[i - radius, i + radius]` clamped to the slice
+/// bounds (edge points see a smaller window rather than zero-padding, so
+/// they are not biased toward zero). `window` must be ≥ 1; a window of 1
+/// is a no-op (returns input unchanged). Panics if `window` is 0.
+fn smooth(values: &[f32], window: usize) -> Vec<f32> {
+    let half_w = window / 2;
+    let n = values.len();
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(half_w);
+            let hi = (i + half_w + 1).min(n);
+            let sum: f32 = values[lo..hi].iter().sum();
+            sum / (hi - lo) as f32
+        })
+        .collect()
+}
+
 fn normalize_trace_segment(
     segment: &TraceSegment,
     time_window: TimeWindow,
@@ -103,34 +128,36 @@ fn normalize_trace_segment(
 ) -> Option<NormalizedTraceSegment> {
     let octave_span = pitch_window.max.0 - pitch_window.min.0;
 
-    // Build a parallel list of raw (unsmoothed) band half-heights alongside
-    // the normalized points. The half-height is gated by vibrato_strength: a
-    // point with zero strength (not real vibrato) contributes zero height so
-    // the band never appears over non-vibrato stretches.
+    // Build parallel lists of raw (unsmoothed) band half-heights and raw
+    // normalized-y values alongside the partial points.
     let mut raw_half_heights: Vec<f32> = Vec::with_capacity(segment.points.len());
+    let mut raw_ys: Vec<f32> = Vec::with_capacity(segment.points.len());
     let points = segment
         .points
         .iter()
         .filter_map(|point| {
             let strength =
                 vibrato_strength(point.vibrato_rate, point.vibrato_depth, point.confidence);
-            // Project depth_cents → normalized-y half-height, then gate by
-            // strength. When strength is 0 the band vanishes; when it's 1
-            // the full measured depth is shown. Intermediate values blend.
+            // Half-height = pure normalized depth: the band rails wrap the actual
+            // peak-to-peak swing of the trace. Rate is already visible in the
+            // wiggle itself; confidence drives opacity (see `apply_mesh_band`).
+            // Strength is NOT applied here — it would double-count information
+            // already expressed through the other two visual channels.
             let raw_hh = if octave_span > 0.0 {
-                (point.vibrato_depth / 1200.0) / octave_span * strength
+                (point.vibrato_depth / 1200.0) / octave_span
             } else {
                 0.0
             };
+            let nx = normalize_time(point.t_ms, time_window)?;
+            let ny = normalize_pitch(point.pitch, pitch_window)?;
             raw_half_heights.push(raw_hh);
+            raw_ys.push(ny);
             Some(NormalizedTracePoint {
-                point: NormalizedPoint {
-                    x: normalize_time(point.t_ms, time_window)?,
-                    y: normalize_pitch(point.pitch, pitch_window)?,
-                },
+                point: NormalizedPoint { x: nx, y: ny },
                 confidence: point.confidence,
                 vibrato_strength: strength,
                 band_half_height: 0.0, // filled in below after smoothing
+                band_center_y: 0.0,    // filled in below after smoothing
             })
         })
         .collect::<Vec<_>>();
@@ -139,27 +166,20 @@ fn normalize_trace_segment(
         return None;
     }
 
-    // Smooth the raw half-heights with a symmetric moving average of window
-    // BAND_SMOOTH_WINDOW. The radius is floor(window/2); for a 5-point window
-    // that is 2 on each side. Edge points use whatever neighbours are
-    // available (they are not zero-padded, so the head and tail see a smaller
-    // window rather than a biased one).
-    let half_w = BAND_SMOOTH_WINDOW / 2;
-    let n = raw_half_heights.len();
-    let smoothed: Vec<f32> = (0..n)
-        .map(|i| {
-            let lo = i.saturating_sub(half_w);
-            let hi = (i + half_w + 1).min(n);
-            let sum: f32 = raw_half_heights[lo..hi].iter().sum();
-            sum / (hi - lo) as f32
-        })
-        .collect();
+    // Smooth the raw half-heights with the narrower window (kills single-hop
+    // spikes while tracking real depth changes quickly).
+    let smoothed_hh = smooth(&raw_half_heights, BAND_SMOOTH_WINDOW);
+    // Smooth the raw y values with the wider window so one full vibrato cycle
+    // is averaged out and the ribbon's centre rails stay steady.
+    let smoothed_center = smooth(&raw_ys, BAND_CENTER_SMOOTH_WINDOW);
 
     let points = points
         .into_iter()
-        .zip(smoothed)
-        .map(|(mut tp, hh)| {
+        .zip(smoothed_hh)
+        .zip(smoothed_center)
+        .map(|((mut tp, hh), cy)| {
             tp.band_half_height = hh;
+            tp.band_center_y = cy;
             tp
         })
         .collect();
@@ -210,11 +230,22 @@ fn normalize_breath_span(
 /// the pile — the on-screen "lines everywhere" defect. `None` means *not
 /// shown*: either a degenerate (zero-span) window or a point outside it.
 fn normalize_time(t_ms: u64, window: TimeWindow) -> Option<f32> {
-    let span = window.end_ms.saturating_sub(window.start_ms);
+    // Divide by the *fixed* retention span, not `end_ms - start_ms`. Early in
+    // a session (or after silence) the buffer holds less than `span_ms` of
+    // data, so `end_ms - start_ms` is smaller than the window and the few
+    // seconds present get stretched across the full width — a "zoom-out" that
+    // relaxes only once the buffer fills. Anchoring on `span_ms` keeps the
+    // pixels-per-second constant from the first frame: "now" sits at x = 1.0
+    // and older data marches left at a fixed rate.
+    let span = window.span_ms;
     if span == 0 || t_ms < window.start_ms || t_ms > window.end_ms {
         return None;
     }
-    Some((t_ms - window.start_ms) as f32 / span as f32)
+    // Anchor "now" (`end_ms`) at x = 1.0 and measure age backwards from it, so
+    // the live edge is pinned to the right from the very first frame and older
+    // samples sit at a fixed fraction of `span_ms` to its left.
+    let age_ms = window.end_ms - t_ms;
+    Some(1.0 - age_ms as f32 / span as f32)
 }
 
 /// Map a pitch onto the window as a `[0, 1]` fraction, **dropping** pitches
@@ -272,11 +303,14 @@ fn vibrato_strength(rate_hz: f32, depth_cents: f32, confidence: f32) -> f32 {
 /// [`normalize_time`] and drop instead. `None` only for a degenerate
 /// window. See [`normalize_breath_span`] for the entirely-outside case.
 fn clamp_time(t_ms: u64, window: TimeWindow) -> Option<f32> {
-    let span = window.end_ms.saturating_sub(window.start_ms);
+    let span = window.span_ms;
     if span == 0 {
         return None;
     }
-    Some((t_ms.saturating_sub(window.start_ms) as f32 / span as f32).clamp(0.0, 1.0))
+    // Same fixed-span, now-pinned-right basis as `normalize_time`; clamps
+    // instead of dropping so a span straddling the left edge is clipped to it.
+    let age_ms = window.end_ms.saturating_sub(t_ms);
+    Some((1.0 - age_ms as f32 / span as f32).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -293,6 +327,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 10,
                 end_ms: 110,
+                span_ms: 100,
             }),
             pitch_window: Some(PitchWindow {
                 min: PitchLog2(8.0),
@@ -363,6 +398,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 10,
                 end_ms: 110,
+                span_ms: 100,
             }),
             pitch_window: Some(PitchWindow {
                 min: PitchLog2(8.0),
@@ -407,6 +443,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 100,
                 end_ms: 200,
+                span_ms: 100,
             }),
             pitch_window: Some(PitchWindow {
                 min: PitchLog2(8.0),
@@ -454,6 +491,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 100,
                 end_ms: 200,
+                span_ms: 100,
             }),
             breath_spans: vec![
                 BreathSpan {
@@ -524,6 +562,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 50,
                 end_ms: 50,
+                span_ms: 0,
             }),
             ..full_graph()
         };
@@ -661,8 +700,7 @@ mod tests {
     ///   pitch_window span = 10.0 - 8.0 = 2.0 octaves
     ///   depth_cents = 120.0
     ///   raw_hh = (120.0 / 1200.0) / 2.0 = 0.1 / 2.0 = 0.05
-    ///   vibrato_strength at rate=5.5, depth=120, conf=1.0 = 1.0 (above full gate)
-    ///   gated_hh = 0.05 * 1.0 = 0.05
+    ///   strength is NOT applied to height (confidence drives opacity instead)
     ///   single-point segment → smoother window = 1 → smoothed = 0.05
     #[test]
     fn band_half_height_known_depth_projects_correctly() {
@@ -670,6 +708,7 @@ mod tests {
             time_window: Some(TimeWindow {
                 start_ms: 0,
                 end_ms: 100,
+                span_ms: 100,
             }),
             pitch_window: Some(PitchWindow {
                 min: PitchLog2(8.0),
@@ -693,13 +732,86 @@ mod tests {
         assert!((hh - 0.05).abs() < 1e-4, "expected 0.05, got {hh}");
     }
 
-    /// A point with zero vibrato strength must yield `band_half_height = 0`.
+    /// The band centre should be the smoothed mean of the raw pitch, not the
+    /// instantaneous pitch. Feed a segment whose raw pitch alternates ±delta
+    /// around 0.5 for enough points to fill the `BAND_CENTER_SMOOTH_WINDOW`.
+    /// Interior points should have `band_center_y ≈ 0.5` within a tight
+    /// tolerance (the symmetric window averages out the alternation exactly).
     #[test]
-    fn band_half_height_zero_for_non_vibrato_point() {
+    fn band_center_y_tracks_mean_not_instantaneous_pitch() {
+        // Alternate ±0.1 around 0.5 for 12 points — more than the 9-point
+        // window so at least some interior points see a full window.
+        let n_points = 12usize;
+        let pitch_window_min = 8.0_f64;
+        let pitch_window_max = 10.0_f64;
+        let span = pitch_window_max - pitch_window_min; // 2.0
+
+        // Convert 0.5 normalized ± delta_norm back to log2 Hz.
+        // normalized y = (pitch - min) / span  →  pitch = y * span + min
+        // We want y values alternating 0.5+delta_norm and 0.5-delta_norm.
+        let delta_norm = 0.15_f64; // large enough to be clearly visible in assertion
+
+        let points: Vec<_> = (0..n_points)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0_f64 } else { -1.0_f64 };
+                let ny = 0.5 + sign * delta_norm;
+                let pitch_log2 = ny * span + pitch_window_min;
+                TracePoint {
+                    t_ms: (i as u64) * 50, // 50 ms per point
+                    pitch: PitchLog2(pitch_log2 as f32),
+                    confidence: 0.0, // vibrato_strength=0, so band is zero
+                    vibrato_rate: 0.0,
+                    vibrato_depth: 0.0,
+                }
+            })
+            .collect();
+
+        let time_end_ms = (n_points as u64 - 1) * 50;
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: 0,
+                end_ms: time_end_ms,
+                span_ms: time_end_ms,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(pitch_window_min as f32),
+                max: PitchLog2(pitch_window_max as f32),
+            }),
+            trace_segments: vec![TraceSegment { points }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+
+        let scene = project_scene(&graph);
+        let tp_list = &scene.pitch_segments[0].points;
+
+        // The window is 9 points (odd). With 12 input points, indices 4..=7
+        // see a full symmetric 9-point window. An odd window over alternating
+        // ±delta values has a worst-case 5:4 split, so the mean deviates from
+        // 0.5 by at most delta/9 = 0.15/9 ≈ 0.0167. The key property is that
+        // this is much tighter than the raw instantaneous deviation of ±0.15.
+        // Allow ±0.02 (slightly above the theoretical max) for fp rounding.
+        for (i, tp) in tp_list.iter().enumerate() {
+            if i >= 4 && i <= 7 {
+                assert!(
+                    (tp.band_center_y - 0.5).abs() < 0.02,
+                    "interior point {i}: band_center_y expected ~0.5, got {}",
+                    tp.band_center_y
+                );
+            }
+        }
+    }
+
+    /// A point with zero vibrato DEPTH must yield `band_half_height = 0`.
+    /// (Band height is pure depth; strength is not a factor.)
+    #[test]
+    fn band_half_height_zero_for_zero_depth_point() {
         let graph = SemanticGraph {
             time_window: Some(TimeWindow {
                 start_ms: 0,
                 end_ms: 100,
+                span_ms: 100,
             }),
             pitch_window: Some(PitchWindow {
                 min: PitchLog2(8.0),
@@ -710,8 +822,8 @@ mod tests {
                     t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 0.9,
-                    vibrato_rate: 0.0, // off-band rate → strength = 0
-                    vibrato_depth: 0.0,
+                    vibrato_rate: 0.0,
+                    vibrato_depth: 0.0, // zero depth → zero height
                 }],
             }],
             grooves: vec![],
@@ -720,6 +832,42 @@ mod tests {
         };
         let scene = project_scene(&graph);
         let hh = scene.pitch_segments[0].points[0].band_half_height;
-        assert_eq!(hh, 0.0, "non-vibrato point must have zero band_half_height");
+        assert_eq!(hh, 0.0, "zero-depth point must have zero band_half_height");
+    }
+
+    /// A point with nonzero depth but zero vibrato strength (off-band rate)
+    /// must yield a NONZERO `band_half_height` — proving strength no longer
+    /// gates height.
+    #[test]
+    fn band_half_height_nonzero_when_depth_nonzero_but_strength_zero() {
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: 0,
+                end_ms: 100,
+                span_ms: 100,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(8.0),
+                max: PitchLog2(10.0),
+            }),
+            trace_segments: vec![TraceSegment {
+                points: vec![TracePoint {
+                    t_ms: 50,
+                    pitch: PitchLog2(9.0),
+                    confidence: 0.9,
+                    vibrato_rate: 0.0,    // off-band rate → strength = 0
+                    vibrato_depth: 120.0, // 120 cents → raw_hh = 0.05
+                }],
+            }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+        let scene = project_scene(&graph);
+        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        assert!(
+            (hh - 0.05).abs() < 1e-4,
+            "depth-driven height must be nonzero even when strength=0, got {hh}"
+        );
     }
 }

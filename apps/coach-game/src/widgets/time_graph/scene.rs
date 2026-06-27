@@ -57,6 +57,13 @@ pub struct NormalizedTracePoint {
     /// the model spent those in [`super::model`]. Mirrors `vibrato_strength`'s
     /// music-blind contract.
     pub band_half_height: f32,
+    /// Smoothed mean normalized pitch the vibrato band is centered on.
+    /// The band's top rail = `band_center_y + band_half_height`,
+    /// bottom rail = `band_center_y - band_half_height`. Music-blind:
+    /// the model has already spent Hz and cents. Uses a wider smoothing
+    /// window than `band_half_height` so one full vibrato cycle is
+    /// averaged out and the rails stay steady.
+    pub band_center_y: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

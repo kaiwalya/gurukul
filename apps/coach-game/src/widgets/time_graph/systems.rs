@@ -35,8 +35,16 @@ const TRACE_MAX_ALPHA: f32 = 0.95;
 /// enough to not compete with the trace or groove lines while still being
 /// legible against the dark lane background.
 const COLOR_BAND: Color = Color::srgba(0.55, 0.65, 0.82, 1.0);
-/// Maximum alpha for the vibrato band at full vibrato strength.
-const BAND_MAX_ALPHA: f32 = 0.22;
+/// Maximum alpha for the vibrato band at full vibrato strength. A highlighter
+/// reads as a solid stroke, so this is intentionally opaque enough to be
+/// clearly visible while still letting the trace shine through.
+const BAND_MAX_ALPHA: f32 = 0.32;
+/// How far the band rails sit beyond the raw vibrato swing. The band reads
+/// like a text-selection highlighter: a solid ribbon the wiggling trace sits
+/// *inside*, with rails clear of the wiggle peaks rather than pinched onto
+/// them. `1.0` would place the rails right at the swing extremes; `1.5` lifts
+/// them ~50% past, so the trace is comfortably enveloped.
+const BAND_HEIGHT_OVERSHOOT: f32 = 1.5;
 
 #[derive(Component)]
 pub struct TimeGraphRoot;
@@ -739,10 +747,17 @@ pub fn apply_mesh_band(
         let n = segment.points.len();
         let seg_base = (positions.len() / 2) as u32;
         for tp in segment.points.iter() {
-            let local = normalized_to_lane(tp.point, size);
+            let center_point = NormalizedPoint {
+                x: tp.point.x,
+                y: tp.band_center_y,
+            };
+            let local = normalized_to_lane(center_point, size);
             let world_center = lane_world.lane_local_to_world(local);
-            let hh_world = tp.band_half_height * lane_height;
-            let alpha = (tp.vibrato_strength * BAND_MAX_ALPHA).clamp(0.0, 1.0);
+            let hh_world = tp.band_half_height * BAND_HEIGHT_OVERSHOOT * lane_height;
+            // Opacity = confidence: the band fades out when pitch detection is
+            // uncertain. Rate is visible in the trace wiggle; depth sets the
+            // band height. Three independent channels, no redundancy.
+            let alpha = (tp.confidence * BAND_MAX_ALPHA).clamp(0.0, 1.0);
             let c = [lin_band.red, lin_band.green, lin_band.blue, alpha];
 
             positions.push([world_center.x, world_center.y + hh_world, 0.15]);

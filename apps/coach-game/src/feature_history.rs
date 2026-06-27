@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 /// Retention is also the graph's visible time width: everything held here
 /// is drawn, so `semantic_graph` fits the pitch window to all of it.
-pub const DEFAULT_HISTORY_MS: u64 = 6_000;
+pub const DEFAULT_HISTORY_MS: u64 = 20_000;
 pub const DEFAULT_HISTORY_CAPACITY: usize = 4_096;
 
 #[derive(Debug)]
@@ -67,6 +67,11 @@ impl FeatureHistory {
     pub fn time_bounds(&self) -> Option<(u64, u64)> {
         let newest = self.max_seen_t_ms?;
         Some((newest.saturating_sub(self.window_ms), newest))
+    }
+
+    /// The fixed retention/display width in milliseconds.
+    pub fn window_ms(&self) -> u64 {
+        self.window_ms
     }
 
     fn evict(&mut self) {
