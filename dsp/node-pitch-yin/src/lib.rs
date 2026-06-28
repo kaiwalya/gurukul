@@ -225,6 +225,20 @@ fn parabolic_interp(dprime: &[f64], tau: usize, tau_min: usize, tau_max: usize) 
 }
 
 impl Node for PitchYin {
+    fn declare_latency(&self) -> usize {
+        // Two additive terms:
+        //   window / 2   — the estimate describes the MIDDLE of the analysis window;
+        //                  the ring holds exactly `window` samples, and the YIN
+        //                  difference function is symmetric around the centre sample.
+        //   hop / 2      — zero-order-hold lag: an estimate is on average half a hop
+        //                  older than the window centre it was computed at, because
+        //                  analysis fires every `hop` samples and the output is held
+        //                  until the next analysis.
+        //
+        // With coach defaults (window = 2048, hop = 512): 1024 + 256 = 1280 frames.
+        self.window / 2 + self.hop / 2
+    }
+
     fn prepare(&mut self, _id: &str, sample_rate: u32, block_size: usize) {
         let window = self.window;
         let hop = self.hop;
@@ -437,6 +451,13 @@ mod tests {
             last_f0 = out_buf[nframes - 1];
         }
         last_f0
+    }
+
+    #[test]
+    fn declare_latency_equals_window_half_plus_hop_half() {
+        // Coach defaults: window=2048, hop=512 → 1024 + 256 = 1280 frames.
+        let node = PitchYin::new(2048, 512, 50.0, 2000.0, 0.1);
+        assert_eq!(node.declare_latency(), 1280);
     }
 
     #[test]

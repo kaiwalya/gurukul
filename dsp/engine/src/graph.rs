@@ -140,6 +140,9 @@ pub struct Engine {
     nodes: Vec<(String, Box<dyn Node>)>,
     // (src_node_idx, src_port_idx, dst_node_idx, dst_port_idx) — node-to-node only.
     connections: Vec<(usize, usize, usize, usize)>,
+    // Transitive latency (own + max upstream) for each node, in node-index order.
+    // Computed once in topo order during build(); queried by out_port_latency().
+    node_latency_cache: Vec<usize>,
     block_size: usize,
     sample_rate: u32,
     // Per-node per-output-port buffers, allocated once.
@@ -504,6 +507,7 @@ impl Engine {
             out_port_sources.push((src_idx, src_port_idx));
         }
 
+        let n_nodes = nodes.len();
         let mut engine = Engine {
             node_index,
             topo_order_idx,
@@ -525,6 +529,7 @@ impl Engine {
             in_port_destinations,
             out_port_sources,
             last_n_frames: 0,
+            node_latency_cache: vec![0usize; n_nodes],
         };
 
         // Call prepare on every node.
@@ -535,6 +540,25 @@ impl Engine {
                 .prepare(&id, engine.sample_rate, engine.block_size);
         }
 
+        // Compute transitive latency in topo order (producers before consumers).
+        // Each node's transitive latency = own declare_latency() + max over its
+        // input producers' transitive latencies. Multiple inputs → max (not sum),
+        // because the node fires when its slowest input is ready; summing parallel
+        // paths would double-count shared ancestors on diamond topologies.
+        // topo_order_idx is guaranteed cycle-free by the topo_sort above.
+        let topo_idx_snapshot = engine.topo_order_idx.clone();
+        for &node_idx in &topo_idx_snapshot {
+            let own = engine.nodes[node_idx].1.declare_latency();
+            let upstream_max = engine
+                .connections
+                .iter()
+                .filter(|&&(_, _, dst, _)| dst == node_idx)
+                .map(|&(src, _, _, _)| engine.node_latency_cache[src])
+                .max()
+                .unwrap_or(0);
+            engine.node_latency_cache[node_idx] = own + upstream_max;
+        }
+
         Ok(engine)
     }
 
@@ -542,9 +566,14 @@ impl Engine {
     // Build-time resolution (NOT realtime-safe; string lookups allowed)
     // -------------------------------------------------------------------------
 
-    /// Inherent latency (in frames) of the node that feeds boundary out-port `h`.
+    /// Transitive latency (in frames) of the signal path that feeds boundary out-port `h`.
     ///
-    /// Boot-time lookup — walks `out_port_sources[h] → node → declare_latency()`.
+    /// Returns the producing node's own `declare_latency()` PLUS the maximum transitive
+    /// latency over all its upstream producers (recursively). Multiple input edges use
+    /// `max`, not sum — a node fires when its slowest input is ready, so parallel paths
+    /// are not additive. The result is pre-computed in topo order during `Engine::build`
+    /// and is O(1) here.
+    ///
     /// NOT realtime-safe; call once after `Engine::build`, never in `process_block`.
     pub fn out_port_latency(&self, h: OutPortHandle) -> usize {
         let idx = h.0 as usize;
@@ -553,7 +582,7 @@ impl Engine {
             "OutPortHandle out of range"
         );
         let (node_idx, _) = self.out_port_sources[idx];
-        self.nodes[node_idx].1.declare_latency()
+        self.node_latency_cache[node_idx]
     }
 
     /// Resolve a boundary input port id to an `InPortHandle`.
@@ -1060,6 +1089,215 @@ mod tests {
         let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
         let h = engine.resolve_out_port("y").unwrap();
         assert_eq!(engine.out_port_latency(h), 0);
+    }
+
+    // --- Transitive (multi-hop) latency tests ---
+
+    /// Build a registry and world for a 2-node chain: A (latency LA) → B (latency LB),
+    /// B's output wired to boundary out-port "y". B has one input port ("in") and one
+    /// output port ("sig").
+    fn make_chain_world(la: usize, lb: usize) -> (crate::world::World, NodeRegistry) {
+        use crate::node::PortSpec;
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+        // Producer node A: no inputs, one output "sig".
+        let la_cap = la;
+        registry.register_full(
+            "NodeA",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(move |_| Box::new(FixedLatencyNode { latency: la_cap }) as Box<dyn Node>),
+        );
+        // Consumer node B: one input "in", one output "sig".
+        let lb_cap = lb;
+        registry.register_full(
+            "NodeB",
+            vec![PortSpec {
+                name: "in",
+                ty: PortType::Feature,
+            }],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(move |_| Box::new(FixedLatencyNode { latency: lb_cap }) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![
+                NodeDef {
+                    id: "a".to_string(),
+                    ty: "NodeA".to_string(),
+                    params: Default::default(),
+                    name: None,
+                    description: None,
+                },
+                NodeDef {
+                    id: "b".to_string(),
+                    ty: "NodeB".to_string(),
+                    params: Default::default(),
+                    name: None,
+                    description: None,
+                },
+            ],
+            connections: vec![
+                Connection {
+                    from: "a.sig".to_string(),
+                    to: "b.in".to_string(),
+                },
+                Connection {
+                    from: "b.sig".to_string(),
+                    to: "y".to_string(),
+                },
+            ],
+        };
+        (world, registry)
+    }
+
+    #[test]
+    fn out_port_latency_two_hop_chain_is_additive() {
+        // A(100) → B(50) → out: transitive latency must be 150.
+        let (world, registry) = make_chain_world(100, 50);
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        let h = engine.resolve_out_port("y").unwrap();
+        assert_eq!(engine.out_port_latency(h), 150);
+    }
+
+    #[test]
+    fn out_port_latency_passthrough_zero_forwards_upstream() {
+        // A(38400) → B(0) → out: a zero-latency passthrough must forward A's latency.
+        let (world, registry) = make_chain_world(38400, 0);
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        let h = engine.resolve_out_port("y").unwrap();
+        assert_eq!(engine.out_port_latency(h), 38400);
+    }
+
+    /// Build a diamond world: two producers P1 (latency l1) and P2 (latency l2)
+    /// both feed into a consumer C (latency lc); C's output goes to boundary "y".
+    /// Expected transitive latency: max(l1, l2) + lc.
+    fn make_diamond_world(l1: usize, l2: usize, lc: usize) -> (crate::world::World, NodeRegistry) {
+        use crate::node::PortSpec;
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+
+        let l1_cap = l1;
+        registry.register_full(
+            "P1",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(move |_| Box::new(FixedLatencyNode { latency: l1_cap }) as Box<dyn Node>),
+        );
+
+        let l2_cap = l2;
+        registry.register_full(
+            "P2",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(move |_| Box::new(FixedLatencyNode { latency: l2_cap }) as Box<dyn Node>),
+        );
+
+        let lc_cap = lc;
+        registry.register_full(
+            "C",
+            vec![
+                PortSpec {
+                    name: "in1",
+                    ty: PortType::Feature,
+                },
+                PortSpec {
+                    name: "in2",
+                    ty: PortType::Feature,
+                },
+            ],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(move |_| Box::new(FixedLatencyNode { latency: lc_cap }) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![
+                NodeDef {
+                    id: "p1".to_string(),
+                    ty: "P1".to_string(),
+                    params: Default::default(),
+                    name: None,
+                    description: None,
+                },
+                NodeDef {
+                    id: "p2".to_string(),
+                    ty: "P2".to_string(),
+                    params: Default::default(),
+                    name: None,
+                    description: None,
+                },
+                NodeDef {
+                    id: "c".to_string(),
+                    ty: "C".to_string(),
+                    params: Default::default(),
+                    name: None,
+                    description: None,
+                },
+            ],
+            connections: vec![
+                Connection {
+                    from: "p1.sig".to_string(),
+                    to: "c.in1".to_string(),
+                },
+                Connection {
+                    from: "p2.sig".to_string(),
+                    to: "c.in2".to_string(),
+                },
+                Connection {
+                    from: "c.sig".to_string(),
+                    to: "y".to_string(),
+                },
+            ],
+        };
+        (world, registry)
+    }
+
+    #[test]
+    fn out_port_latency_diamond_takes_max_not_sum() {
+        // P1(200) and P2(100) both feed C(50) → out.
+        // Expected: max(200, 100) + 50 = 250, NOT (200+100+50=350).
+        let (world, registry) = make_diamond_world(200, 100, 50);
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        let h = engine.resolve_out_port("y").unwrap();
+        assert_eq!(engine.out_port_latency(h), 250);
     }
 
     #[test]

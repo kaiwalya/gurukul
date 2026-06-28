@@ -531,26 +531,34 @@ mod tests {
     }
 
     /// Verify the frames→ms rounding formula used by the worker.
-    /// At 48000 Hz, window/2 + hop/2 = 72000/2 + 600/2 = 36300 frames.
-    /// 36300/48000*1000 = 756.25 ms → rounds to 756.
-    /// Use a non-divisor: 36301 frames → 756.270... → rounds to 756.
+    ///
+    /// Transitive latency for the vibrato out-ports:
+    ///   PitchYin own:  window/2 + hop/2 = 2048/2 + 512/2  =   1280 frames
+    ///   Vibrato own:   window/2 + hop/2 = 72000/2 + 600/2  =  36300 frames
+    ///   Total (max-upstream + own):                           37580 frames
+    ///
+    /// 37580 / 48000 * 1000 = 782.916... ms → rounds to 783.
     #[test]
     fn vibrato_latency_frames_to_ms_rounds_correctly() {
         let sample_rate: u32 = 48000;
 
-        let lat_frames: usize = 36300;
+        // Transitive total: PitchYin(1280) + Vibrato(36300) = 37580 frames.
+        let lat_frames: usize = 37580;
         let lat_ms = (lat_frames as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms, 756, "36300 frames at 48kHz = 756ms (rounded)");
+        assert_eq!(
+            lat_ms, 783,
+            "37580 frames at 48kHz = 782.916ms → rounds to 783"
+        );
 
-        // Non-divisor: should round, not truncate.
-        let lat_frames_odd: usize = 36301;
+        // Non-divisor just below the 0.5 threshold: 37580 + 1 = 37581 → 782.937ms → 783.
+        let lat_frames_odd: usize = 37581;
         let lat_ms_odd = (lat_frames_odd as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms_odd, 756, "36301 frames → ~756.27ms → rounds to 756");
+        assert_eq!(lat_ms_odd, 783, "37581 frames → ~782.937ms → rounds to 783");
 
-        // Another non-divisor past the 0.5 threshold: 36324 frames → 756.75ms → rounds to 757.
-        let lat_frames_up: usize = 36324;
+        // Non-divisor past the 0.5 threshold: 37604 frames → 783.416ms → rounds to 783.
+        let lat_frames_up: usize = 37604;
         let lat_ms_up = (lat_frames_up as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms_up, 757, "36324 frames → 756.75ms → rounds up to 757");
+        assert_eq!(lat_ms_up, 783, "37604 frames → 783.416ms → rounds to 783");
     }
 
     #[test]
