@@ -621,19 +621,17 @@ pub fn apply_mesh_trace(
     let mut vertex_colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     for segment in &live.pitch_segments {
-        if segment.points.len() < 2 {
+        if segment.len() < 2 {
             continue;
         }
         let world_points: Vec<Vec2> = segment
-            .points
             .iter()
             .map(|tp| {
-                let local = normalized_to_lane(tp.point, size);
+                let local = normalized_to_lane(NormalizedPoint { x: tp.x, y: tp.y }, size);
                 lane_world.lane_local_to_world(local)
             })
             .collect();
         let colors: Vec<[f32; 4]> = segment
-            .points
             .iter()
             .map(|tp| {
                 let conf = tp.confidence.clamp(0.0, 1.0).powi(4);
@@ -740,28 +738,27 @@ pub fn apply_mesh_band(
 
     let lin_band = COLOR_BAND.to_linear();
 
-    for segment in &live.pitch_segments {
-        if segment.points.len() < 2 {
+    for segment in &live.band_segments {
+        if segment.len() < 2 {
             continue;
         }
-        let n = segment.points.len();
+        let n = segment.len();
         let seg_base = (positions.len() / 2) as u32;
-        for tp in segment.points.iter() {
-            // Use vibrato_x (back-dated by ~0.80s) so the band aligns with
-            // the pitch trace. Fall back to pitch x when vibrato_t_ms is
-            // outside the window (first ~0.80s of a session).
-            let band_x = tp.vibrato_x.unwrap_or(tp.point.x);
+        for bp in segment.iter() {
+            // bp.x is the final resolved band x (back-dated by ~0.80 s, or the
+            // pitch-x fallback for early session points). Fallback was resolved
+            // in project_band_segment; do not re-derive it here.
             let center_point = NormalizedPoint {
-                x: band_x,
-                y: tp.band_center_y,
+                x: bp.x,
+                y: bp.center_y,
             };
             let local = normalized_to_lane(center_point, size);
             let world_center = lane_world.lane_local_to_world(local);
-            let hh_world = tp.band_half_height * BAND_HEIGHT_OVERSHOOT * lane_height;
+            let hh_world = bp.half_height * BAND_HEIGHT_OVERSHOOT * lane_height;
             // Opacity = confidence: the band fades out when pitch detection is
             // uncertain. Rate is visible in the trace wiggle; depth sets the
             // band height. Three independent channels, no redundancy.
-            let alpha = (tp.confidence * BAND_MAX_ALPHA).clamp(0.0, 1.0);
+            let alpha = (bp.confidence * BAND_MAX_ALPHA).clamp(0.0, 1.0);
             let c = [lin_band.red, lin_band.green, lin_band.blue, alpha];
 
             positions.push([world_center.x, world_center.y + hh_world, 0.15]);

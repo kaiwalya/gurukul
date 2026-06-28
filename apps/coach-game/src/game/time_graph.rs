@@ -30,6 +30,7 @@ pub fn refresh_scene(
     });
     *live = TimeGraphLiveSceneRes {
         pitch_segments: next.pitch_segments,
+        band_segments: next.band_segments,
         onset_ticks: next.onset_ticks,
         breath_spans: next.breath_spans,
     };

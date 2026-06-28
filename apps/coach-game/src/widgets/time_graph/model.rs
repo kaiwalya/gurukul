@@ -11,7 +11,9 @@ use crate::semantic_graph::{
 use domain_ports::pitch::PitchLog2;
 
 // ---------------------------------------------------------------------------
-// Vibrato-strength thresholds — all decisions in domain units, here only.
+// Vibrato-strength thresholds — used by the vibrato_strength scalar function,
+// which is test-only (the render path expresses rate/depth/confidence as
+// independent visual channels and does not call vibrato_strength).
 // ---------------------------------------------------------------------------
 
 /// Depth below which we treat the pitch wobble as noise, not vibrato
@@ -19,25 +21,31 @@ use domain_ports::pitch::PitchLog2;
 /// which builds the contour as `1200 × log2(f)`). Typical sung vibrato is
 /// ~20–50 cents peak-to-peak (≈ 0.2–0.5 st), so a 20-cent floor gives margin
 /// against gentle ornamentation and pitch jitter.
+#[cfg(test)]
 const VIBRATO_DEPTH_FLOOR_CENTS: f32 = 20.0;
 
 /// Depth at which the gate reaches 1.0 (cents). A ramp from 20 to 50 covers the
 /// typical vibrato range; depth above 50 cents is unambiguously intentional
 /// vibrato.
+#[cfg(test)]
 const VIBRATO_DEPTH_FULL_CENTS: f32 = 50.0;
 
 /// Lower edge of the musical vibrato rate band (Hz). Below ~4 Hz the wobble
 /// is too slow to be perceived as vibrato (more like a slow wavering).
+#[cfg(test)]
 const VIBRATO_RATE_LOW_ZERO: f32 = 3.5;
 
 /// Rate at which the band reaches full weight on the low side (Hz).
+#[cfg(test)]
 const VIBRATO_RATE_LOW_FULL: f32 = 4.5;
 
 /// Rate at which the band begins fading on the high side (Hz). Classical
 /// vibrato rarely exceeds 7 Hz; anything faster starts to sound strained.
+#[cfg(test)]
 const VIBRATO_RATE_HIGH_FULL: f32 = 6.5;
 
 /// Rate at which the band fades to zero on the high side (Hz).
+#[cfg(test)]
 const VIBRATO_RATE_HIGH_ZERO: f32 = 7.5;
 
 /// Number of points in the symmetric moving-average window used to smooth the
@@ -55,8 +63,8 @@ const BAND_SMOOTH_WINDOW: usize = 5;
 const BAND_CENTER_SMOOTH_WINDOW: usize = 9;
 
 use super::scene::{
-    NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
-    NormalizedTracePoint, NormalizedTraceSegment, TimeGraphScene,
+    NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, PitchTracePoint,
+    TimeGraphScene, VibratoBandPoint,
 };
 
 pub fn project_scene(graph: &SemanticGraph) -> TimeGraphScene {
@@ -84,19 +92,26 @@ pub fn project_scene(graph: &SemanticGraph) -> TimeGraphScene {
                 .collect()
         })
         .unwrap_or_default();
-    let pitch_segments = graph
+    let (pitch_segments, band_segments) = graph
         .pitch_window
         .map(|pitch_window| {
-            graph
-                .trace_segments
-                .iter()
-                .filter_map(|segment| normalize_trace_segment(segment, time_window, pitch_window))
-                .collect()
+            let mut pitch_segs = Vec::new();
+            let mut band_segs = Vec::new();
+            for segment in &graph.trace_segments {
+                let survivors = filter_in_window(segment, time_window, pitch_window);
+                if survivors.is_empty() {
+                    continue;
+                }
+                pitch_segs.push(project_pitch_segment(&survivors));
+                band_segs.push(project_band_segment(&survivors, pitch_window));
+            }
+            (pitch_segs, band_segs)
         })
         .unwrap_or_default();
 
     TimeGraphScene {
         pitch_segments,
+        band_segments,
         grooves,
         onset_ticks,
         breath_spans,
@@ -161,55 +176,96 @@ fn sample_center_at_x(xs: &[f32], values: &[f32], query_x: f32) -> f32 {
     values[lo] + t * (values[hi] - values[lo])
 }
 
-fn normalize_trace_segment(
+/// A raw trace point that survived both the time and pitch window filters.
+/// Carries the original point data plus its pre-computed normalized coordinates.
+/// The shared post-filter list is the single source of truth for both
+/// `project_pitch_segment` and `project_band_segment` — they must consume the
+/// same `Vec<SurvivingPoint>` so their index spaces cannot drift.
+struct SurvivingPoint {
+    /// Normalized x in `[0, 1]` (time).
+    nx: f32,
+    /// Normalized y in `[0, 1]` (pitch).
+    ny: f32,
+    /// Normalized x for the back-dated vibrato band position, or `None` when
+    /// `vibrato_t_ms` falls outside the visible window.
+    vibrato_nx: Option<f32>,
+    /// Raw (unsmoothed) band half-height in normalized-y units.
+    raw_half_height: f32,
+    /// Pitch detection confidence, passed through to both series.
+    confidence: f32,
+}
+
+/// Build the shared post-filter point list: points that survive both the time
+/// window and pitch window filters. Both projections consume this list so their
+/// index spaces are identical — independent re-filtering would cause the band's
+/// back-date interpolation to sample the wrong pitch when leading points are
+/// dropped.
+fn filter_in_window(
     segment: &TraceSegment,
     time_window: TimeWindow,
     pitch_window: PitchWindow,
-) -> Option<NormalizedTraceSegment> {
+) -> Vec<SurvivingPoint> {
     let octave_span = pitch_window.max.0 - pitch_window.min.0;
-
-    // Build parallel lists of raw (unsmoothed) band half-heights and raw
-    // normalized-y values alongside the partial points.
-    let mut raw_half_heights: Vec<f32> = Vec::with_capacity(segment.points.len());
-    let mut raw_ys: Vec<f32> = Vec::with_capacity(segment.points.len());
-    let points = segment
+    segment
         .points
         .iter()
         .filter_map(|point| {
-            let strength =
-                vibrato_strength(point.vibrato_rate, point.vibrato_depth, point.confidence);
+            let nx = normalize_time(point.t_ms, time_window)?;
+            let ny = normalize_pitch(point.pitch, pitch_window)?;
             // Half-height = pure normalized depth: the band rails wrap the actual
             // peak-to-peak swing of the trace. Rate is already visible in the
-            // wiggle itself; confidence drives opacity (see `apply_mesh_band`).
-            // Strength is NOT applied here — it would double-count information
-            // already expressed through the other two visual channels.
-            let raw_hh = if octave_span > 0.0 {
+            // wiggle itself; confidence drives opacity. Strength is NOT applied
+            // here — it would double-count information already expressed through
+            // the other visual channels.
+            let raw_half_height = if octave_span > 0.0 {
                 (point.vibrato_depth / 1200.0) / octave_span
             } else {
                 0.0
             };
-            let nx = normalize_time(point.t_ms, time_window)?;
-            let ny = normalize_pitch(point.pitch, pitch_window)?;
             // Vibrato band x uses the back-dated timestamp so the band slides
             // forward ~0.80s to align with the pitch trace. `None` when the
             // vibrato timestamp falls outside the window (band point hidden).
-            let vibrato_x = normalize_time(point.vibrato_t_ms, time_window);
-            raw_half_heights.push(raw_hh);
-            raw_ys.push(ny);
-            Some(NormalizedTracePoint {
-                point: NormalizedPoint { x: nx, y: ny },
+            let vibrato_nx = normalize_time(point.vibrato_t_ms, time_window);
+            Some(SurvivingPoint {
+                nx,
+                ny,
+                vibrato_nx,
+                raw_half_height,
                 confidence: point.confidence,
-                vibrato_strength: strength,
-                band_half_height: 0.0, // filled in below after smoothing
-                band_center_y: 0.0,    // filled in below after smoothing
-                vibrato_x,
             })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    if points.is_empty() {
-        return None;
-    }
+/// Project the shared filtered point list into the pitch-trace series.
+/// Pure mapping: no smoothing, no band logic.
+fn project_pitch_segment(survivors: &[SurvivingPoint]) -> Vec<PitchTracePoint> {
+    survivors
+        .iter()
+        .map(|sp| PitchTracePoint {
+            x: sp.nx,
+            y: sp.ny,
+            confidence: sp.confidence,
+        })
+        .collect()
+}
+
+/// Project the shared filtered point list into the vibrato-band series.
+/// Owns the band transform: smoothing, back-date interpolation, x-fallback.
+/// Series-in / series-out because back-date interpolation is a whole-series
+/// transform (it samples `smoothed_center` at an arbitrary `vibrato_x`).
+///
+/// Correction #5: the x-fallback (`vibrato_nx.unwrap_or(nx)`) is resolved
+/// HERE so `VibratoBandPoint.x` is final. The render system reads a plain
+/// `x` — it must not re-derive the fallback.
+fn project_band_segment(
+    survivors: &[SurvivingPoint],
+    pitch_window: PitchWindow,
+) -> Vec<VibratoBandPoint> {
+    let _ = pitch_window; // octave_span already spent in filter_in_window
+
+    let raw_half_heights: Vec<f32> = survivors.iter().map(|sp| sp.raw_half_height).collect();
+    let raw_ys: Vec<f32> = survivors.iter().map(|sp| sp.ny).collect();
 
     // Smooth the raw half-heights with the narrower window (kills single-hop
     // spikes while tracking real depth changes quickly).
@@ -218,33 +274,34 @@ fn normalize_trace_segment(
     // is averaged out and the ribbon's centre rails stay steady.
     let smoothed_center = smooth(&raw_ys, BAND_CENTER_SMOOTH_WINDOW);
 
-    // Build a parallel list of the point.x values (monotonic, [0,1]) so we
-    // can map each point's vibrato_x back to a fractional index into
-    // smoothed_center.  This is the "x-axis" for the interpolation helper.
-    let point_xs: Vec<f32> = points.iter().map(|tp| tp.point.x).collect();
+    // The x-axis for interpolation: the survivors' own nx values (monotonic).
+    let point_xs: Vec<f32> = survivors.iter().map(|sp| sp.nx).collect();
 
-    let points = points
-        .into_iter()
+    survivors
+        .iter()
         .zip(smoothed_hh)
         .enumerate()
-        .map(|(i, (mut tp, hh))| {
-            tp.band_half_height = hh;
-            // The band's x uses vibrato_x (back-dated ~0.80 s) so it sits under
-            // the pitch trace. The center-y must match: sample smoothed_center at
-            // the same back-dated position, not at the point's own time.
-            tp.band_center_y = match tp.vibrato_x {
-                Some(vx) => sample_center_at_x(&point_xs, &smoothed_center, vx),
-                // vibrato_x is None only when vibrato_t_ms falls before the
-                // window start (first ~0.80 s of a session). In that case
-                // apply_mesh_band also falls back to point.x, so keep the
-                // un-shifted smoothed center for consistency.
-                None => smoothed_center[i],
+        .map(|(i, (sp, hh))| {
+            // The band's x uses vibrato_nx (back-dated ~0.80 s) so it sits
+            // under the pitch trace. The center-y must match: sample
+            // smoothed_center at the same back-dated position, not at the
+            // point's own time. Correction #5: resolve the fallback here so
+            // VibratoBandPoint carries a final, resolved x.
+            let (x, center_y) = match sp.vibrato_nx {
+                Some(vx) => (vx, sample_center_at_x(&point_xs, &smoothed_center, vx)),
+                // vibrato_nx is None only when vibrato_t_ms falls before the
+                // window start (first ~0.80 s of a session). Fall back to the
+                // point's own x and the un-shifted smoothed center.
+                None => (sp.nx, smoothed_center[i]),
             };
-            tp
+            VibratoBandPoint {
+                x,
+                center_y,
+                half_height: hh,
+                confidence: sp.confidence,
+            }
         })
-        .collect();
-
-    Some(NormalizedTraceSegment { points })
+        .collect()
 }
 
 fn normalize_groove(groove: GrooveLine, pitch_window: PitchWindow) -> Option<NormalizedGrooveLine> {
@@ -332,6 +389,11 @@ fn normalize_pitch(pitch: PitchLog2, window: PitchWindow) -> Option<f32> {
 /// Non-finite inputs (NaN / ±inf) are treated as 0 so strength is always a
 /// clean [0, 1] value. Intentionally instantaneous — no temporal windowing
 /// (that would be Stage-2 interpretation, explicitly deferred).
+///
+/// Not used by production projection code (the render path expresses strength
+/// via the three visual channels independently); kept for the scalar unit tests
+/// that guard the gate and rate-band math.
+#[cfg(test)]
 fn vibrato_strength(rate_hz: f32, depth_cents: f32, confidence: f32) -> f32 {
     let depth_gate = ((depth_cents - VIBRATO_DEPTH_FLOOR_CENTS)
         / (VIBRATO_DEPTH_FULL_CENTS - VIBRATO_DEPTH_FLOOR_CENTS))
@@ -434,7 +496,7 @@ mod tests {
         assert_eq!(scene.grooves.len(), 1);
         assert_eq!(scene.onset_ticks.len(), 1);
         assert_eq!(scene.breath_spans.len(), 1);
-        let point = scene.pitch_segments[0].points[1].point;
+        let point = &scene.pitch_segments[0][1];
         assert!((point.x - 0.5).abs() < 1e-5);
         assert!((point.y - 0.5).abs() < 1e-5);
         assert!((scene.grooves[0].y - 0.5).abs() < 1e-5);
@@ -531,11 +593,7 @@ mod tests {
             1,
             "segment survives via its in-window tail"
         );
-        let xs: Vec<f32> = scene.pitch_segments[0]
-            .points
-            .iter()
-            .map(|p| p.point.x)
-            .collect();
+        let xs: Vec<f32> = scene.pitch_segments[0].iter().map(|p| p.x).collect();
         assert_eq!(xs.len(), 2, "only the two in-window points survive");
         assert!((xs[0] - 0.5).abs() < 1e-5, "150ms → 0.5, got {}", xs[0]);
         assert!((xs[1] - 1.0).abs() < 1e-5, "200ms → 1.0, got {}", xs[1]);
@@ -793,7 +851,7 @@ mod tests {
             breath_spans: vec![],
         };
         let scene = project_scene(&graph);
-        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        let hh = scene.band_segments[0][0].half_height;
         assert!((hh - 0.05).abs() < 1e-4, "expected 0.05, got {hh}");
     }
 
@@ -850,7 +908,7 @@ mod tests {
         };
 
         let scene = project_scene(&graph);
-        let tp_list = &scene.pitch_segments[0].points;
+        let bp_list = &scene.band_segments[0];
 
         // The window is 9 points (odd). With 12 input points, indices 4..=7
         // see a full symmetric 9-point window. An odd window over alternating
@@ -858,12 +916,12 @@ mod tests {
         // 0.5 by at most delta/9 = 0.15/9 ≈ 0.0167. The key property is that
         // this is much tighter than the raw instantaneous deviation of ±0.15.
         // Allow ±0.02 (slightly above the theoretical max) for fp rounding.
-        for (i, tp) in tp_list.iter().enumerate() {
+        for (i, bp) in bp_list.iter().enumerate() {
             if i >= 4 && i <= 7 {
                 assert!(
-                    (tp.band_center_y - 0.5).abs() < 0.02,
-                    "interior point {i}: band_center_y expected ~0.5, got {}",
-                    tp.band_center_y
+                    (bp.center_y - 0.5).abs() < 0.02,
+                    "interior point {i}: center_y expected ~0.5, got {}",
+                    bp.center_y
                 );
             }
         }
@@ -898,7 +956,7 @@ mod tests {
             breath_spans: vec![],
         };
         let scene = project_scene(&graph);
-        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        let hh = scene.band_segments[0][0].half_height;
         assert_eq!(hh, 0.0, "zero-depth point must have zero band_half_height");
     }
 
@@ -932,7 +990,7 @@ mod tests {
             breath_spans: vec![],
         };
         let scene = project_scene(&graph);
-        let hh = scene.pitch_segments[0].points[0].band_half_height;
+        let hh = scene.band_segments[0][0].half_height;
         assert!(
             (hh - 0.05).abs() < 1e-4,
             "depth-driven height must be nonzero even when strength=0, got {hh}"
@@ -1008,25 +1066,25 @@ mod tests {
         };
 
         let scene = project_scene(&graph);
-        let tp_list = &scene.pitch_segments[0].points;
+        let pitch_list = &scene.pitch_segments[0];
+        let band_list = &scene.band_segments[0];
 
-        // Check interior points that have valid vibrato_x AND are far enough
-        // from the window edges that the back-dated sample is well-interior.
-        // Points i=10..=14 have vibrato_t_ms well within the window (>=5 hops
-        // in, far from both edges), so vibrato_x is Some and the interpolation
-        // returns the pitch from 5 hops ago.
+        // Check interior points that have a non-fallback band x AND are far
+        // enough from the window edges that the back-dated sample is well-
+        // interior. Points i=10..=14 have vibrato_t_ms well within the window
+        // (>=5 hops in, far from both edges), so band.x differs from pitch.x
+        // and the interpolation returns the pitch from 5 hops ago.
         let expected_shift = slope_per_hop as f32 * back_date_hops as f32;
         for i in 10..=14 {
-            let tp = &tp_list[i];
-            let current_y = tp.point.y;
-            let center = tp.band_center_y;
+            let current_y = pitch_list[i].y;
+            let center = band_list[i].center_y;
             // On a rising ramp, the back-dated center must be clearly below the
             // current point.y. The expected shift is ~0.158; allow generous
             // tolerance (0.10) for smoothing edge effects.
             assert!(
                 center < current_y - 0.10,
-                "point {i}: band_center_y={center:.4} should be at least 0.10 below \
-                 point.y={current_y:.4} (expected shift ~{expected_shift:.3})"
+                "point {i}: center_y={center:.4} should be at least 0.10 below \
+                 pitch y={current_y:.4} (expected shift ~{expected_shift:.3})"
             );
         }
     }
@@ -1102,34 +1160,51 @@ mod tests {
         };
 
         let scene = project_scene(&graph);
-        let tp_list = &scene.pitch_segments[0].points;
-        assert!(tp_list.len() >= 8, "expected the in-window survivors only");
+        let pitch_list = &scene.pitch_segments[0];
+        let band_list = &scene.band_segments[0];
+        assert!(
+            pitch_list.len() >= 8,
+            "expected the in-window survivors only"
+        );
+        assert_eq!(
+            pitch_list.len(),
+            band_list.len(),
+            "pitch and band must have the same number of survivors"
+        );
 
         // The no-drift invariant, stated WITHOUT assuming anything about the
         // dropped leading points: the band centre must equal the *survivors'*
         // own trace curve sampled at the band's back-dated x. We rebuild the
-        // survivors' (x, y) curve from the projected points themselves and
+        // survivors' (x, y) curve from the projected pitch points themselves and
         // re-derive what the centre SHOULD be — if the band had instead indexed
         // against an un-filtered list, its centre would land on a different
         // pitch and this equality breaks.
-        let surv_xs: Vec<f32> = tp_list.iter().map(|tp| tp.point.x).collect();
-        let surv_ys: Vec<f32> = tp_list.iter().map(|tp| tp.point.y).collect();
+        let surv_xs: Vec<f32> = pitch_list.iter().map(|tp| tp.x).collect();
+        let surv_ys: Vec<f32> = pitch_list.iter().map(|tp| tp.y).collect();
         // Smooth the survivors' y the same way the band centre is smoothed, so
         // we compare like with like (the centre is a smoothed sample).
         let surv_smoothed = smooth(&surv_ys, BAND_CENTER_SMOOTH_WINDOW);
 
+        // A back-dated band point has band.x != pitch.x for the same index.
+        // We detect "non-fallback" points by checking whether band.x differs
+        // from the pitch's own x (a fallback point would have the same x).
         let mut checked = 0;
-        for tp in tp_list.iter() {
-            let Some(vx) = tp.vibrato_x else { continue };
+        for (i, (tp, bp)) in pitch_list.iter().zip(band_list.iter()).enumerate() {
+            // Skip points where vibrato_x was None (fallback: band.x == pitch.x).
+            // These are early-session points where back-dating overshot the start.
+            if (bp.x - tp.x).abs() < 1e-6 && i < back_date_hops {
+                continue;
+            }
+            let vx = bp.x;
             // Expected centre = the survivors' own smoothed curve sampled at the
             // band's back-dated x. Same helper the model uses internally.
             let expected = sample_center_at_x(&surv_xs, &surv_smoothed, vx);
             assert!(
-                (tp.band_center_y - expected).abs() < 1e-4,
+                (bp.center_y - expected).abs() < 1e-4,
                 "band centre {:.5} must equal the survivors' curve sampled at \
-                 vibrato_x={vx:.4} (={expected:.5}); a mismatch means the band \
+                 band.x={vx:.4} (={expected:.5}); a mismatch means the band \
                  indexed a different (un-shared) point list — drift.",
-                tp.band_center_y
+                bp.center_y
             );
             checked += 1;
         }
@@ -1138,13 +1213,14 @@ mod tests {
         // And the behavioural sanity: on a RISING ramp the back-dated centre is
         // never ABOVE the point's own y (it samples older = lower pitch), except
         // within float tolerance at the clamped left edge.
-        for tp in tp_list.iter() {
-            if tp.vibrato_x.is_some() {
+        for (tp, bp) in pitch_list.iter().zip(band_list.iter()) {
+            // Only check points where back-dating actually moved the x left.
+            if (bp.x - tp.x).abs() > 1e-6 {
                 assert!(
-                    tp.band_center_y <= tp.point.y + 1e-4,
+                    bp.center_y <= tp.y + 1e-4,
                     "rising ramp: centre {:.4} must not sit above trace y {:.4}",
-                    tp.band_center_y,
-                    tp.point.y
+                    bp.center_y,
+                    tp.y
                 );
             }
         }

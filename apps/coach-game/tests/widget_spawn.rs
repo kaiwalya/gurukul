@@ -257,6 +257,7 @@ fn one_groove() -> TimeGraphGridSceneRes {
 fn one_onset() -> TimeGraphLiveSceneRes {
     TimeGraphLiveSceneRes {
         pitch_segments: vec![],
+        band_segments: vec![],
         onset_ticks: vec![NormalizedOnsetTick {
             x: 0.25,
             strength: 0.9,

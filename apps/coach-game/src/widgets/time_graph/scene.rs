@@ -44,37 +44,27 @@ pub struct NormalizedPoint {
     pub y: f32,
 }
 
+/// A single projected pitch-trace point. Music-blind: x/y are already
+/// normalized to `[0, 1]`; the model has spent Hz and milliseconds.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NormalizedTracePoint {
-    pub point: NormalizedPoint,
+pub struct PitchTracePoint {
+    pub x: f32,
+    pub y: f32,
     pub confidence: f32,
-    /// Dimensionless [0, 1] scalar computed by the model layer. Combines
-    /// depth gate, rate band, and confidence into a single tint signal.
-    /// Music-blind: no Hz or cents here — the model has already spent those.
-    pub vibrato_strength: f32,
-    /// Smoothed vibrato-depth projected into normalized-y half-height units.
-    /// `0.0` when no vibrato is present. Music-blind: no cents or Hz here —
-    /// the model spent those in [`super::model`]. Mirrors `vibrato_strength`'s
-    /// music-blind contract.
-    pub band_half_height: f32,
-    /// Smoothed mean normalized pitch the vibrato band is centered on.
-    /// The band's top rail = `band_center_y + band_half_height`,
-    /// bottom rail = `band_center_y - band_half_height`. Music-blind:
-    /// the model has already spent Hz and cents. Uses a wider smoothing
-    /// window than `band_half_height` so one full vibrato cycle is
-    /// averaged out and the rails stay steady.
-    pub band_center_y: f32,
-    /// Normalized x position for the vibrato band, derived from the back-dated
-    /// `vibrato_t_ms` rather than `t_ms`. The vibrato analyzer's group delay
-    /// (~0.80 s) is subtracted so the band slides forward to align with the
-    /// pitch trace it envelopes. `None` when `vibrato_t_ms` falls outside the
-    /// visible time window (band point is hidden for that column).
-    pub vibrato_x: Option<f32>,
 }
 
+/// A single projected vibrato-band point. Music-blind: all coordinates are
+/// already normalized to `[0, 1]`; fallbacks are resolved by the model.
+/// - `x`: final resolved x (back-dated vibrato_t_ms or pitch x fallback).
+/// - `center_y`: smoothed mean pitch the band is centered on, sampled at `x`.
+/// - `half_height`: smoothed vibrato depth in normalized-y units.
+/// - `confidence`: drives band opacity (alpha = confidence × BAND_MAX_ALPHA).
 #[derive(Debug, Clone, PartialEq)]
-pub struct NormalizedTraceSegment {
-    pub points: Vec<NormalizedTracePoint>,
+pub struct VibratoBandPoint {
+    pub x: f32,
+    pub center_y: f32,
+    pub half_height: f32,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,7 +89,8 @@ pub struct NormalizedBreathSpan {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeGraphScene {
-    pub pitch_segments: Vec<NormalizedTraceSegment>,
+    pub pitch_segments: Vec<Vec<PitchTracePoint>>,
+    pub band_segments: Vec<Vec<VibratoBandPoint>>,
     pub grooves: Vec<NormalizedGrooveLine>,
     pub onset_ticks: Vec<NormalizedOnsetTick>,
     pub breath_spans: Vec<NormalizedBreathSpan>,
@@ -124,12 +115,15 @@ pub struct TimeGraphGridSceneRes {
     pub grooves: Vec<NormalizedGrooveLine>,
 }
 
-/// Fast-cadence scene: the pitch trace plus the time-anchored event markers
-/// (onset ticks, breath spans). All three are normalized against the rolling
-/// time window, so they scroll — and repaint — every frame.
+/// Fast-cadence scene: the pitch trace, vibrato band, and time-anchored event
+/// markers (onset ticks, breath spans). All scroll with the rolling time window
+/// and repaint every frame. Pitch and band share the same cadence so they live
+/// in one resource (splitting by feature, not cadence, is what the doctrine
+/// forbids — see the scene-split comment above).
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
 pub struct TimeGraphLiveSceneRes {
-    pub pitch_segments: Vec<NormalizedTraceSegment>,
+    pub pitch_segments: Vec<Vec<PitchTracePoint>>,
+    pub band_segments: Vec<Vec<VibratoBandPoint>>,
     pub onset_ticks: Vec<NormalizedOnsetTick>,
     pub breath_spans: Vec<NormalizedBreathSpan>,
 }

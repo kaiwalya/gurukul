@@ -12,8 +12,8 @@ pub mod systems;
 pub use model::project_scene;
 pub use scene::{
     LogicalSize, NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, NormalizedPoint,
-    NormalizedTracePoint, NormalizedTraceSegment, TimeGraphGridSceneRes, TimeGraphLiveSceneRes,
-    TimeGraphPitchLanePhysRect, TimeGraphPitchLaneScale, TimeGraphPitchLaneSize, TimeGraphScene,
+    PitchTracePoint, TimeGraphGridSceneRes, TimeGraphLiveSceneRes, TimeGraphPitchLanePhysRect,
+    TimeGraphPitchLaneScale, TimeGraphPitchLaneSize, TimeGraphScene, VibratoBandPoint,
 };
 pub use systems::{
     spawn, BreathSpanMarker, GridlineLayer, GridlineMeshEntity, GrooveLineMarker, LaneBgMeshEntity,
