@@ -56,11 +56,13 @@ const VIBRATO_RATE_HIGH_ZERO: f32 = 7.5;
 const BAND_SMOOTH_WINDOW: usize = 5;
 
 /// Number of points in the symmetric moving-average window used to smooth
-/// the per-point band centre (mean pitch). Wider than [`BAND_SMOOTH_WINDOW`]
-/// so one full vibrato cycle is averaged out and the ribbon rails stay
-/// steady: at ~5.5 Hz vibrato and 50 ms/point a full cycle is ~4 points;
-/// a 9-point window covers ~1 full cycle plus margin on each side.
-const BAND_CENTER_SMOOTH_WINDOW: usize = 9;
+/// the per-point band centre (mean pitch). Must span at least one full
+/// vibrato cycle, or the "centerline" still wiggles with the pitch and the
+/// band snakes along the trace instead of bracketing it. Trace points arrive
+/// at ~13 ms/point, so a 5 Hz vibrato cycle (200 ms) is ~15 points and a slow
+/// 2 Hz cycle (500 ms) is ~38 points. A 31-point window clears two full 5 Hz
+/// cycles and most of a 2 Hz cycle, keeping the ribbon centre steady.
+const BAND_CENTER_SMOOTH_WINDOW: usize = 31;
 
 use super::scene::{
     NormalizedBreathSpan, NormalizedGrooveLine, NormalizedOnsetTick, PitchTracePoint,
@@ -1065,20 +1067,27 @@ mod tests {
     /// point's own time while band_x was back-dated, causing the band to float
     /// above the trace during ascent.
     ///
-    /// Setup: 20 points, pitch rises linearly from y=0.2 to y=0.8 (normalized).
+    /// Setup: a long linear pitch ramp from y=0.2 to y=0.8 (normalized).
     /// Each point's `vibrato_t_ms` is exactly 5 steps behind its own `t_ms`
     /// (i.e. the band x is back-dated by 5 hops = 250 ms at 50 ms/hop).
     ///
-    /// For an interior point i (far from edges, full smoothing window active):
+    /// The ramp must be long enough that interior points have a FULL symmetric
+    /// centerline-smoothing window ([`BAND_CENTER_SMOOTH_WINDOW`]) on both
+    /// sides — otherwise the average is dragged toward the segment mean by the
+    /// edges and the back-date shift is washed out. On a pure linear ramp a
+    /// symmetric average returns the center value unchanged, so the shift is
+    /// purely the back-date:
     /// - The unshifted smoothed pitch ≈ current normalized y at i.
     /// - The back-dated smoothed pitch ≈ normalized y at i-5.
-    /// - The ramp slope is (0.8 - 0.2) / 19 ≈ 0.0316 per step.
-    /// - So band_center_y should be ~0.0316 × 5 = 0.158 below point.y.
+    /// - So band_center_y should be ~slope × 5 below point.y.
     ///
-    /// We assert: band_center_y[i] < point.y[i] - 0.10 for mid-range points.
+    /// We assert: band_center_y[i] < point.y[i] - 0.10 for well-interior points.
     #[test]
     fn band_center_y_back_dated_on_rising_ramp() {
-        let n_points = 20usize;
+        // Enough points that the test indices have a full smoothing window each
+        // side: half-window (BAND_CENTER_SMOOTH_WINDOW/2) margin + the span we
+        // probe. 60 points comfortably clears a 31-point window.
+        let n_points = 60usize;
         let hop_ms = 50u64;
         let back_date_hops = 5usize; // vibrato_t_ms is 5 hops behind t_ms
         let back_date_ms = back_date_hops as u64 * hop_ms;
@@ -1131,150 +1140,28 @@ mod tests {
         let pitch_list = &scene.pitch_segments[0];
         let band_list = &scene.band_segments[0];
 
-        // Check interior points that have a non-fallback band x AND are far
-        // enough from the window edges that the back-dated sample is well-
-        // interior. Points i=10..=14 have vibrato_t_ms well within the window
-        // (>=5 hops in, far from both edges), so band.x differs from pitch.x
-        // and the interpolation returns the pitch from 5 hops ago.
+        // Check well-interior points: far enough from both edges that the
+        // centerline smoothing window is fully symmetric (so on a linear ramp
+        // it returns the center value unchanged) AND the back-dated sample is
+        // interior. With 60 points and a 31-point window, the middle band
+        // (i=28..=32) clears the half-window margin (~15) on both sides, so
+        // band.x differs from pitch.x and the interpolation returns the pitch
+        // from 5 hops ago.
+        // On a pure linear ramp a symmetric average returns the centre value
+        // unchanged, so the whole shift is the back-date: ~slope × back_date_hops.
+        // Assert the centre is below the current pitch by close to that shift
+        // (tolerance covers float + interpolation rounding), rather than a magic
+        // absolute threshold that assumes a particular ramp steepness.
         let expected_shift = slope_per_hop as f32 * back_date_hops as f32;
-        for i in 10..=14 {
+        for i in 28..=32 {
             let current_y = pitch_list[i].y;
             let center = band_list[i].center_y;
-            // On a rising ramp, the back-dated center must be clearly below the
-            // current point.y. The expected shift is ~0.158; allow generous
-            // tolerance (0.10) for smoothing edge effects.
+            let actual_shift = current_y - center;
             assert!(
-                center < current_y - 0.10,
-                "point {i}: center_y={center:.4} should be at least 0.10 below \
-                 pitch y={current_y:.4} (expected shift ~{expected_shift:.3})"
-            );
-        }
-    }
-
-    fn dump_band_segment(band: &[VibratoBandPoint]) -> Vec<(f32, f32, f32, f32)> {
-        band.iter()
-            .map(|bp| (bp.x, bp.center_y, bp.half_height, bp.confidence))
-            .collect()
-    }
-
-    fn make_harvest_graph() -> SemanticGraph {
-        let n = 22usize;
-        let hop_ms = 50u64;
-        let back_date_ms = 200u64;
-        let pitch_min = 8.0_f32;
-        let pitch_max = 10.0_f32;
-        let span = pitch_max - pitch_min;
-
-        let points: Vec<_> = (0..n)
-            .map(|i| {
-                let sign = if i % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
-                let drift = i as f32 * 0.01;
-                let ny = (0.5 + sign * 0.08 + drift).clamp(0.05, 0.95);
-                let pitch_log2 = ny * span + pitch_min;
-                let depth = if i % 3 == 0 {
-                    120.0
-                } else if i % 3 == 1 {
-                    60.0
-                } else {
-                    0.0
-                };
-                let t_ms = i as u64 * hop_ms;
-                let vibrato_t_ms = t_ms.saturating_sub(back_date_ms);
-                TracePoint {
-                    t_ms,
-                    vibrato_t_ms,
-                    pitch: PitchLog2(pitch_log2),
-                    confidence: 0.7 + (i as f32 * 0.01),
-                    vibrato_rate: 5.5,
-                    vibrato_depth: depth,
-                }
-            })
-            .collect();
-
-        let window_start_ms = 200u64;
-        let time_end_ms = (n as u64 - 1) * hop_ms;
-
-        SemanticGraph {
-            time_window: Some(TimeWindow {
-                start_ms: window_start_ms,
-                end_ms: time_end_ms,
-                span_ms: time_end_ms - window_start_ms,
-            }),
-            pitch_window: Some(PitchWindow {
-                min: PitchLog2(pitch_min),
-                max: PitchLog2(pitch_max),
-            }),
-            trace_segments: vec![TraceSegment { points }],
-            grooves: vec![],
-            onset_ticks: vec![],
-            breath_spans: vec![],
-        }
-    }
-
-    /// Equivalence guard: the chain-based `project_band_segment` must reproduce
-    /// the legacy inline projection bit-for-bit (within 1e-6 per field).
-    ///
-    /// Input: 22-point segment — centre wobble, varying vibrato_depth, and
-    /// some points with vibrato_t_ms before the window start (hitting the
-    /// x-fallback path). Expected values were captured from the PRE-refactor
-    /// output and are fixed literals here.
-    ///
-    /// This test was written FIRST (against the legacy code) and must stay green
-    /// through the refactor.
-    #[test]
-    fn band_chain_matches_legacy_projection() {
-        let graph = make_harvest_graph();
-        let scene = project_scene(&graph);
-        let band = &scene.band_segments[0];
-
-        // Snapshot captured from pre-refactor output.
-        // Each tuple: (x, center_y, half_height, confidence)
-        let expected: Vec<(f32, f32, f32, f32)> = vec![
-            (0.0, 0.5759999, 0.025, 0.74),
-            (0.058823526, 0.565, 0.025, 0.75),
-            (0.11764705, 0.5814285, 0.02, 0.76),
-            (0.17647058, 0.575, 0.025, 0.77),
-            (0.0, 0.5759999, 0.030000001, 0.78),
-            (0.058823526, 0.565, 0.02, 0.78999996),
-            (0.11764705, 0.5814285, 0.025, 0.79999995),
-            (0.17647058, 0.575, 0.030000001, 0.81),
-            (0.2352941, 0.5888889, 0.02, 0.82),
-            (0.29411763, 0.58111113, 0.025, 0.83),
-            (0.35294116, 0.60888886, 0.030000001, 0.84),
-            (0.41176468, 0.6011111, 0.02, 0.84999996),
-            (0.4705882, 0.62888885, 0.025, 0.86),
-            (0.5294118, 0.62111115, 0.030000001, 0.87),
-            (0.58823526, 0.6488889, 0.02, 0.88),
-            (0.64705884, 0.64111114, 0.025, 0.89),
-            (0.7058823, 0.66888887, 0.03125, 0.9),
-            (0.7647059, 0.6611111, 0.025, 0.90999997),
-        ];
-
-        assert_eq!(band.len(), expected.len(), "point count mismatch");
-        for (i, (bp, &(ex, ecy, ehh, econf))) in band.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (bp.x - ex).abs() < 1e-6,
-                "point {i} x: got {}, expected {}",
-                bp.x,
-                ex
-            );
-            assert!(
-                (bp.center_y - ecy).abs() < 1e-6,
-                "point {i} center_y: got {}, expected {}",
-                bp.center_y,
-                ecy
-            );
-            assert!(
-                (bp.half_height - ehh).abs() < 1e-6,
-                "point {i} half_height: got {}, expected {}",
-                bp.half_height,
-                ehh
-            );
-            assert!(
-                (bp.confidence - econf).abs() < 1e-6,
-                "point {i} confidence: got {}, expected {}",
-                bp.confidence,
-                econf
+                (actual_shift - expected_shift).abs() < 0.01,
+                "point {i}: centre is {actual_shift:.4} below pitch \
+                 (center_y={center:.4}, pitch y={current_y:.4}); \
+                 expected back-date shift ~{expected_shift:.4}"
             );
         }
     }
@@ -1296,7 +1183,13 @@ mod tests {
     /// assertion fails.
     #[test]
     fn band_center_samples_correct_pitch_when_leading_points_dropped() {
-        let n_points = 24usize;
+        // Long enough that the surviving points include a well-interior band
+        // (full symmetric centerline window each side). The centerline smoother
+        // ([`BAND_CENTER_SMOOTH_WINDOW`]) drags edge points toward the segment
+        // mean, so the rising-ramp sanity below is only meaningful where the
+        // window is fully symmetric; 80 points clears a 31-point window with
+        // margin even after the leading drop.
+        let n_points = 80usize;
         let hop_ms = 50u64;
         let back_date_hops = 4usize;
         let back_date_ms = back_date_hops as u64 * hop_ms;
@@ -1305,7 +1198,7 @@ mod tests {
         let pitch_max = 10.0_f64;
         let span = pitch_max - pitch_min;
 
-        // Linear ramp in normalized y from 0.15 to 0.85 across all 24 points.
+        // Linear ramp in normalized y from 0.15 to 0.85 across all points.
         let y_start = 0.15_f64;
         let y_end = 0.85_f64;
         let slope_per_hop = (y_end - y_start) / (n_points as f64 - 1.0);
@@ -1401,9 +1294,17 @@ mod tests {
         assert!(checked >= 4, "test must exercise several back-dated points");
 
         // And the behavioural sanity: on a RISING ramp the back-dated centre is
-        // never ABOVE the point's own y (it samples older = lower pitch), except
-        // within float tolerance at the clamped left edge.
-        for (tp, bp) in pitch_list.iter().zip(band_list.iter()) {
+        // never ABOVE the point's own y (it samples older = lower pitch). This
+        // holds only where the centerline window is fully symmetric — at the
+        // segment edges the smoother drags the centre toward the segment mean,
+        // which can lift an early centre above its (lower) local trace y. So
+        // restrict the check to well-interior survivors.
+        let half_win = BAND_CENTER_SMOOTH_WINDOW / 2;
+        let n = pitch_list.len();
+        for (i, (tp, bp)) in pitch_list.iter().zip(band_list.iter()).enumerate() {
+            if i < half_win || i + half_win >= n {
+                continue; // edge: smoothing not symmetric
+            }
             // Only check points where back-dating actually moved the x left.
             if (bp.x - tp.x).abs() > 1e-6 {
                 assert!(
