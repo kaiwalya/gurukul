@@ -121,6 +121,46 @@ fn smooth(values: &[f32], window: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Interpolate `values` (indexed by point, on the `xs` time axis) at an
+/// arbitrary query position `query_x`.
+///
+/// WHY: the vibrato band's x is back-dated to `vibrato_t_ms` so the band
+/// slides left to align with the pitch trace. The center-y must share the
+/// same back-dated time — otherwise on a fast pitch ramp the band x is 0.8 s
+/// in the past while the center-y reflects the present pitch. This helper
+/// converts `vibrato_x` (normalized time of `vibrato_t_ms`) back to a
+/// fractional index into `smoothed_center` so both coordinates reference the
+/// same moment in the audio.
+///
+/// `xs` must be monotonically non-decreasing (guaranteed by construction: the
+/// points are ordered by `t_ms` and `normalize_time` is monotone). If
+/// `query_x` is outside `[xs[0], xs[last]]` the nearest endpoint value is
+/// returned (clamp, no extrapolation).
+fn sample_center_at_x(xs: &[f32], values: &[f32], query_x: f32) -> f32 {
+    debug_assert_eq!(xs.len(), values.len());
+    let n = xs.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 || query_x <= xs[0] {
+        return values[0];
+    }
+    if query_x >= xs[n - 1] {
+        return values[n - 1];
+    }
+    // Binary search for the segment [lo, lo+1] that straddles query_x.
+    let lo = xs.partition_point(|&x| x <= query_x).saturating_sub(1);
+    let hi = (lo + 1).min(n - 1);
+    let x_lo = xs[lo];
+    let x_hi = xs[hi];
+    let span = x_hi - x_lo;
+    if span <= 0.0 {
+        return values[lo];
+    }
+    let t = (query_x - x_lo) / span;
+    values[lo] + t * (values[hi] - values[lo])
+}
+
 fn normalize_trace_segment(
     segment: &TraceSegment,
     time_window: TimeWindow,
@@ -178,13 +218,28 @@ fn normalize_trace_segment(
     // is averaged out and the ribbon's centre rails stay steady.
     let smoothed_center = smooth(&raw_ys, BAND_CENTER_SMOOTH_WINDOW);
 
+    // Build a parallel list of the point.x values (monotonic, [0,1]) so we
+    // can map each point's vibrato_x back to a fractional index into
+    // smoothed_center.  This is the "x-axis" for the interpolation helper.
+    let point_xs: Vec<f32> = points.iter().map(|tp| tp.point.x).collect();
+
     let points = points
         .into_iter()
         .zip(smoothed_hh)
-        .zip(smoothed_center)
-        .map(|((mut tp, hh), cy)| {
+        .enumerate()
+        .map(|(i, (mut tp, hh))| {
             tp.band_half_height = hh;
-            tp.band_center_y = cy;
+            // The band's x uses vibrato_x (back-dated ~0.80 s) so it sits under
+            // the pitch trace. The center-y must match: sample smoothed_center at
+            // the same back-dated position, not at the point's own time.
+            tp.band_center_y = match tp.vibrato_x {
+                Some(vx) => sample_center_at_x(&point_xs, &smoothed_center, vx),
+                // vibrato_x is None only when vibrato_t_ms falls before the
+                // window start (first ~0.80 s of a session). In that case
+                // apply_mesh_band also falls back to point.x, so keep the
+                // un-shifted smoothed center for consistency.
+                None => smoothed_center[i],
+            };
             tp
         })
         .collect();
@@ -882,5 +937,216 @@ mod tests {
             (hh - 0.05).abs() < 1e-4,
             "depth-driven height must be nonzero even when strength=0, got {hh}"
         );
+    }
+
+    /// Regression guard for the PDC vertical-alignment bug: on a rising pitch
+    /// ramp, `band_center_y` must track the BACK-DATED pitch (lower), not the
+    /// current pitch (higher). Before the fix, band_center_y reflected the
+    /// point's own time while band_x was back-dated, causing the band to float
+    /// above the trace during ascent.
+    ///
+    /// Setup: 20 points, pitch rises linearly from y=0.2 to y=0.8 (normalized).
+    /// Each point's `vibrato_t_ms` is exactly 5 steps behind its own `t_ms`
+    /// (i.e. the band x is back-dated by 5 hops = 250 ms at 50 ms/hop).
+    ///
+    /// For an interior point i (far from edges, full smoothing window active):
+    /// - The unshifted smoothed pitch ≈ current normalized y at i.
+    /// - The back-dated smoothed pitch ≈ normalized y at i-5.
+    /// - The ramp slope is (0.8 - 0.2) / 19 ≈ 0.0316 per step.
+    /// - So band_center_y should be ~0.0316 × 5 = 0.158 below point.y.
+    ///
+    /// We assert: band_center_y[i] < point.y[i] - 0.10 for mid-range points.
+    #[test]
+    fn band_center_y_back_dated_on_rising_ramp() {
+        let n_points = 20usize;
+        let hop_ms = 50u64;
+        let back_date_hops = 5usize; // vibrato_t_ms is 5 hops behind t_ms
+        let back_date_ms = back_date_hops as u64 * hop_ms;
+
+        let pitch_window_min = 8.0_f64;
+        let pitch_window_max = 10.0_f64;
+        let span = pitch_window_max - pitch_window_min; // 2.0
+
+        // Linear ramp: normalized y goes from 0.2 to 0.8.
+        let y_start = 0.2_f64;
+        let y_end = 0.8_f64;
+        let slope_per_hop = (y_end - y_start) / (n_points as f64 - 1.0);
+
+        let points: Vec<_> = (0..n_points)
+            .map(|i| {
+                let ny = y_start + i as f64 * slope_per_hop;
+                let pitch_log2 = ny * span + pitch_window_min;
+                // vibrato_t_ms is back-dated; clamp to 0 so we don't go negative.
+                let t_ms = i as u64 * hop_ms;
+                let vibrato_t_ms = t_ms.saturating_sub(back_date_ms);
+                TracePoint {
+                    t_ms,
+                    vibrato_t_ms,
+                    pitch: PitchLog2(pitch_log2 as f32),
+                    confidence: 0.0,
+                    vibrato_rate: 0.0,
+                    vibrato_depth: 0.0,
+                }
+            })
+            .collect();
+
+        let time_end_ms = (n_points as u64 - 1) * hop_ms;
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: 0,
+                end_ms: time_end_ms,
+                span_ms: time_end_ms,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(pitch_window_min as f32),
+                max: PitchLog2(pitch_window_max as f32),
+            }),
+            trace_segments: vec![TraceSegment { points }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+
+        let scene = project_scene(&graph);
+        let tp_list = &scene.pitch_segments[0].points;
+
+        // Check interior points that have valid vibrato_x AND are far enough
+        // from the window edges that the back-dated sample is well-interior.
+        // Points i=10..=14 have vibrato_t_ms well within the window (>=5 hops
+        // in, far from both edges), so vibrato_x is Some and the interpolation
+        // returns the pitch from 5 hops ago.
+        let expected_shift = slope_per_hop as f32 * back_date_hops as f32;
+        for i in 10..=14 {
+            let tp = &tp_list[i];
+            let current_y = tp.point.y;
+            let center = tp.band_center_y;
+            // On a rising ramp, the back-dated center must be clearly below the
+            // current point.y. The expected shift is ~0.158; allow generous
+            // tolerance (0.10) for smoothing edge effects.
+            assert!(
+                center < current_y - 0.10,
+                "point {i}: band_center_y={center:.4} should be at least 0.10 below \
+                 point.y={current_y:.4} (expected shift ~{expected_shift:.3})"
+            );
+        }
+    }
+
+    /// Drift guard for the pitch/band series split.
+    ///
+    /// The band's `band_center_y` is sampled from the smoothed pitch array by a
+    /// shared post-filter index. When the band becomes its own series, pitch and
+    /// band must share ONE filtered point list — if they filter independently,
+    /// dropped leading points shift the band's index space and the back-dated
+    /// centre samples the WRONG pitch.
+    ///
+    /// We force the trap: a rising ramp whose *leading* points fall before the
+    /// window start (so they are dropped), with the rest in-window. A surviving
+    /// interior point's `band_center_y` must equal the *trace's own y* at that
+    /// point's back-dated time — i.e. the centre must track the trace shifted by
+    /// exactly `back_date_ms`, regardless of how many leading points were
+    /// dropped. If the index spaces drift, this lands on the wrong pitch and the
+    /// assertion fails.
+    #[test]
+    fn band_center_samples_correct_pitch_when_leading_points_dropped() {
+        let n_points = 24usize;
+        let hop_ms = 50u64;
+        let back_date_hops = 4usize;
+        let back_date_ms = back_date_hops as u64 * hop_ms;
+
+        let pitch_min = 8.0_f64;
+        let pitch_max = 10.0_f64;
+        let span = pitch_max - pitch_min;
+
+        // Linear ramp in normalized y from 0.15 to 0.85 across all 24 points.
+        let y_start = 0.15_f64;
+        let y_end = 0.85_f64;
+        let slope_per_hop = (y_end - y_start) / (n_points as f64 - 1.0);
+
+        let points: Vec<_> = (0..n_points)
+            .map(|i| {
+                let ny = y_start + i as f64 * slope_per_hop;
+                let pitch_log2 = ny * span + pitch_min;
+                let t_ms = i as u64 * hop_ms;
+                let vibrato_t_ms = t_ms.saturating_sub(back_date_ms);
+                TracePoint {
+                    t_ms,
+                    vibrato_t_ms,
+                    pitch: PitchLog2(pitch_log2 as f32),
+                    confidence: 1.0,
+                    vibrato_rate: 5.5,
+                    vibrato_depth: 60.0,
+                }
+            })
+            .collect();
+
+        // Window starts at hop 8 → the first 8 points (t=0..350ms) are DROPPED
+        // by the time filter. The band index space must reflect ONLY survivors.
+        let window_start_hop = 8u64;
+        let window_start_ms = window_start_hop * hop_ms;
+        let time_end_ms = (n_points as u64 - 1) * hop_ms;
+
+        let graph = SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: window_start_ms,
+                end_ms: time_end_ms,
+                span_ms: time_end_ms - window_start_ms,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(pitch_min as f32),
+                max: PitchLog2(pitch_max as f32),
+            }),
+            trace_segments: vec![TraceSegment { points }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        };
+
+        let scene = project_scene(&graph);
+        let tp_list = &scene.pitch_segments[0].points;
+        assert!(tp_list.len() >= 8, "expected the in-window survivors only");
+
+        // The no-drift invariant, stated WITHOUT assuming anything about the
+        // dropped leading points: the band centre must equal the *survivors'*
+        // own trace curve sampled at the band's back-dated x. We rebuild the
+        // survivors' (x, y) curve from the projected points themselves and
+        // re-derive what the centre SHOULD be — if the band had instead indexed
+        // against an un-filtered list, its centre would land on a different
+        // pitch and this equality breaks.
+        let surv_xs: Vec<f32> = tp_list.iter().map(|tp| tp.point.x).collect();
+        let surv_ys: Vec<f32> = tp_list.iter().map(|tp| tp.point.y).collect();
+        // Smooth the survivors' y the same way the band centre is smoothed, so
+        // we compare like with like (the centre is a smoothed sample).
+        let surv_smoothed = smooth(&surv_ys, BAND_CENTER_SMOOTH_WINDOW);
+
+        let mut checked = 0;
+        for tp in tp_list.iter() {
+            let Some(vx) = tp.vibrato_x else { continue };
+            // Expected centre = the survivors' own smoothed curve sampled at the
+            // band's back-dated x. Same helper the model uses internally.
+            let expected = sample_center_at_x(&surv_xs, &surv_smoothed, vx);
+            assert!(
+                (tp.band_center_y - expected).abs() < 1e-4,
+                "band centre {:.5} must equal the survivors' curve sampled at \
+                 vibrato_x={vx:.4} (={expected:.5}); a mismatch means the band \
+                 indexed a different (un-shared) point list — drift.",
+                tp.band_center_y
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "test must exercise several back-dated points");
+
+        // And the behavioural sanity: on a RISING ramp the back-dated centre is
+        // never ABOVE the point's own y (it samples older = lower pitch), except
+        // within float tolerance at the clamped left edge.
+        for tp in tp_list.iter() {
+            if tp.vibrato_x.is_some() {
+                assert!(
+                    tp.band_center_y <= tp.point.y + 1e-4,
+                    "rising ramp: centre {:.4} must not sit above trace y {:.4}",
+                    tp.band_center_y,
+                    tp.point.y
+                );
+            }
+        }
     }
 }
