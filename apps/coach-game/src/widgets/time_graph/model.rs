@@ -250,58 +250,120 @@ fn project_pitch_segment(survivors: &[SurvivingPoint]) -> Vec<PitchTracePoint> {
         .collect()
 }
 
+/// Read-only context every band step sees.
+/// `smoothed_center` is an INTERMEDIATE — only `pdc_align` writes it into
+/// the series, paired with the final `x`, so `center_y` is written exactly once.
+struct BandCtx<'a> {
+    survivors: &'a [SurvivingPoint],
+    smoothed_center: &'a [f32],
+    point_xs: &'a [f32],
+}
+
+/// One named band transform. Reads context + the series so far; returns the
+/// next series. Coordinates that must move together (x and center_y) are
+/// emitted together by one step.
+struct BandStep {
+    /// Human-readable label for debugging / future tracing.
+    #[allow(dead_code)]
+    name: &'static str,
+    enabled: bool,
+    apply: fn(ctx: &BandCtx, series: Vec<VibratoBandPoint>) -> Vec<VibratoBandPoint>,
+}
+
+/// Seed the band series: x = survivor nx, half_height = 0.0, center_y = 0.0
+/// (UNSET — pdc_align is the sole writer), confidence = survivor confidence.
+fn seed_band_series(survivors: &[SurvivingPoint]) -> Vec<VibratoBandPoint> {
+    survivors
+        .iter()
+        .map(|sp| VibratoBandPoint {
+            x: sp.nx,
+            center_y: 0.0,
+            half_height: 0.0,
+            confidence: sp.confidence,
+        })
+        .collect()
+}
+
+/// Step 1: smooth raw half-heights (window 5) and write them into the series.
+fn half_height_derive(ctx: &BandCtx, mut series: Vec<VibratoBandPoint>) -> Vec<VibratoBandPoint> {
+    let raw: Vec<f32> = ctx.survivors.iter().map(|sp| sp.raw_half_height).collect();
+    let smoothed = smooth(&raw, BAND_SMOOTH_WINDOW);
+    for (pt, hh) in series.iter_mut().zip(smoothed) {
+        pt.half_height = hh;
+    }
+    series
+}
+
+/// Step 2 ⭐ — the coordinate-binding step.
+/// Writes `x` AND `center_y` as one pair per point; these two coordinates
+/// are inseparable (x is back-dated; center_y must be sampled at that same
+/// back-dated moment). This is the sole writer of both fields.
+fn pdc_align(ctx: &BandCtx, mut series: Vec<VibratoBandPoint>) -> Vec<VibratoBandPoint> {
+    for (i, pt) in series.iter_mut().enumerate() {
+        let (x, center_y) = match ctx.survivors[i].vibrato_nx {
+            Some(vx) => (
+                vx,
+                sample_center_at_x(ctx.point_xs, ctx.smoothed_center, vx),
+            ),
+            None => (ctx.survivors[i].nx, ctx.smoothed_center[i]),
+        };
+        pt.x = x;
+        pt.center_y = center_y;
+    }
+    series
+}
+
+fn band_chain() -> [BandStep; 2] {
+    [
+        BandStep {
+            name: "half_height_derive",
+            enabled: true,
+            apply: half_height_derive,
+        },
+        BandStep {
+            name: "pdc_align",
+            enabled: true,
+            apply: pdc_align,
+        },
+    ]
+}
+
 /// Project the shared filtered point list into the vibrato-band series.
 /// Owns the band transform: smoothing, back-date interpolation, x-fallback.
-/// Series-in / series-out because back-date interpolation is a whole-series
-/// transform (it samples `smoothed_center` at an arbitrary `vibrato_x`).
+///
+/// The transform is expressed as a named chain so each step's responsibility
+/// is explicit. The coupling-safety invariant: `x` and `center_y` are written
+/// together, exactly once, by the `pdc_align` step. `smoothed_center` is an
+/// intermediate that lives only in `BandCtx`; it never enters the series early.
 ///
 /// Correction #5: the x-fallback (`vibrato_nx.unwrap_or(nx)`) is resolved
-/// HERE so `VibratoBandPoint.x` is final. The render system reads a plain
-/// `x` — it must not re-derive the fallback.
+/// inside `pdc_align` so `VibratoBandPoint.x` is final. The render system reads
+/// a plain `x` — it must not re-derive the fallback.
 fn project_band_segment(
     survivors: &[SurvivingPoint],
     pitch_window: PitchWindow,
 ) -> Vec<VibratoBandPoint> {
     let _ = pitch_window; // octave_span already spent in filter_in_window
 
-    let raw_half_heights: Vec<f32> = survivors.iter().map(|sp| sp.raw_half_height).collect();
-    let raw_ys: Vec<f32> = survivors.iter().map(|sp| sp.ny).collect();
-
-    // Smooth the raw half-heights with the narrower window (kills single-hop
-    // spikes while tracking real depth changes quickly).
-    let smoothed_hh = smooth(&raw_half_heights, BAND_SMOOTH_WINDOW);
-    // Smooth the raw y values with the wider window so one full vibrato cycle
-    // is averaged out and the ribbon's centre rails stay steady.
-    let smoothed_center = smooth(&raw_ys, BAND_CENTER_SMOOTH_WINDOW);
-
-    // The x-axis for interpolation: the survivors' own nx values (monotonic).
+    let smoothed_center: Vec<f32> = {
+        let raw_ys: Vec<f32> = survivors.iter().map(|sp| sp.ny).collect();
+        smooth(&raw_ys, BAND_CENTER_SMOOTH_WINDOW)
+    };
     let point_xs: Vec<f32> = survivors.iter().map(|sp| sp.nx).collect();
 
-    survivors
-        .iter()
-        .zip(smoothed_hh)
-        .enumerate()
-        .map(|(i, (sp, hh))| {
-            // The band's x uses vibrato_nx (back-dated ~0.80 s) so it sits
-            // under the pitch trace. The center-y must match: sample
-            // smoothed_center at the same back-dated position, not at the
-            // point's own time. Correction #5: resolve the fallback here so
-            // VibratoBandPoint carries a final, resolved x.
-            let (x, center_y) = match sp.vibrato_nx {
-                Some(vx) => (vx, sample_center_at_x(&point_xs, &smoothed_center, vx)),
-                // vibrato_nx is None only when vibrato_t_ms falls before the
-                // window start (first ~0.80 s of a session). Fall back to the
-                // point's own x and the un-shifted smoothed center.
-                None => (sp.nx, smoothed_center[i]),
-            };
-            VibratoBandPoint {
-                x,
-                center_y,
-                half_height: hh,
-                confidence: sp.confidence,
-            }
-        })
-        .collect()
+    let ctx = BandCtx {
+        survivors,
+        smoothed_center: &smoothed_center,
+        point_xs: &point_xs,
+    };
+
+    let mut series = seed_band_series(survivors);
+    for step in band_chain() {
+        if step.enabled {
+            series = (step.apply)(&ctx, series);
+        }
+    }
+    series
 }
 
 fn normalize_groove(groove: GrooveLine, pitch_window: PitchWindow) -> Option<NormalizedGrooveLine> {
@@ -1085,6 +1147,134 @@ mod tests {
                 center < current_y - 0.10,
                 "point {i}: center_y={center:.4} should be at least 0.10 below \
                  pitch y={current_y:.4} (expected shift ~{expected_shift:.3})"
+            );
+        }
+    }
+
+    fn dump_band_segment(band: &[VibratoBandPoint]) -> Vec<(f32, f32, f32, f32)> {
+        band.iter()
+            .map(|bp| (bp.x, bp.center_y, bp.half_height, bp.confidence))
+            .collect()
+    }
+
+    fn make_harvest_graph() -> SemanticGraph {
+        let n = 22usize;
+        let hop_ms = 50u64;
+        let back_date_ms = 200u64;
+        let pitch_min = 8.0_f32;
+        let pitch_max = 10.0_f32;
+        let span = pitch_max - pitch_min;
+
+        let points: Vec<_> = (0..n)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+                let drift = i as f32 * 0.01;
+                let ny = (0.5 + sign * 0.08 + drift).clamp(0.05, 0.95);
+                let pitch_log2 = ny * span + pitch_min;
+                let depth = if i % 3 == 0 {
+                    120.0
+                } else if i % 3 == 1 {
+                    60.0
+                } else {
+                    0.0
+                };
+                let t_ms = i as u64 * hop_ms;
+                let vibrato_t_ms = t_ms.saturating_sub(back_date_ms);
+                TracePoint {
+                    t_ms,
+                    vibrato_t_ms,
+                    pitch: PitchLog2(pitch_log2),
+                    confidence: 0.7 + (i as f32 * 0.01),
+                    vibrato_rate: 5.5,
+                    vibrato_depth: depth,
+                }
+            })
+            .collect();
+
+        let window_start_ms = 200u64;
+        let time_end_ms = (n as u64 - 1) * hop_ms;
+
+        SemanticGraph {
+            time_window: Some(TimeWindow {
+                start_ms: window_start_ms,
+                end_ms: time_end_ms,
+                span_ms: time_end_ms - window_start_ms,
+            }),
+            pitch_window: Some(PitchWindow {
+                min: PitchLog2(pitch_min),
+                max: PitchLog2(pitch_max),
+            }),
+            trace_segments: vec![TraceSegment { points }],
+            grooves: vec![],
+            onset_ticks: vec![],
+            breath_spans: vec![],
+        }
+    }
+
+    /// Equivalence guard: the chain-based `project_band_segment` must reproduce
+    /// the legacy inline projection bit-for-bit (within 1e-6 per field).
+    ///
+    /// Input: 22-point segment — centre wobble, varying vibrato_depth, and
+    /// some points with vibrato_t_ms before the window start (hitting the
+    /// x-fallback path). Expected values were captured from the PRE-refactor
+    /// output and are fixed literals here.
+    ///
+    /// This test was written FIRST (against the legacy code) and must stay green
+    /// through the refactor.
+    #[test]
+    fn band_chain_matches_legacy_projection() {
+        let graph = make_harvest_graph();
+        let scene = project_scene(&graph);
+        let band = &scene.band_segments[0];
+
+        // Snapshot captured from pre-refactor output.
+        // Each tuple: (x, center_y, half_height, confidence)
+        let expected: Vec<(f32, f32, f32, f32)> = vec![
+            (0.0, 0.5759999, 0.025, 0.74),
+            (0.058823526, 0.565, 0.025, 0.75),
+            (0.11764705, 0.5814285, 0.02, 0.76),
+            (0.17647058, 0.575, 0.025, 0.77),
+            (0.0, 0.5759999, 0.030000001, 0.78),
+            (0.058823526, 0.565, 0.02, 0.78999996),
+            (0.11764705, 0.5814285, 0.025, 0.79999995),
+            (0.17647058, 0.575, 0.030000001, 0.81),
+            (0.2352941, 0.5888889, 0.02, 0.82),
+            (0.29411763, 0.58111113, 0.025, 0.83),
+            (0.35294116, 0.60888886, 0.030000001, 0.84),
+            (0.41176468, 0.6011111, 0.02, 0.84999996),
+            (0.4705882, 0.62888885, 0.025, 0.86),
+            (0.5294118, 0.62111115, 0.030000001, 0.87),
+            (0.58823526, 0.6488889, 0.02, 0.88),
+            (0.64705884, 0.64111114, 0.025, 0.89),
+            (0.7058823, 0.66888887, 0.03125, 0.9),
+            (0.7647059, 0.6611111, 0.025, 0.90999997),
+        ];
+
+        assert_eq!(band.len(), expected.len(), "point count mismatch");
+        for (i, (bp, &(ex, ecy, ehh, econf))) in band.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (bp.x - ex).abs() < 1e-6,
+                "point {i} x: got {}, expected {}",
+                bp.x,
+                ex
+            );
+            assert!(
+                (bp.center_y - ecy).abs() < 1e-6,
+                "point {i} center_y: got {}, expected {}",
+                bp.center_y,
+                ecy
+            );
+            assert!(
+                (bp.half_height - ehh).abs() < 1e-6,
+                "point {i} half_height: got {}, expected {}",
+                bp.half_height,
+                ehh
+            );
+            assert!(
+                (bp.confidence - econf).abs() < 1e-6,
+                "point {i} confidence: got {}, expected {}",
+                bp.confidence,
+                econf
             );
         }
     }
