@@ -47,7 +47,8 @@ pub struct TracePoint {
     pub pitch: PitchLog2,
     pub confidence: f32,
     pub vibrato_rate: f32,
-    pub vibrato_depth: f32,
+    pub vibrato_amplitude: f32,
+    pub vibrato_phase: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -216,7 +217,8 @@ fn trace_segments(history: &FeatureHistory) -> Vec<TraceSegment> {
                 pitch,
                 confidence: sample.confidence,
                 vibrato_rate: sample.vibrato_rate,
-                vibrato_depth: sample.vibrato_depth,
+                vibrato_amplitude: sample.vibrato_amplitude,
+                vibrato_phase: sample.vibrato_phase,
             }),
             Some(pitch) => {
                 finish_segment(&mut segments, &mut points);
@@ -226,7 +228,8 @@ fn trace_segments(history: &FeatureHistory) -> Vec<TraceSegment> {
                     pitch,
                     confidence: sample.confidence,
                     vibrato_rate: sample.vibrato_rate,
-                    vibrato_depth: sample.vibrato_depth,
+                    vibrato_amplitude: sample.vibrato_amplitude,
+                    vibrato_phase: sample.vibrato_phase,
                 });
             }
             None => finish_segment(&mut segments, &mut points),
@@ -332,7 +335,8 @@ mod tests {
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
-            vibrato_depth: 0.0,
+            vibrato_amplitude: 0.0,
+            vibrato_phase: 0.0,
             vibrato_t_ms: t_ms,
             t_ms,
         }

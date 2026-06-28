@@ -639,7 +639,34 @@ fn cmd_replay_audio(
     Ok(())
 }
 
+/// Expected audio-trace manifest schema version. Sidecars produced by older
+/// writers (schema != 2) use a different field layout and must not be diffed.
+const EXPECTED_AUDIO_TRACE_SCHEMA: u32 = 2;
+
 fn load_sidecar(path: &Path) -> Result<Vec<SidecarHop>> {
+    // Check the sibling manifest for schema compatibility before parsing the
+    // sidecar. If the manifest is absent we proceed (older recordings may not
+    // have one); if it exists and the schema doesn't match, bail.
+    let manifest_path = {
+        let s = path.to_string_lossy();
+        let stem = s.strip_suffix(".features.jsonl").unwrap_or(&s);
+        std::path::PathBuf::from(format!("{stem}.manifest.json"))
+    };
+    if manifest_path.exists() {
+        let manifest_raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+        let manifest: audio_trace_format::Manifest = serde_json::from_str(&manifest_raw)
+            .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+        if manifest.schema != EXPECTED_AUDIO_TRACE_SCHEMA {
+            anyhow::bail!(
+                "{}: manifest schema {} does not match expected {} — re-record with a current build",
+                manifest_path.display(),
+                manifest.schema,
+                EXPECTED_AUDIO_TRACE_SCHEMA
+            );
+        }
+    }
+
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading sidecar {}", path.display()))?;
     let hops: Vec<SidecarHop> = raw

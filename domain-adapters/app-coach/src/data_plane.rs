@@ -309,13 +309,13 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
     };
 
     // Compute vibrato latency once at boot (boot-time only, not hot-path).
-    // vibrato_rate and vibrato_depth are produced by the same node, so their
+    // vibrato_rate and vibrato_amplitude are produced by the same node, so their
     // latencies must be equal — assert the invariant and use either.
     let lat_frames = engine.out_port_latency(ports.vibrato_rate);
     debug_assert_eq!(
         lat_frames,
-        engine.out_port_latency(ports.vibrato_depth),
-        "vibrato_rate and vibrato_depth must come from the same node"
+        engine.out_port_latency(ports.vibrato_amplitude),
+        "vibrato_rate and vibrato_amplitude must come from the same node"
     );
     // Convert frames → ms with rounding (not truncation) in f64 to avoid
     // systematic bias at non-divisor sample rates.
@@ -389,7 +389,8 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         let onset = engine.out_port(ports.onset)[0];
         let breath = engine.out_port(ports.breath)[0];
         let vibrato_rate = engine.out_port(ports.vibrato_rate)[0];
-        let vibrato_depth = engine.out_port(ports.vibrato_depth)[0];
+        let vibrato_amplitude = engine.out_port(ports.vibrato_amplitude)[0];
+        let vibrato_phase = engine.out_port(ports.vibrato_phase)[0];
 
         let t_ms = clock.now_ms();
         let snapshot = FeatureSnapshot {
@@ -399,7 +400,8 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
             onset,
             breath,
             vibrato_rate,
-            vibrato_depth,
+            vibrato_amplitude,
+            vibrato_phase,
             vibrato_t_ms: t_ms.saturating_sub(vibrato_latency_ms),
             t_ms,
         };
@@ -411,7 +413,8 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
                 onset,
                 breath,
                 vibrato_rate,
-                vibrato_depth,
+                vibrato_amplitude,
+                vibrato_phase,
             });
         }
         hop_index = hop_index.wrapping_add(1);
@@ -440,7 +443,8 @@ struct ResolvedPorts {
     onset: OutPortHandle,
     breath: OutPortHandle,
     vibrato_rate: OutPortHandle,
-    vibrato_depth: OutPortHandle,
+    vibrato_amplitude: OutPortHandle,
+    vibrato_phase: OutPortHandle,
 }
 
 fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
@@ -462,9 +466,12 @@ fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
     let vibrato_rate = engine
         .resolve_out_port("vibrato_rate")
         .map_err(|e| format!("vibrato_rate: {e:?}"))?;
-    let vibrato_depth = engine
-        .resolve_out_port("vibrato_depth")
-        .map_err(|e| format!("vibrato_depth: {e:?}"))?;
+    let vibrato_amplitude = engine
+        .resolve_out_port("vibrato_amplitude")
+        .map_err(|e| format!("vibrato_amplitude: {e:?}"))?;
+    let vibrato_phase = engine
+        .resolve_out_port("vibrato_phase")
+        .map_err(|e| format!("vibrato_phase: {e:?}"))?;
     Ok(ResolvedPorts {
         mic,
         pitch,
@@ -472,7 +479,8 @@ fn resolve_ports(engine: &Engine) -> Result<ResolvedPorts, String> {
         onset,
         breath,
         vibrato_rate,
-        vibrato_depth,
+        vibrato_amplitude,
+        vibrato_phase,
     })
 }
 
@@ -515,32 +523,34 @@ mod tests {
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
-            vibrato_depth: 0.0,
+            vibrato_amplitude: 0.0,
+            vibrato_phase: 0.0,
             vibrato_t_ms: t_ms,
             t_ms,
         }
     }
 
     /// Verify the frames→ms rounding formula used by the worker.
-    /// At 48000 Hz, 38400 frames / 48000 = exactly 800 ms (no rounding needed).
-    /// Use a non-divisor: 38401 frames → 38401000/48000 = 800.020833... → rounds to 800.
+    /// At 48000 Hz, window/2 + hop/2 = 72000/2 + 600/2 = 36300 frames.
+    /// 36300/48000*1000 = 756.25 ms → rounds to 756.
+    /// Use a non-divisor: 36301 frames → 756.270... → rounds to 756.
     #[test]
     fn vibrato_latency_frames_to_ms_rounds_correctly() {
         let sample_rate: u32 = 48000;
 
-        let lat_frames: usize = 38400;
+        let lat_frames: usize = 36300;
         let lat_ms = (lat_frames as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms, 800, "38400 frames at 48kHz = 800ms exactly");
+        assert_eq!(lat_ms, 756, "36300 frames at 48kHz = 756ms (rounded)");
 
         // Non-divisor: should round, not truncate.
-        let lat_frames_odd: usize = 38401;
+        let lat_frames_odd: usize = 36301;
         let lat_ms_odd = (lat_frames_odd as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms_odd, 800, "38401 frames → ~800.02ms → rounds to 800");
+        assert_eq!(lat_ms_odd, 756, "36301 frames → ~756.27ms → rounds to 756");
 
-        // Another non-divisor past the 0.5 threshold: 38424 frames → 800.5ms → rounds to 801.
-        let lat_frames_up: usize = 38424;
+        // Another non-divisor past the 0.5 threshold: 36324 frames → 756.75ms → rounds to 757.
+        let lat_frames_up: usize = 36324;
         let lat_ms_up = (lat_frames_up as f64 * 1000.0 / sample_rate as f64).round() as u64;
-        assert_eq!(lat_ms_up, 801, "38424 frames → 800.5ms → rounds up to 801");
+        assert_eq!(lat_ms_up, 757, "36324 frames → 756.75ms → rounds up to 757");
     }
 
     #[test]
@@ -863,7 +873,7 @@ mod tests {
         let manifest: Manifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read manifest"))
                 .expect("manifest parses as the shared type");
-        assert_eq!(manifest.schema, 1);
+        assert_eq!(manifest.schema, 2);
         assert_eq!(manifest.block_size, 512);
         assert_eq!(manifest.channels, 1);
         assert_eq!(manifest.sample_rate, SR);

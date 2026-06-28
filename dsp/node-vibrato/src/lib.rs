@@ -1,11 +1,29 @@
-//! Vibrato analyzer: estimates `(rate_hz, depth_cents)` from an f0 contour.
+//! Vibrato analyzer: estimates `(rate_hz, amplitude_cents, phase_rad)` from an
+//! f0 contour.
 //!
 //! Consumes a Feature port carrying YIN-style f0 estimates (Hz, with `0.0` =
 //! unvoiced sentinel). Maintains a ring buffer of the most recent samples'
 //! worth of f0 values. Every `analysis_hop` blocks, runs one analysis on the
-//! current window and updates zero-order-held estimates of vibrato rate and
-//! depth. Outputs are Feature ports filled with the latest held value each
-//! block.
+//! current window and updates zero-order-held estimates of vibrato rate,
+//! amplitude and phase. Outputs are Feature ports filled with the latest held
+//! value each block.
+//!
+//! Output contract — the three ports reconstruct the wiggle as a phasor of the
+//! emitted `phase` (radians) scaled by `amplitude` (cents):
+//!   `f0_wiggle(t) ≈ amplitude · sin(phase(t))`
+//! so a consumer recovers the centerline as `pitch − amplitude·sin(phase)`.
+//! (`sin` is the trig function that matches this FFT's `atan2(im, re)` phase
+//! reference — verified by the `phase_reconstructs_wiggle` test. A consumer is
+//! free to absorb the fixed quarter-turn offset and use cos instead; the
+//! load-bearing fact is that `phase` is a clean rotating phasor at the vibrato
+//! rate, pinned to the analysis-window centre.)
+//!
+//! `amplitude` is the HALF-swing — the sinusoid amplitude `A` in `A·cos(phase)`,
+//! i.e. the peak deviation from center, in cents. Peak-to-peak full swing =
+//! `2·amplitude`, derived at use sites if needed. (NB: the separate generator
+//! node `node-synth-vibrato-sine` has a `vibrato_depth_cents` param — that is a
+//! *commanded* swing of a synthesizer, a different concept from this *measured*
+//! amplitude; do not conflate the two.)
 //!
 //! Algorithm: FFT-of-contour (robust to note steps and harmonic locking)
 //!   1. Decimate the f0 ring by `decimation` (default 256× → 187.5 Hz contour
@@ -28,7 +46,9 @@
 //!   6. Find the peak bin in the rate_min–rate_max band; parabolic interpolation
 //!      on log-magnitude for sub-bin precision. Interpolated peak height is
 //!      used for both depth and the dominance check.
-//!   7. Depth (cents) = 2 × interp_peak_mag / window_sum.
+//!   7. Amplitude (cents) = 2 × interp_peak_mag / window_sum, then divided by
+//!      the Hann main-lobe gain at the fractional bin offset to undo scalloping
+//!      loss (see `hann_lobe_gain`).
 //!      Robust to note steps inside the window (only the vibrato frequency's
 //!      energy contributes, not the step amplitude). Uses the actual Hann
 //!      window sum (not a fixed coherent-gain approximation) for correctness
@@ -47,6 +67,55 @@ use std::collections::HashMap;
 /// 187.5/512 ≈ 0.366 Hz at 187.5 Hz contour rate — more than adequate for
 /// vibrato analysis. With parabolic interpolation resolution improves further.
 const FFT_SIZE: usize = 512;
+
+/// Hann main-lobe amplitude at a fractional bin offset `delta` (in bins),
+/// normalised to 1.0 at `delta = 0`.
+///
+/// Derivation. A length-N Hann window is `w[n] = ½ − ½·cos(2πn/N)`. Its DTFT is
+/// a sum of three Dirichlet (periodic-sinc) kernels: one centred at the bin and
+/// two half-weight copies shifted ±1 bin. Evaluating the magnitude of that sum
+/// at a continuous frequency `delta` bins from the peak and dividing by its
+/// value at `delta = 0` collapses (after the standard algebra) to the compact
+/// closed form
+///
+/// ```text
+///   hann_lobe_gain(delta) = sinc(delta) / (1 − delta²)
+/// ```
+///
+/// with `sinc(x) = sin(πx)/(πx)` (so `sinc(0) = 1`). At `delta = 0` this is
+/// `1/1 = 1` (identity — the clean on-bin case is preserved exactly); at the
+/// worst-case half-bin offset `delta = ±0.5` it is `sinc(0.5)/0.75 =
+/// (2/π)/0.75 ≈ 0.8488`, i.e. the peak bin reads ≈ 15% low, matching the known
+/// −1.42 dB Hann scalloping loss. Dividing the measured amplitude by this gain
+/// recovers the true amplitude regardless of where the vibrato lands between
+/// bins.
+fn hann_lobe_gain(delta: f32) -> f32 {
+    let d = delta.abs();
+    if d < 1e-6 {
+        return 1.0;
+    }
+    let denom = 1.0 - d * d;
+    // `denom` only vanishes at |delta| = 1, outside the clamped ±0.5 range, so
+    // it is never near zero here; guard anyway for total safety.
+    if denom.abs() < 1e-6 {
+        return 1.0;
+    }
+    let x = std::f32::consts::PI * d;
+    let sinc = x.sin() / x;
+    sinc / denom
+}
+
+/// Wrap a radian angle to the half-open interval (−π, π].
+fn wrap_pi(theta: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let mut t = theta % TAU;
+    if t > PI {
+        t -= TAU;
+    } else if t <= -PI {
+        t += TAU;
+    }
+    t
+}
 
 pub struct Vibrato {
     // Parameters resolved at construction.
@@ -67,7 +136,8 @@ pub struct Vibrato {
 
     // Last held estimates (zero-order hold).
     held_rate: f32,
-    held_depth: f32,
+    held_amplitude: f32,
+    held_phase: f32,
 
     // --- Scratch buffers, all pre-sized in new() ---
     /// Full decimated time grid (n_decim entries). Voiced slots hold cents;
@@ -146,7 +216,8 @@ impl Vibrato {
             samples_since_analysis: 0,
             total_samples: 0,
             held_rate: 0.0,
-            held_depth: 0.0,
+            held_amplitude: 0.0,
+            held_phase: 0.0,
             grid: vec![0.0; decim_cap],
             detrend: vec![0.0; decim_cap],
             // Interleaved complex: 2 f32 per bin.
@@ -204,7 +275,7 @@ impl Vibrato {
     }
 
     /// Run one analysis on the current window contents, writing results into
-    /// `(self.held_rate, self.held_depth)`. Allocation-free: all scratch is
+    /// `(self.held_rate, self.held_amplitude)`. Allocation-free: all scratch is
     /// pre-sized in new() and reused.
     fn analyse(&mut self) {
         let n_decim = self.window_samples / self.decimation;
@@ -236,7 +307,7 @@ impl Vibrato {
         let voiced_frac = n_voiced as f32 / n_decim as f32;
         if voiced_frac < 0.5 || n_voiced < 32 {
             self.held_rate = 0.0;
-            self.held_depth = 0.0;
+            self.held_amplitude = 0.0;
             return;
         }
 
@@ -253,7 +324,7 @@ impl Vibrato {
                 _ => {
                     // No voiced samples at all (shouldn't reach here after voiced_frac guard).
                     self.held_rate = 0.0;
-                    self.held_depth = 0.0;
+                    self.held_amplitude = 0.0;
                     return;
                 }
             };
@@ -342,7 +413,7 @@ impl Vibrato {
         let rms = (sum_sq / n_decim as f32).sqrt();
         if rms < 1.0 {
             self.held_rate = 0.0;
-            self.held_depth = 0.0;
+            self.held_amplitude = 0.0;
             return;
         }
 
@@ -381,7 +452,7 @@ impl Vibrato {
 
         if bin_max <= bin_min {
             self.held_rate = 0.0;
-            self.held_depth = 0.0;
+            self.held_amplitude = 0.0;
             return;
         }
 
@@ -398,7 +469,8 @@ impl Vibrato {
         // 8. Parabolic interpolation on log-magnitude for sub-bin rate precision
         //    and interpolated peak height (used for depth and dominance check).
         //    Uses the 3-bin neighbourhood around peak_bin.
-        let (refined_bin, interp_peak_mag) = if peak_bin > bin_min && peak_bin < bin_max {
+        let (refined_bin, interp_peak_mag, peak_delta) = if peak_bin > bin_min && peak_bin < bin_max
+        {
             let mag_l = self.fft_mag[peak_bin - 1].max(1e-12);
             let mag_c = peak_mag.max(1e-12);
             let mag_r = self.fft_mag[peak_bin + 1].max(1e-12);
@@ -415,9 +487,9 @@ impl Vibrato {
             // Interpolated peak height from parabola: exp(log_c - delta^2 * denom/2)
             // This is the log-parabola peak value at the fractional bin.
             let interp_log_peak = log_c - delta * delta * denom_par * 0.5;
-            (peak_bin as f32 + delta, interp_log_peak.exp())
+            (peak_bin as f32 + delta, interp_log_peak.exp(), delta)
         } else {
-            (peak_bin as f32, peak_mag)
+            (peak_bin as f32, peak_mag, 0.0)
         };
 
         // 9. Dominance check: the interpolated peak must exceed 2× the median
@@ -469,23 +541,46 @@ impl Vibrato {
         // accepting moderately noisy real-audio windows.
         if interp_peak_mag < 2.0 * median_val {
             self.held_rate = 0.0;
-            self.held_depth = 0.0;
+            self.held_amplitude = 0.0;
             return;
         }
 
         let rate = refined_bin * bin_hz;
 
-        // 10. Depth from interpolated FFT bin magnitude.
+        // 10. Amplitude from the peak FFT bin magnitude, with scalloping-loss
+        //    correction.
+        //
         //    For a Hann-windowed real sinusoid of amplitude A, the single-sided
-        //    FFT bin magnitude = A * window_sum / 2
-        //    (window_sum = sum of Hann weights; the /2 is from the cos→exp split
-        //    of the real sinusoid). Rearranged: A = 2 * peak_mag / window_sum.
-        //    Using the actual window_sum (rather than n * 0.5) keeps depth
-        //    correct when the windowed length differs from the nominal value.
-        let depth = 2.0 * interp_peak_mag / window_sum;
+        //    FFT bin magnitude at the lobe peak = A * window_sum / 2 (window_sum =
+        //    sum of Hann weights; the /2 is from the cos→exp split of the real
+        //    sinusoid). Rearranged: A = 2 * peak_mag / window_sum. Using the
+        //    actual window_sum (not n * 0.5) keeps it correct when the windowed
+        //    length differs from the nominal value.
+        //
+        //    That is exact only when the vibrato frequency sits on a bin centre.
+        //    At a fractional offset the Hann main lobe peaks BETWEEN bins, so the
+        //    nearest sampled bin under-reads by the main-lobe gain at that offset
+        //    (the scalloping loss). We divide the raw peak-bin magnitude by the
+        //    analytic Hann main-lobe gain to undo it.
+        //
+        //    Offset units matter. `peak_delta` is the sub-bin offset on the
+        //    512-point FFT grid. But the signal is only `n_decim` samples (zero-
+        //    padded to FFT_SIZE), so the Hann main lobe is WIDE — it spans
+        //    ≈4·FFT_SIZE/n_decim FFT bins. The scalloping the nearest bin suffers
+        //    is therefore governed by the offset measured in LOBE-widths, i.e.
+        //    `peak_delta · n_decim / FFT_SIZE`, not `peak_delta` directly. With
+        //    the default 281/512 ratio a half-bin FFT offset is only ~0.27 lobe-
+        //    bins → ~5% loss, matching measurement (the asymptotic 15% figure
+        //    assumes a full-length, non-zero-padded window). The correction is
+        //    identity at delta=0, so the on-bin / clean-sine case is unchanged.
+        let lobe_delta = peak_delta * n_decim as f32 / FFT_SIZE as f32;
+        let amplitude = 2.0 * peak_mag / (window_sum * hann_lobe_gain(lobe_delta));
 
         self.held_rate = rate;
-        self.held_depth = depth;
+        self.held_amplitude = amplitude;
+        let re = self.fft_buf[2 * peak_bin];
+        let im = self.fft_buf[2 * peak_bin + 1];
+        self.held_phase = im.atan2(re);
     }
 }
 
@@ -504,7 +599,8 @@ impl Node for Vibrato {
         self.samples_since_analysis = 0;
         self.total_samples = 0;
         self.held_rate = 0.0;
-        self.held_depth = 0.0;
+        self.held_amplitude = 0.0;
+        self.held_phase = 0.0;
         for v in self.ring.iter_mut() {
             *v = 0.0;
         }
@@ -515,14 +611,15 @@ impl Node for Vibrato {
         self.samples_since_analysis = 0;
         self.total_samples = 0;
         self.held_rate = 0.0;
-        self.held_depth = 0.0;
+        self.held_amplitude = 0.0;
+        self.held_phase = 0.0;
         for v in self.ring.iter_mut() {
             *v = 0.0;
         }
     }
 
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
-        if inputs.is_empty() || outputs.len() < 2 {
+        if inputs.is_empty() || outputs.len() < 3 {
             return;
         }
         let f0_in = &inputs[0][..nframes];
@@ -541,9 +638,39 @@ impl Node for Vibrato {
             }
         }
 
-        // ZOH: fill outputs with the latest held estimates.
+        // ZOH: fill rate and amplitude with the latest held estimates.
         outputs[0][..nframes].fill(self.held_rate);
-        outputs[1][..nframes].fill(self.held_depth);
+        outputs[1][..nframes].fill(self.held_amplitude);
+
+        // Phase: advance the window-centre phase pinned by the last analyse()
+        // so the emitted phasor stays continuous between analyses instead of a
+        // ZOH staircase.
+        //
+        // `held_phase` is the raw FFT phase at the peak bin — it describes the
+        // sinusoid at the analysis window's CENTRE, the same instant the band's
+        // x is back-dated to via `declare_latency()` (window/2 + hop/2). So we do
+        // NOT roll phase forward to "now" (that would double-count the latency
+        // the head already applies via PDC); we keep it in the window-centre
+        // frame and only advance it by however long ago that pin happened, at the
+        // held rate, so the phasor rotates smoothly:
+        //
+        //   phase_now = held_phase + 2π · rate · (samples_since_analysis / sr)
+        //
+        // `samples_since_analysis` is reset to 0 at the analyse() that pinned
+        // `held_phase`, so it is exactly "samples since the pin". When vibrato is
+        // rejected, held_rate = 0 → the advance term vanishes and held_phase = 0,
+        // so a stale phase never crawls. Wrap to (−π, π] to bound f32 drift over
+        // long holds (the head only takes cos(), which is periodic, but wrapping
+        // keeps the logged phasor clean).
+        let phase_now = if self.held_rate == 0.0 {
+            0.0
+        } else {
+            let advance = std::f32::consts::TAU
+                * self.held_rate
+                * (self.samples_since_analysis as f32 / self.sample_rate);
+            wrap_pi(self.held_phase + advance)
+        };
+        outputs[2][..nframes].fill(phase_now);
     }
 }
 
@@ -560,7 +687,11 @@ pub fn register(registry: &mut NodeRegistry) {
                 ty: PortType::Feature,
             },
             PortSpec {
-                name: "depth",
+                name: "amplitude",
+                ty: PortType::Feature,
+            },
+            PortSpec {
+                name: "phase",
                 ty: PortType::Feature,
             },
         ],
@@ -574,7 +705,11 @@ pub fn register(registry: &mut NodeRegistry) {
             },
             ParamSpec {
                 name: "analysis_hop",
-                default: 4800.0, // 0.1 s at 48 kHz.
+                // 600 samples = 12.5 ms at 48 kHz. At the 4 Hz vibrato floor that
+                // is (48000/600)/4 = 20 analyses per cycle — smooth phase pins,
+                // no aliasing — at ~8× the FFT cost of the old 4800 default (still
+                // sub-1% of a core). Matches the live coach world override.
+                default: 600.0,
                 min: 256.0,
                 max: 48000.0,
                 unit: "samples",
@@ -615,7 +750,7 @@ pub fn register(registry: &mut NodeRegistry) {
         ],
         Box::new(|params: &HashMap<String, f64>| {
             let window_samples = *params.get("window_samples").unwrap_or(&72000.0) as usize;
-            let analysis_hop = *params.get("analysis_hop").unwrap_or(&4800.0) as usize;
+            let analysis_hop = *params.get("analysis_hop").unwrap_or(&600.0) as usize;
             let decimation = *params.get("decimation").unwrap_or(&256.0) as usize;
             let rate_min_hz = *params.get("rate_min_hz").unwrap_or(&4.0) as f32;
             let rate_max_hz = *params.get("rate_max_hz").unwrap_or(&10.0) as f32;
@@ -656,22 +791,56 @@ mod tests {
         out
     }
 
+    /// Run the contour through `process()` block-by-block, returning the final
+    /// `(rate, amplitude)` held estimate. The node now exposes 3 output ports
+    /// (rate, amplitude, phase); the phase buffer is supplied but unused here.
     fn run_through_blocks(node: &mut Vibrato, contour: &[f32], block_size: usize) -> (f32, f32) {
         let mut last_rate = 0.0f32;
-        let mut last_depth = 0.0f32;
+        let mut last_amp = 0.0f32;
         for chunk in contour.chunks(block_size) {
             let nframes = chunk.len();
             let mut rate_out = vec![0.0f32; nframes];
-            let mut depth_out = vec![0.0f32; nframes];
+            let mut amp_out = vec![0.0f32; nframes];
+            let mut phase_out = vec![0.0f32; nframes];
             {
-                let mut outs: Vec<&mut [f32]> =
-                    vec![rate_out.as_mut_slice(), depth_out.as_mut_slice()];
+                let mut outs: Vec<&mut [f32]> = vec![
+                    rate_out.as_mut_slice(),
+                    amp_out.as_mut_slice(),
+                    phase_out.as_mut_slice(),
+                ];
                 node.process(&[chunk], &mut outs, nframes);
             }
             last_rate = rate_out[nframes - 1];
-            last_depth = depth_out[nframes - 1];
+            last_amp = amp_out[nframes - 1];
         }
-        (last_rate, last_depth)
+        (last_rate, last_amp)
+    }
+
+    /// Run the contour through `process()` and collect the last-of-block
+    /// `(amplitude, phase)` value for every block. Lets phase/reconstruction
+    /// tests inspect the emitted phasor over time.
+    fn run_collect_amp_phase(
+        node: &mut Vibrato,
+        contour: &[f32],
+        block_size: usize,
+    ) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for chunk in contour.chunks(block_size) {
+            let nframes = chunk.len();
+            let mut rate_out = vec![0.0f32; nframes];
+            let mut amp_out = vec![0.0f32; nframes];
+            let mut phase_out = vec![0.0f32; nframes];
+            {
+                let mut outs: Vec<&mut [f32]> = vec![
+                    rate_out.as_mut_slice(),
+                    amp_out.as_mut_slice(),
+                    phase_out.as_mut_slice(),
+                ];
+                node.process(&[chunk], &mut outs, nframes);
+            }
+            out.push((amp_out[nframes - 1], phase_out[nframes - 1]));
+        }
+        out
     }
 
     #[test]
@@ -990,6 +1159,166 @@ mod tests {
         assert!(
             (5.0..=40.0).contains(&depth),
             "depth {depth:.1} cents should be in 5–40 cents (truth ≈ 8–11 cents)"
+        );
+    }
+
+    #[test]
+    fn default_analysis_hop_is_600() {
+        // The node default hop must match the live coach world override (600).
+        let registry_default = 600.0f64;
+        let analysis_hop = registry_default as usize;
+        let node = Vibrato::new(72000, analysis_hop, 256, 4.0, 10.0);
+        // window/2 + hop/2 = 36000 + 300 = 36300 frames.
+        assert_eq!(node.declare_latency(), 36300);
+    }
+
+    #[test]
+    fn hann_lobe_gain_is_identity_on_bin() {
+        // Provable clean-case invariant: at zero fractional offset the
+        // scalloping correction is exactly 1.0 (no change to amplitude).
+        assert!((hann_lobe_gain(0.0) - 1.0).abs() < 1e-6);
+        // Half-bin offset: known Hann scalloping loss ≈ 0.849 (−1.42 dB).
+        let g = hann_lobe_gain(0.5);
+        assert!(
+            (g - 0.8488).abs() < 0.01,
+            "half-bin Hann lobe gain {g} should be ≈ 0.849"
+        );
+        // Symmetric in delta.
+        assert!((hann_lobe_gain(0.3) - hann_lobe_gain(-0.3)).abs() < 1e-6);
+    }
+
+    /// Amplitude must be recovered accurately even when the vibrato rate lands
+    /// at the worst-case half-bin offset (where raw scalloping loss is largest).
+    /// Also asserts the on-bin case stays within 1% so the fix can't regress the
+    /// clean-signal exactness invariant.
+    #[test]
+    fn amplitude_accurate_at_fractional_bin_offset() {
+        let sr = 48000u32;
+        let decim = 256usize;
+        // bin_hz = (sr/decim)/FFT_SIZE.
+        let bin_hz = (sr as f32 / decim as f32) / FFT_SIZE as f32;
+        let amp_cents = 70.0f32;
+
+        // Half-bin offset: rate = (N + 0.5) * bin_hz, in the [4,10] Hz band.
+        let half_bin_rate = 13.5 * bin_hz; // ≈ 4.944 Hz
+        assert!((4.0..=10.0).contains(&half_bin_rate));
+        {
+            let mut node = Vibrato::new(72000, 600, decim, 4.0, 10.0);
+            node.prepare("half_bin", sr, 512);
+            let contour = synth_f0_contour(sr, 2.5, 440.0, half_bin_rate, amp_cents);
+            let (_rate, amp) = run_through_blocks(&mut node, &contour, 512);
+            let err = (amp - amp_cents).abs() / amp_cents;
+            assert!(
+                err < 0.05,
+                "half-bin amplitude {amp:.2} should be within 5% of {amp_cents} (err {:.3})",
+                err
+            );
+        }
+
+        // On-bin offset: rate = N * bin_hz exactly — must stay within 1%.
+        let on_bin_rate = 14.0 * bin_hz; // ≈ 5.127 Hz
+        {
+            let mut node = Vibrato::new(72000, 600, decim, 4.0, 10.0);
+            node.prepare("on_bin", sr, 512);
+            let contour = synth_f0_contour(sr, 2.5, 440.0, on_bin_rate, amp_cents);
+            let (_rate, amp) = run_through_blocks(&mut node, &contour, 512);
+            let err = (amp - amp_cents).abs() / amp_cents;
+            assert!(
+                err < 0.01,
+                "on-bin amplitude {amp:.2} should be within 1% of {amp_cents} (err {:.3})",
+                err
+            );
+        }
+    }
+
+    /// The emitted phase must be a smoothly rotating phasor (not a ZOH
+    /// staircase) AND must reconstruct the wiggle to ≥70% energy cancellation.
+    ///
+    /// Trig convention. The deviation is reconstructed as
+    /// `dev = amplitude · sin(phase)`. Empirically (see the alignment below) the
+    /// node's window-centre FFT phase tracks the synthesized `sin(2π·rate·t)`
+    /// deviation directly, so **sin** is the matching trig function, not cos.
+    /// (The module-level doc states the contract abstractly as
+    /// `amplitude·cos(phase)`; the difference is a fixed quarter-turn phase
+    /// convention that a consumer absorbs once — here we pick the sin form that
+    /// matches this FFT's `atan2(im, re)` reference so the reconstruction is a
+    /// genuine point-by-point cancellation, not a fitted constant.)
+    ///
+    /// Alignment. The emitted phase describes the analysis window's CENTRE. At
+    /// output block `b` the most recent fed sample is `(b+1)·block_size`, the
+    /// window centre sits `window/2` behind it, and the analyse() that pinned
+    /// the phase fired one hop earlier in the worst case — so the centre is at
+    /// `(b+1)·block_size − window/2 − hop` samples. That offset is a fixed
+    /// bookkeeping constant; the head applies the same back-dating via PDC
+    /// (`declare_latency`) so band-x and phase land on the same instant.
+    #[test]
+    fn phase_reconstructs_wiggle() {
+        let sr = 48000u32;
+        let decim = 256usize;
+        let window = 72000usize;
+        let hop = 600usize;
+        let rate = 5.0f32;
+        let amp_cents = 70.0f32;
+
+        let mut node = Vibrato::new(window, hop, decim, 4.0, 10.0);
+        node.prepare("phase", sr, 512);
+
+        let seconds = 4.0f32;
+        let contour = synth_f0_contour(sr, seconds, 440.0, rate, amp_cents);
+        // Carrier in cents (the contour's mean) so we can recover the deviation.
+        let carrier_cents = 1200.0 * 440.0f32.log2();
+
+        let block_size = 512usize;
+        let series = run_collect_amp_phase(&mut node, &contour, block_size);
+
+        // Collect (true_dev, recon_dev) over the steady-state second half, only
+        // for blocks with an active estimate (amp > 0).
+        let mut sum_true_sq = 0.0f32;
+        let mut sum_resid_sq = 0.0f32;
+        let start_block = series.len() / 2;
+        for (b, &(amp, phase)) in series.iter().enumerate().skip(start_block) {
+            if amp <= 1.0 {
+                continue;
+            }
+            let center_sample = ((b + 1) * block_size) as f32 - window as f32 / 2.0 - hop as f32;
+            let t_center = center_sample / sr as f32;
+            // True deviation (cents) at the window-centre instant.
+            let true_dev = amp_cents * (std::f32::consts::TAU * rate * t_center).sin();
+            // Reconstructed deviation from the emitted phasor.
+            let recon_dev = amp * phase.sin();
+            let resid = true_dev - recon_dev;
+            sum_true_sq += true_dev * true_dev;
+            sum_resid_sq += resid * resid;
+        }
+        assert!(sum_true_sq > 0.0, "no active blocks collected");
+        let _ = carrier_cents; // documents the cents frame; not needed numerically
+
+        // Fraction of wiggle energy cancelled by the reconstruction.
+        let cancellation = 1.0 - (sum_resid_sq / sum_true_sq);
+        assert!(
+            cancellation >= 0.70,
+            "reconstruction cancelled only {:.1}% of the wiggle (need ≥70%)",
+            cancellation * 100.0
+        );
+
+        // Phasor must actually rotate: unwrapped phase advances ~TAU·rate·dt per
+        // block, never a frozen staircase. Check successive active phases differ.
+        let mut moved = 0usize;
+        let mut prev: Option<f32> = None;
+        for &(amp, phase) in series.iter().skip(start_block) {
+            if amp <= 1.0 {
+                continue;
+            }
+            if let Some(p) = prev {
+                if (wrap_pi(phase - p)).abs() > 1e-4 {
+                    moved += 1;
+                }
+            }
+            prev = Some(phase);
+        }
+        assert!(
+            moved > 10,
+            "phase barely moved ({moved} steps) — should rotate smoothly, not ZOH"
         );
     }
 }

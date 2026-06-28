@@ -153,7 +153,7 @@ fn run_cell(rate_hz: f32, snr_db: f32, rate_idx: usize, snr_idx: usize) -> CellR
                 to: "rate_out".to_string(),
             },
             Connection {
-                from: "vib.depth".to_string(),
+                from: "vib.amplitude".to_string(),
                 to: "depth_out".to_string(),
             },
         ],

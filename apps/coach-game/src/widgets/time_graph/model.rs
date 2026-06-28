@@ -17,7 +17,7 @@ use domain_ports::pitch::PitchLog2;
 // ---------------------------------------------------------------------------
 
 /// Depth below which we treat the pitch wobble as noise, not vibrato
-/// (cents — the `vibrato_depth` feature is emitted in cents by `node-vibrato`,
+/// (cents — the `vibrato_amplitude` feature is emitted in cents by `node-vibrato`,
 /// which builds the contour as `1200 × log2(f)`). Typical sung vibrato is
 /// ~20–50 cents peak-to-peak (≈ 0.2–0.5 st), so a 20-cent floor gives margin
 /// against gentle ornamentation and pitch jitter.
@@ -220,7 +220,7 @@ fn filter_in_window(
             // here — it would double-count information already expressed through
             // the other visual channels.
             let raw_half_height = if octave_span > 0.0 {
-                (point.vibrato_depth / 1200.0) / octave_span
+                (point.vibrato_amplitude / 1200.0) / octave_span
             } else {
                 0.0
             };
@@ -527,7 +527,8 @@ mod tests {
                         pitch: PitchLog2(8.0),
                         confidence: 0.2,
                         vibrato_rate: 0.0,
-                        vibrato_depth: 0.0,
+                        vibrato_amplitude: 0.0,
+                        vibrato_phase: 0.0,
                     },
                     TracePoint {
                         t_ms: 60,
@@ -535,7 +536,8 @@ mod tests {
                         pitch: PitchLog2(9.0),
                         confidence: 0.8,
                         vibrato_rate: 5.5,
-                        vibrato_depth: 60.0,
+                        vibrato_amplitude: 60.0,
+                        vibrato_phase: 0.0,
                     },
                 ],
             }],
@@ -576,7 +578,8 @@ mod tests {
             pitch,
             confidence: 0.8,
             vibrato_rate: 0.0,
-            vibrato_depth: 0.0,
+            vibrato_amplitude: 0.0,
+            vibrato_phase: 0.0,
         }
     }
 
@@ -600,7 +603,8 @@ mod tests {
                     pitch: PitchLog2(9.0),
                     confidence: 0.8,
                     vibrato_rate: 0.0,
-                    vibrato_depth: 0.0,
+                    vibrato_amplitude: 0.0,
+                    vibrato_phase: 0.0,
                 }],
             }],
             grooves: vec![GrooveLine {
@@ -906,8 +910,9 @@ mod tests {
                     vibrato_t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 1.0,
-                    vibrato_rate: 5.5,    // band centre
-                    vibrato_depth: 120.0, // well above full gate
+                    vibrato_rate: 5.5,        // band centre
+                    vibrato_amplitude: 120.0, // well above full gate
+                    vibrato_phase: 0.0,
                 }],
             }],
             grooves: vec![],
@@ -949,7 +954,8 @@ mod tests {
                     pitch: PitchLog2(pitch_log2 as f32),
                     confidence: 0.0, // vibrato_strength=0, so band is zero
                     vibrato_rate: 0.0,
-                    vibrato_depth: 0.0,
+                    vibrato_amplitude: 0.0,
+                    vibrato_phase: 0.0,
                 }
             })
             .collect();
@@ -1012,7 +1018,8 @@ mod tests {
                     pitch: PitchLog2(9.0),
                     confidence: 0.9,
                     vibrato_rate: 0.0,
-                    vibrato_depth: 0.0, // zero depth → zero height
+                    vibrato_amplitude: 0.0, // zero depth → zero height
+                    vibrato_phase: 0.0,
                 }],
             }],
             grooves: vec![],
@@ -1045,8 +1052,9 @@ mod tests {
                     vibrato_t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 0.9,
-                    vibrato_rate: 0.0,    // off-band rate → strength = 0
-                    vibrato_depth: 120.0, // 120 cents → raw_hh = 0.05
+                    vibrato_rate: 0.0,        // off-band rate → strength = 0
+                    vibrato_amplitude: 120.0, // 120 cents → raw_hh = 0.05
+                    vibrato_phase: 0.0,
                 }],
             }],
             grooves: vec![],
@@ -1114,7 +1122,8 @@ mod tests {
                     pitch: PitchLog2(pitch_log2 as f32),
                     confidence: 0.0,
                     vibrato_rate: 0.0,
-                    vibrato_depth: 0.0,
+                    vibrato_amplitude: 0.0,
+                    vibrato_phase: 0.0,
                 }
             })
             .collect();
@@ -1215,7 +1224,8 @@ mod tests {
                     pitch: PitchLog2(pitch_log2 as f32),
                     confidence: 1.0,
                     vibrato_rate: 5.5,
-                    vibrato_depth: 60.0,
+                    vibrato_amplitude: 60.0,
+                    vibrato_phase: 0.0,
                 }
             })
             .collect();

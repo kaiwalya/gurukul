@@ -124,7 +124,8 @@ fn ingame_widgets_are_pairwise_disjoint_and_fill_viewport() {
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
-            vibrato_depth: 0.0,
+            vibrato_amplitude: 0.0,
+            vibrato_phase: 0.0,
             vibrato_t_ms: 1_000,
             t_ms: 1_000,
         }];

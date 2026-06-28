@@ -10,7 +10,8 @@
     { "id": "onset" },
     { "id": "breath" },
     { "id": "vibrato_rate" },
-    { "id": "vibrato_depth" }
+    { "id": "vibrato_amplitude" },
+    { "id": "vibrato_phase" }
   ],
   "nodes": [
     {
@@ -34,7 +35,8 @@
     },
     {
       "id": "vibrato_det",
-      "type": "Vibrato"
+      "type": "Vibrato",
+      "params": { "analysis_hop": 600 }
     }
   ],
   "connections": [
@@ -47,6 +49,7 @@
     { "from": "onset_det.onset",    "to": "onset" },
     { "from": "breath_det.breath",  "to": "breath" },
     { "from": "vibrato_det.rate",   "to": "vibrato_rate" },
-    { "from": "vibrato_det.depth",  "to": "vibrato_depth" }
+    { "from": "vibrato_det.amplitude",  "to": "vibrato_amplitude" },
+    { "from": "vibrato_det.phase",  "to": "vibrato_phase" }
   ]
 }

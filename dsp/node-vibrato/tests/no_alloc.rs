@@ -36,17 +36,23 @@ fn process_does_not_allocate() {
     // 3 s of contour → enough blocks to drive ring-fill + many analyses.
     let signal = vibrato_f0(3.0, 440.0, 5.0, 50.0);
     let mut rate_out = vec![0.0f32; BLOCK];
-    let mut depth_out = vec![0.0f32; BLOCK];
+    let mut amp_out = vec![0.0f32; BLOCK];
+    let mut phase_out = vec![0.0f32; BLOCK];
 
     assert_no_alloc(|| {
         for chunk in signal.chunks(BLOCK) {
             let nframes = chunk.len();
             rate_out[..nframes].fill(0.0);
-            depth_out[..nframes].fill(0.0);
-            // Stack-allocated [&mut [f32]; 2] array literal — no Vec, no heap.
+            amp_out[..nframes].fill(0.0);
+            phase_out[..nframes].fill(0.0);
+            // Stack-allocated [&mut [f32]; 3] array literal — no Vec, no heap.
             node.process(
                 &[chunk],
-                &mut [&mut rate_out[..nframes], &mut depth_out[..nframes]],
+                &mut [
+                    &mut rate_out[..nframes],
+                    &mut amp_out[..nframes],
+                    &mut phase_out[..nframes],
+                ],
                 nframes,
             );
         }

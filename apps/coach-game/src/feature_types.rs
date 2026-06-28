@@ -20,8 +20,10 @@ pub struct Features {
     pub breath: f32,
     /// Vibrato rate in Hz over the recent window.
     pub vibrato_rate: f32,
-    /// Vibrato depth in semitones.
-    pub vibrato_depth: f32,
+    /// Vibrato amplitude in semitones.
+    pub vibrato_amplitude: f32,
+    /// Instantaneous vibrato phase in radians.
+    pub vibrato_phase: f32,
     /// Back-dated timestamp for vibrato features, in ms. See [`FeatureSnapshot::vibrato_t_ms`].
     #[serde(default)]
     pub vibrato_t_ms: u64,
@@ -38,7 +40,8 @@ impl From<FeatureSnapshot> for Features {
             onset: snapshot.onset,
             breath: snapshot.breath,
             vibrato_rate: snapshot.vibrato_rate,
-            vibrato_depth: snapshot.vibrato_depth,
+            vibrato_amplitude: snapshot.vibrato_amplitude,
+            vibrato_phase: snapshot.vibrato_phase,
             vibrato_t_ms: snapshot.vibrato_t_ms,
             t_ms: snapshot.t_ms,
         }

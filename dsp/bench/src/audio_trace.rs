@@ -111,7 +111,8 @@ pub fn replay_samples(
             "onset",
             "breath",
             "vibrato_rate",
-            "vibrato_depth",
+            "vibrato_amplitude",
+            "vibrato_phase",
         ])
         .run(crate::Run::blocks(n_hops as u64));
 
@@ -121,7 +122,8 @@ pub fn replay_samples(
     let onset_buf = captured.out("onset");
     let breath_buf = captured.out("breath");
     let vrate_buf = captured.out("vibrato_rate");
-    let vdepth_buf = captured.out("vibrato_depth");
+    let vamp_buf = captured.out("vibrato_amplitude");
+    let vphase_buf = captured.out("vibrato_phase");
 
     let mut hops: Vec<SidecarHop> = Vec::with_capacity(n_hops);
     for i in 0..n_hops {
@@ -133,7 +135,8 @@ pub fn replay_samples(
             onset: onset_buf[s0],
             breath: breath_buf[s0],
             vibrato_rate: vrate_buf[s0],
-            vibrato_depth: vdepth_buf[s0],
+            vibrato_amplitude: vamp_buf[s0],
+            vibrato_phase: vphase_buf[s0],
         });
     }
 
@@ -143,7 +146,7 @@ pub fn replay_samples(
         .unwrap_or_else(|| world_path.to_string_lossy().into_owned());
 
     let manifest = Manifest {
-        schema: 1,
+        schema: 2,
         world: world_name,
         world_sha256: world_sha256.to_string(),
         sample_rate,
@@ -175,7 +178,8 @@ mod tests {
             onset: 0.0,
             breath: 1.0,
             vibrato_rate: 5.5,
-            vibrato_depth: 0.02,
+            vibrato_amplitude: 0.02,
+            vibrato_phase: 0.0,
         };
         let json = serde_json::to_string(&hop).unwrap();
         let back: SidecarHop = serde_json::from_str(&json).unwrap();
@@ -187,7 +191,7 @@ mod tests {
     #[test]
     fn manifest_round_trips() {
         let m = Manifest {
-            schema: 1,
+            schema: 2,
             world: "coach.json".to_string(),
             world_sha256: "deadbeef".to_string(),
             sample_rate: 48000,

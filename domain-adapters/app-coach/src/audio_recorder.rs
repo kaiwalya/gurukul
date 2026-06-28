@@ -276,7 +276,7 @@ impl Recorder {
         let manifest_path = audio_trace_format::manifest_path(&meta.prefix);
 
         let manifest = Manifest {
-            schema: 1,
+            schema: 2,
             world: meta.world_name.clone(),
             world_sha256: meta.world_sha256.clone(),
             sample_rate: meta.sample_rate,
@@ -381,7 +381,8 @@ mod tests {
                 onset: 0.0,
                 breath: 0.0,
                 vibrato_rate: 0.0,
-                vibrato_depth: 0.0,
+                vibrato_amplitude: 0.0,
+                vibrato_phase: 0.0,
             });
         }
 
@@ -420,7 +421,7 @@ mod tests {
         assert!(manifest_path.exists(), "manifest must exist");
         let manifest_str = fs::read_to_string(&manifest_path).expect("read manifest");
         let manifest: Manifest = serde_json::from_str(&manifest_str).expect("manifest must parse");
-        assert_eq!(manifest.schema, 1);
+        assert_eq!(manifest.schema, 2);
         assert_eq!(manifest.block_size, 512);
         assert_eq!(manifest.channels, 1);
         assert_eq!(manifest.n_hops, N_HOPS);
@@ -458,7 +459,8 @@ mod tests {
                 onset: 0.1,
                 breath: 0.05,
                 vibrato_rate: 5.0,
-                vibrato_depth: 0.01,
+                vibrato_amplitude: 0.01,
+                vibrato_phase: 0.0,
             });
         }
 
@@ -482,7 +484,7 @@ mod tests {
         let manifest: Manifest =
             serde_json::from_str(&manifest_str).expect("Manifest round-trip parse");
         assert_eq!(manifest.n_hops, N_HOPS);
-        assert_eq!(manifest.schema, 1);
+        assert_eq!(manifest.schema, 2);
     }
 
     // Test 5: Periodic flush — WAV is readable with correct sample count without
@@ -558,7 +560,8 @@ mod tests {
             onset: 0.0,
             breath: 0.0,
             vibrato_rate: 0.0,
-            vibrato_depth: 0.0,
+            vibrato_amplitude: 0.0,
+            vibrato_phase: 0.0,
         });
 
         // Simulate a mid-run invalidation (what try_send-full or a writer I/O

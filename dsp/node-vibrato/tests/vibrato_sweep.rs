@@ -99,7 +99,7 @@ fn run_cell(carrier_hz: f32, rate_hz: f32, depth_cents: f32) -> CellResult {
                 to: "rate_out".to_string(),
             },
             Connection {
-                from: "vib.depth".to_string(),
+                from: "vib.amplitude".to_string(),
                 to: "depth_out".to_string(),
             },
         ],

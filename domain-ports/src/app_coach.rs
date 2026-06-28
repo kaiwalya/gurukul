@@ -373,7 +373,7 @@ pub enum AudioSessionErrorKind {
 /// frame reports a positive Hz value; an unvoiced frame reports
 /// `0.0`. This matches the YIN node's sentinel and keeps the read
 /// path branch-free. The other features (`onset`, `breath`,
-/// `vibrato_rate`, `vibrato_depth`) are always populated — their
+/// `vibrato_rate`, `vibrato_amplitude`) are always populated — their
 /// detectors emit `0.0` during inactive frames rather than a
 /// distinguished sentinel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -420,11 +420,15 @@ pub struct FeatureSnapshot {
     /// silence will report `0.0` until the window fills.
     pub vibrato_rate: f32,
 
-    /// Vibrato depth in cents over the most recent analysis window
+    /// Vibrato amplitude in cents over the most recent analysis window
     /// (the analyzer builds the f0 contour as `1200 × log2(f)` and
-    /// reports half its peak-to-peak range). Pairs with `vibrato_rate`;
-    /// both go to `0.0` together when vibrato detection is inactive.
-    pub vibrato_depth: f32,
+    /// reports the sinusoid amplitude A — the half-swing; peak-to-peak = 2·amplitude).
+    /// Pairs with `vibrato_rate`; both go to `0.0` together when vibrato detection is inactive.
+    pub vibrato_amplitude: f32,
+
+    /// Instantaneous vibrato phase in radians, extrapolated from the
+    /// last analysis window. `0.0` when no stable vibrato is detected.
+    pub vibrato_phase: f32,
 
     /// Back-dated wall-clock timestamp for vibrato features, in milliseconds.
     ///

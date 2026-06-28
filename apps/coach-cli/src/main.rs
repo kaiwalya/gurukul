@@ -221,7 +221,10 @@ fn print_features(s: &FeatureSnapshot, use_color: bool) {
     // vibrato: 6 chars rate + slash + 5 chars depth keeps the column
     // width identical whether vibrato is detected or not.
     let vib_str = if s.vibrato_rate > 0.0 {
-        format!("vib {:>4.1}Hz/{:>4.2}st", s.vibrato_rate, s.vibrato_depth)
+        format!(
+            "vib {:>4.1}Hz/{:>4.2}st",
+            s.vibrato_rate, s.vibrato_amplitude
+        )
     } else {
         format!("vib {:>4}Hz/{:>4}st", "--", "--")
     };

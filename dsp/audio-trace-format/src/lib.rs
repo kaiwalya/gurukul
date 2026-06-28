@@ -16,13 +16,14 @@ pub struct SidecarHop {
     pub onset: f32,
     pub breath: f32,
     pub vibrato_rate: f32,
-    pub vibrato_depth: f32,
+    pub vibrato_amplitude: f32,
+    pub vibrato_phase: f32,
 }
 
 /// Run-configuration manifest written to `.manifest.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Format version. `1` for this schema; bump only on a breaking change.
+    /// Format version. `2` for this schema; bump only on a breaking change.
     pub schema: u32,
     /// World filename (basename of the mounted path).
     pub world: String,

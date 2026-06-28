@@ -129,7 +129,7 @@ fn classify_port(_node: &str, port: &str) -> PortShape {
         // Onset emits short impulses.
         "onset" => PortShape::FeatureEvent,
         // Breath / vibrato detectors emit slowly-varying scalars.
-        "breath" | "rate" | "depth" => PortShape::Control,
+        "breath" | "rate" | "amplitude" => PortShape::Control,
         _ => PortShape::Control,
     }
 }

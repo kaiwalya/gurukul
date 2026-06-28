@@ -297,7 +297,7 @@ mod tests {
             &[
                 HEADER_V4,
                 r#"{"f":1,"k":"frame","delta_s":0.016}"#,
-                r#"{"f":1,"k":"coach","drained":[{"hop_index":1,"f0_hz":222.0,"confidence":0.7,"onset":0.0,"breath":0.0,"vibrato_rate":0.0,"vibrato_depth":0.0,"t_ms":1010}]}"#,
+                r#"{"f":1,"k":"coach","drained":[{"hop_index":1,"f0_hz":222.0,"confidence":0.7,"onset":0.0,"breath":0.0,"vibrato_rate":0.0,"vibrato_amplitude":0.0,"vibrato_phase":0.0,"t_ms":1010}]}"#,
                 r#"{"f":1,"k":"input","input":"cursor","pos":[640.0,360.0]}"#,
                 r#"{"f":1,"k":"input","input":"mouse_button","button":"Left","state":"pressed"}"#,
                 r#"{"f":1,"k":"input","input":"key","key":"F8","state":"pressed","repeat":false}"#,
