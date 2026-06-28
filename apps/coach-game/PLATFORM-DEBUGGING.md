@@ -228,10 +228,19 @@ When a platform-specific failure resists the obvious fixes:
    route/rate rules the sim ignores. A clean sim run does **not** mean the
    device path works.
 
-### Known open issue (device mic)
+### Resolved: device mic (the bug this method found)
 
-As of Phase 1.6.2, device mic capture does **not** work: cpal 0.17.1's iOS
-input path never enables the RemoteIO **input** bus on real hardware — the
-device syslog shows only output units (`IsRecording` never true). Sim mic and
-Mac mic are unaffected. Tracked for a cpal version bump / patch / native
-input adapter; see [`docs/PHASE_1_6_PLAN.md`](../../docs/PHASE_1_6_PLAN.md).
+The forensics above cracked the original device-mic failure: cpal 0.17.1's
+iOS input path never enabled the RemoteIO **input** bus on real hardware —
+the device syslog showed only output units (`IsRecording` never true). The
+true floor was upstream of cpal: `coreaudio-rs`'s `AudioUnit::new` calls
+`AudioUnitInitialize` *inside the constructor*, and on real hardware that
+premature initialize made the first `EnableIO` fail (-10851).
+
+Fix: the native **`audio-apple`** adapter (`domain-adapters/audio-apple`)
+owns the input unit end to end on raw objc2 CoreAudio FFI — no cpal, no
+coreaudio-rs — building it create → configure-while-uninitialized →
+initialize → start. Apple targets (Mac + iOS) route here; cpal remains only
+the non-Apple desktop path. Proven on an iPhone 14 Pro (224k feature frames
+in a 15 s run). The cpal forensic lessons above stay because cpal still
+backs the desktop path and the method generalizes.
