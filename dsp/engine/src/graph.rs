@@ -542,6 +542,20 @@ impl Engine {
     // Build-time resolution (NOT realtime-safe; string lookups allowed)
     // -------------------------------------------------------------------------
 
+    /// Inherent latency (in frames) of the node that feeds boundary out-port `h`.
+    ///
+    /// Boot-time lookup — walks `out_port_sources[h] → node → declare_latency()`.
+    /// NOT realtime-safe; call once after `Engine::build`, never in `process_block`.
+    pub fn out_port_latency(&self, h: OutPortHandle) -> usize {
+        let idx = h.0 as usize;
+        debug_assert!(
+            idx < self.out_port_sources.len(),
+            "OutPortHandle out of range"
+        );
+        let (node_idx, _) = self.out_port_sources[idx];
+        self.nodes[node_idx].1.declare_latency()
+    }
+
     /// Resolve a boundary input port id to an `InPortHandle`.
     pub fn resolve_in_port(&self, id: &str) -> Result<InPortHandle, EngineError> {
         self.in_port_specs
@@ -923,6 +937,129 @@ mod tests {
             from: from.to_string(),
             to: to.to_string(),
         }
+    }
+
+    // --- out_port_latency tests ---
+
+    /// A node that declares a fixed latency of N frames, used to exercise
+    /// `out_port_latency` without depending on the real vibrato node.
+    struct FixedLatencyNode {
+        latency: usize,
+    }
+    impl Node for FixedLatencyNode {
+        fn prepare(&mut self, _: &str, _: u32, _: usize) {}
+        fn process(&mut self, _: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize) {
+            if let Some(out) = outputs.first_mut() {
+                out[..nframes].fill(0.0);
+            }
+        }
+        fn declare_latency(&self) -> usize {
+            self.latency
+        }
+    }
+
+    fn make_single_out_world(out_port_id: &str) -> (crate::world::World, NodeRegistry) {
+        use crate::node::PortSpec;
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Fixed38400",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(|_| Box::new(FixedLatencyNode { latency: 38400 }) as Box<dyn Node>),
+        );
+        registry.register_full(
+            "Fixed0",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(|_| Box::new(FixedLatencyNode { latency: 0 }) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![],
+            out_ports: vec![BoundaryPort {
+                id: out_port_id.to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "src".to_string(),
+                ty: "Fixed38400".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![Connection {
+                from: "src.sig".to_string(),
+                to: out_port_id.to_string(),
+            }],
+        };
+        (world, registry)
+    }
+
+    #[test]
+    fn out_port_latency_returns_declared_value() {
+        // A node declaring 38400 frames of latency: out_port_latency must return 38400.
+        let (world, registry) = make_single_out_world("y");
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        let h = engine.resolve_out_port("y").unwrap();
+        assert_eq!(engine.out_port_latency(h), 38400);
+    }
+
+    #[test]
+    fn out_port_latency_default_zero() {
+        // A node that relies on the default declare_latency() must return 0.
+        use crate::node::PortSpec;
+        use crate::world::{BoundaryPort, NodeDef, World};
+
+        let mut registry = NodeRegistry::new();
+        registry.register_full(
+            "Fixed0",
+            vec![],
+            vec![PortSpec {
+                name: "sig",
+                ty: PortType::Feature,
+            }],
+            vec![],
+            Box::new(|_| Box::new(FixedLatencyNode { latency: 0 }) as Box<dyn Node>),
+        );
+
+        let world = World {
+            schema: None,
+            world_version: 1,
+            in_ports: vec![],
+            out_ports: vec![BoundaryPort {
+                id: "y".to_string(),
+                name: None,
+                description: None,
+            }],
+            nodes: vec![NodeDef {
+                id: "src".to_string(),
+                ty: "Fixed0".to_string(),
+                params: Default::default(),
+                name: None,
+                description: None,
+            }],
+            connections: vec![Connection {
+                from: "src.sig".to_string(),
+                to: "y".to_string(),
+            }],
+        };
+
+        let engine = Engine::build(&world, &registry, 48000, 512).unwrap();
+        let h = engine.resolve_out_port("y").unwrap();
+        assert_eq!(engine.out_port_latency(h), 0);
     }
 
     #[test]

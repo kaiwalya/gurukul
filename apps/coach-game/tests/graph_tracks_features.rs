@@ -40,6 +40,7 @@ fn snapshot(
         breath,
         vibrato_rate: 5.5,
         vibrato_depth: 0.2,
+        vibrato_t_ms: t_ms,
         t_ms,
     }
 }

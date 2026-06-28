@@ -490,6 +490,14 @@ impl Vibrato {
 }
 
 impl Node for Vibrato {
+    fn declare_latency(&self) -> usize {
+        // Two additive terms:
+        //   window_samples / 2  — the estimate describes the MIDDLE of the analysis window
+        //   analysis_hop / 2    — zero-order-hold lag: an estimate is on average half a hop
+        //                         older than the window centre it was computed at
+        self.window_samples / 2 + self.analysis_hop / 2
+    }
+
     fn prepare(&mut self, _id: &str, sample_rate: u32, _block_size: usize) {
         self.sample_rate = sample_rate as f32;
         self.ring_write = 0;
@@ -664,6 +672,14 @@ mod tests {
             last_depth = depth_out[nframes - 1];
         }
         (last_rate, last_depth)
+    }
+
+    #[test]
+    fn declare_latency_equals_window_half_plus_hop_half() {
+        // Default params: window_samples=72000, analysis_hop=4800.
+        // Expected: 72000/2 + 4800/2 = 36000 + 2400 = 38400 frames.
+        let node = Vibrato::new(72000, 4800, 256, 4.0, 10.0);
+        assert_eq!(node.declare_latency(), 38400);
     }
 
     #[test]

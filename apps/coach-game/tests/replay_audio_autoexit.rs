@@ -71,6 +71,7 @@ fn push_hop(fake: &FakeCoach) {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 0,
             t_ms: 0,
         });
 }

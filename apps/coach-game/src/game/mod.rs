@@ -337,6 +337,7 @@ pub fn log_features(features: Res<LatestFeatures>, mut last: ResMut<LastFeatureH
         vibrato_rate,
         vibrato_depth,
         t_ms,
+        ..
     }) = features.0
     else {
         return;

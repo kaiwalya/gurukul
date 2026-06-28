@@ -49,6 +49,7 @@ fn snapshot(hop_index: u64, t_ms: u64, f0_hz: f32) -> FeatureSnapshot {
         breath: 0.0,
         vibrato_rate: 0.0,
         vibrato_depth: 0.0,
+        vibrato_t_ms: t_ms,
         t_ms,
     }
 }

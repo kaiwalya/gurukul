@@ -150,6 +150,10 @@ fn normalize_trace_segment(
             };
             let nx = normalize_time(point.t_ms, time_window)?;
             let ny = normalize_pitch(point.pitch, pitch_window)?;
+            // Vibrato band x uses the back-dated timestamp so the band slides
+            // forward ~0.80s to align with the pitch trace. `None` when the
+            // vibrato timestamp falls outside the window (band point hidden).
+            let vibrato_x = normalize_time(point.vibrato_t_ms, time_window);
             raw_half_heights.push(raw_hh);
             raw_ys.push(ny);
             Some(NormalizedTracePoint {
@@ -158,6 +162,7 @@ fn normalize_trace_segment(
                 vibrato_strength: strength,
                 band_half_height: 0.0, // filled in below after smoothing
                 band_center_y: 0.0,    // filled in below after smoothing
+                vibrato_x,
             })
         })
         .collect::<Vec<_>>();
@@ -337,6 +342,7 @@ mod tests {
                 points: vec![
                     TracePoint {
                         t_ms: 10,
+                        vibrato_t_ms: 10,
                         pitch: PitchLog2(8.0),
                         confidence: 0.2,
                         vibrato_rate: 0.0,
@@ -344,6 +350,7 @@ mod tests {
                     },
                     TracePoint {
                         t_ms: 60,
+                        vibrato_t_ms: 60,
                         pitch: PitchLog2(9.0),
                         confidence: 0.8,
                         vibrato_rate: 5.5,
@@ -384,6 +391,7 @@ mod tests {
     fn trace_point(t_ms: u64, pitch: PitchLog2) -> TracePoint {
         TracePoint {
             t_ms,
+            vibrato_t_ms: t_ms,
             pitch,
             confidence: 0.8,
             vibrato_rate: 0.0,
@@ -407,6 +415,7 @@ mod tests {
             trace_segments: vec![TraceSegment {
                 points: vec![TracePoint {
                     t_ms: 60,
+                    vibrato_t_ms: 60,
                     pitch: PitchLog2(9.0),
                     confidence: 0.8,
                     vibrato_rate: 0.0,
@@ -717,6 +726,7 @@ mod tests {
             trace_segments: vec![TraceSegment {
                 points: vec![TracePoint {
                     t_ms: 50,
+                    vibrato_t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 1.0,
                     vibrato_rate: 5.5,    // band centre
@@ -758,6 +768,7 @@ mod tests {
                 let pitch_log2 = ny * span + pitch_window_min;
                 TracePoint {
                     t_ms: (i as u64) * 50, // 50 ms per point
+                    vibrato_t_ms: (i as u64) * 50,
                     pitch: PitchLog2(pitch_log2 as f32),
                     confidence: 0.0, // vibrato_strength=0, so band is zero
                     vibrato_rate: 0.0,
@@ -820,6 +831,7 @@ mod tests {
             trace_segments: vec![TraceSegment {
                 points: vec![TracePoint {
                     t_ms: 50,
+                    vibrato_t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 0.9,
                     vibrato_rate: 0.0,
@@ -853,6 +865,7 @@ mod tests {
             trace_segments: vec![TraceSegment {
                 points: vec![TracePoint {
                     t_ms: 50,
+                    vibrato_t_ms: 50,
                     pitch: PitchLog2(9.0),
                     confidence: 0.9,
                     vibrato_rate: 0.0,    // off-band rate → strength = 0

@@ -64,6 +64,12 @@ pub struct NormalizedTracePoint {
     /// window than `band_half_height` so one full vibrato cycle is
     /// averaged out and the rails stay steady.
     pub band_center_y: f32,
+    /// Normalized x position for the vibrato band, derived from the back-dated
+    /// `vibrato_t_ms` rather than `t_ms`. The vibrato analyzer's group delay
+    /// (~0.80 s) is subtracted so the band slides forward to align with the
+    /// pitch trace it envelopes. `None` when `vibrato_t_ms` falls outside the
+    /// visible time window (band point is hidden for that column).
+    pub vibrato_x: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

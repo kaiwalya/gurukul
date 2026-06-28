@@ -84,6 +84,7 @@ fn voiced_feature_writes_a_primary_needle_at_expected_angle() {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 1,
             t_ms: 1,
         }),
     );
@@ -117,6 +118,7 @@ fn singing_sa_lands_the_needle_at_north() {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 1,
             t_ms: 1,
         }),
     );
@@ -146,6 +148,7 @@ fn unvoiced_feature_yields_no_needle() {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 1,
             t_ms: 1,
         }),
     );
@@ -173,6 +176,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 1,
             t_ms: 1,
         }),
     );
@@ -190,6 +194,7 @@ fn voiced_then_unvoiced_clears_the_needle() {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: 2,
             t_ms: 2,
         }),
     );

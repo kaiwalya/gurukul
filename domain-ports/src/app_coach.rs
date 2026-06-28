@@ -426,6 +426,23 @@ pub struct FeatureSnapshot {
     /// both go to `0.0` together when vibrato detection is inactive.
     pub vibrato_depth: f32,
 
+    /// Back-dated wall-clock timestamp for vibrato features, in milliseconds.
+    ///
+    /// The vibrato analyzer measures wiggle over a 1.5 s window (group delay
+    /// ≈ 0.80 s), so its output describes audio that is ~0.80 s older than
+    /// `t_ms`. This field carries `t_ms - vibrato_latency_ms` so that
+    /// consumers can place vibrato on the time axis at its true age, making
+    /// the vibrato band align with the pitch trace it envelopes.
+    ///
+    /// Features whose source node declares zero latency (pitch, onset, breath)
+    /// share `t_ms`. Features with declared latency carry their own aged stamp.
+    ///
+    /// Defaults to `0` when deserializing older trace files that predate this
+    /// field — those replays have no vibrato compensation and the band is
+    /// effectively invisible at time 0.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub vibrato_t_ms: u64,
+
     /// Wall-clock milliseconds (from the coach's [`Clock`]) at which
     /// this snapshot was published. Useful for placing samples on a
     /// time axis, but not for continuity: coarse clocks may assign the

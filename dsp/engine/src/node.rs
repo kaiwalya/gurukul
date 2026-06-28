@@ -49,6 +49,18 @@ pub trait Node: Send {
     fn prepare(&mut self, id: &str, sample_rate: u32, block_size: usize);
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], nframes: usize);
 
+    /// Inherent processing latency in FRAMES at the prepared sample rate.
+    ///
+    /// Valid after [`prepare`](Self::prepare) (a sample-rate-dependent node computes it there).
+    /// Default 0 — a node with no look-behind / look-ahead delay.
+    ///
+    /// Matches the VST3 `getLatencySamples` / CLAP latency-in-samples convention.
+    /// Queried by the engine via `Engine::out_port_latency` at boot time only;
+    /// never called on the hot path.
+    fn declare_latency(&self) -> usize {
+        0
+    }
+
     /// Called once after the last block. Default impl is a no-op.
     fn finish(&mut self) -> Result<(), NodeError> {
         Ok(())

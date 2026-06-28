@@ -308,6 +308,19 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         }
     };
 
+    // Compute vibrato latency once at boot (boot-time only, not hot-path).
+    // vibrato_rate and vibrato_depth are produced by the same node, so their
+    // latencies must be equal — assert the invariant and use either.
+    let lat_frames = engine.out_port_latency(ports.vibrato_rate);
+    debug_assert_eq!(
+        lat_frames,
+        engine.out_port_latency(ports.vibrato_depth),
+        "vibrato_rate and vibrato_depth must come from the same node"
+    );
+    // Convert frames → ms with rounding (not truncation) in f64 to avoid
+    // systematic bias at non-divisor sample rates.
+    let vibrato_latency_ms: u64 = (lat_frames as f64 * 1000.0 / sample_rate as f64).round() as u64;
+
     tel_info!(
         &*telemetry,
         "data-plane: worker up",
@@ -378,6 +391,7 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
         let vibrato_rate = engine.out_port(ports.vibrato_rate)[0];
         let vibrato_depth = engine.out_port(ports.vibrato_depth)[0];
 
+        let t_ms = clock.now_ms();
         let snapshot = FeatureSnapshot {
             hop_index,
             f0_hz,
@@ -386,7 +400,8 @@ fn run_worker(args: WorkerArgs, feature_producer: &mut Producer<FeatureSnapshot>
             breath,
             vibrato_rate,
             vibrato_depth,
-            t_ms: clock.now_ms(),
+            vibrato_t_ms: t_ms.saturating_sub(vibrato_latency_ms),
+            t_ms,
         };
         if let Some(r) = recorder.as_mut() {
             r.record_hop(SidecarHop {
@@ -501,8 +516,31 @@ mod tests {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: t_ms,
             t_ms,
         }
+    }
+
+    /// Verify the frames→ms rounding formula used by the worker.
+    /// At 48000 Hz, 38400 frames / 48000 = exactly 800 ms (no rounding needed).
+    /// Use a non-divisor: 38401 frames → 38401000/48000 = 800.020833... → rounds to 800.
+    #[test]
+    fn vibrato_latency_frames_to_ms_rounds_correctly() {
+        let sample_rate: u32 = 48000;
+
+        let lat_frames: usize = 38400;
+        let lat_ms = (lat_frames as f64 * 1000.0 / sample_rate as f64).round() as u64;
+        assert_eq!(lat_ms, 800, "38400 frames at 48kHz = 800ms exactly");
+
+        // Non-divisor: should round, not truncate.
+        let lat_frames_odd: usize = 38401;
+        let lat_ms_odd = (lat_frames_odd as f64 * 1000.0 / sample_rate as f64).round() as u64;
+        assert_eq!(lat_ms_odd, 800, "38401 frames → ~800.02ms → rounds to 800");
+
+        // Another non-divisor past the 0.5 threshold: 38424 frames → 800.5ms → rounds to 801.
+        let lat_frames_up: usize = 38424;
+        let lat_ms_up = (lat_frames_up as f64 * 1000.0 / sample_rate as f64).round() as u64;
+        assert_eq!(lat_ms_up, 801, "38424 frames → 800.5ms → rounds up to 801");
     }
 
     #[test]

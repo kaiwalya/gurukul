@@ -747,8 +747,12 @@ pub fn apply_mesh_band(
         let n = segment.points.len();
         let seg_base = (positions.len() / 2) as u32;
         for tp in segment.points.iter() {
+            // Use vibrato_x (back-dated by ~0.80s) so the band aligns with
+            // the pitch trace. Fall back to pitch x when vibrato_t_ms is
+            // outside the window (first ~0.80s of a session).
+            let band_x = tp.vibrato_x.unwrap_or(tp.point.x);
             let center_point = NormalizedPoint {
-                x: tp.point.x,
+                x: band_x,
                 y: tp.band_center_y,
             };
             let local = normalized_to_lane(center_point, size);

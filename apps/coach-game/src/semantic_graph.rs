@@ -38,7 +38,12 @@ pub struct PitchWindow {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TracePoint {
+    /// Wall-clock timestamp for pitch placement on the time axis (ms).
     pub t_ms: u64,
+    /// Back-dated timestamp for vibrato band placement on the time axis (ms).
+    /// Equals `t_ms - vibrato_latency_ms` — the vibrato analyzer's group delay
+    /// subtracted so the band aligns with the pitch trace it envelopes.
+    pub vibrato_t_ms: u64,
     pub pitch: PitchLog2,
     pub confidence: f32,
     pub vibrato_rate: f32,
@@ -207,6 +212,7 @@ fn trace_segments(history: &FeatureHistory) -> Vec<TraceSegment> {
         match sample.pitch {
             Some(pitch) if previous.is_none() || contiguous => points.push(TracePoint {
                 t_ms: sample.t_ms,
+                vibrato_t_ms: sample.vibrato_t_ms,
                 pitch,
                 confidence: sample.confidence,
                 vibrato_rate: sample.vibrato_rate,
@@ -216,6 +222,7 @@ fn trace_segments(history: &FeatureHistory) -> Vec<TraceSegment> {
                 finish_segment(&mut segments, &mut points);
                 points.push(TracePoint {
                     t_ms: sample.t_ms,
+                    vibrato_t_ms: sample.vibrato_t_ms,
                     pitch,
                     confidence: sample.confidence,
                     vibrato_rate: sample.vibrato_rate,
@@ -326,6 +333,7 @@ mod tests {
             breath: 0.0,
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
+            vibrato_t_ms: t_ms,
             t_ms,
         }
     }
